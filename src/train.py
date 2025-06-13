@@ -13,7 +13,7 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from torch.cuda.amp import autocast
 
-from dpo_cache_utils import generate_ref_cache, save_ref_cache, load_ref_cache, get_delta_theta
+from dpo_cache_utils import *
 
 
 import wandb
@@ -203,6 +203,11 @@ def train(model, ref_model, tokenizer, optimizer, train_dataloader, epochs=1, be
             else:
                 raise ValueError(f"Unknown loss_type: {loss_type}")
 
+            print("loss.requires_grad:", loss.requires_grad)
+            print("loss.grad_fn:", loss.grad_fn)
+            print("model_preferred_logprob.requires_grad:", model_preferred_logprob.requires_grad)
+            print("model_dispreferred_logprob.requires_grad:", model_dispreferred_logprob.requires_grad)
+
             loss.backward()
             optimizer.step()
 
@@ -260,8 +265,9 @@ def main():
             ref_cache = load_ref_cache(args.ref_cache_path)
         except FileNotFoundError:
             print("Cache not found. Generating...")
-            ref_cache = generate_ref_cache(ref_model, tokenizer, dataset, device,
-                                           max_length=args.max_length)
+            ref_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
+
+            ref_cache = generate_ref_cache(ref_model, ref_dataloader, device)
             save_ref_cache(ref_cache, args.ref_cache_path)
             print(f"Saved reference cache to {args.ref_cache_path}")
 

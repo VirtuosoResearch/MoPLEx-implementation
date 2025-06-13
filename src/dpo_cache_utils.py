@@ -88,50 +88,44 @@ def calculate_DPO_loss(model_preferred_logprob, model_dispreferred_logprob,
 
 
 
-def generate_ref_cache(ref_model, tokenizer, dataloader, device, max_length):
-    """
-    Generate and return a reference cache with log-probs and gradients from ref_model.
-    Uses sample_ids from dataloader batch as unique keys.
-    """
-    ref_model.eval()
+def generate_ref_cache(ref_model, dataloader, device):
+    ref_model.train()  # 确保模型在训练模式，虽然通常影响不大，但更保险
     ref_cache = {}
 
     for batch in tqdm(dataloader, desc="Generating ref cache"):
-        prompt_preferred_ids = batch['prompt_preferred_ids'].to(device)
-        prompt_dispreferred_ids = batch['prompt_dispreferred_ids'].to(device)
-        prompt_lengths = batch['prompt_lengths'].to(device)
-        sample_ids = batch['sample_ids'].to(device)
+        sample_ids = batch['sample_ids'].tolist()
 
-        batch_size = prompt_preferred_ids.size(0)
+        # Preferred
+        logits_pref = ref_model(
+            input_ids=batch['prompt_preferred_ids'],
+            attention_mask=batch['prompt_preferred_mask']
+        ).logits
+        logp_pref = get_log_prob(logits_pref, batch['prompt_preferred_ids'], batch['prompt_lengths'])
+        grads_pref = torch.autograd.grad(logp_pref.sum(), ref_model.parameters(), retain_graph=True, allow_unused=True)
+        grads_pref = torch.cat([g.flatten() for g in grads_pref if g is not None])
 
-        for i in range(batch_size):
-            sample_id = str(sample_ids[i].item())
+        # Dispreferred
+        logits_dispref = ref_model(
+            input_ids=batch['prompt_dispreferred_ids'],
+            attention_mask=batch['prompt_dispreferred_mask']
+        ).logits
+        logp_dispref = get_log_prob(logits_dispref, batch['prompt_dispreferred_ids'], batch['prompt_lengths'])
+        grads_dispref = torch.autograd.grad(logp_dispref.sum(), ref_model.parameters(), retain_graph=True, allow_unused=True)
+        grads_dispref = torch.cat([g.flatten() for g in grads_dispref if g is not None])
 
-            # Preferred
-            input_ids = prompt_preferred_ids[i].unsqueeze(0).clone().detach()
-            input_ids.requires_grad = True
-            logits = ref_model(input_ids).logits
-            logp = get_log_prob(logits, input_ids, prompt_lengths=torch.tensor([prompt_lengths[i].item()], device=device))
-            ref_model.zero_grad()
-            logp.sum().backward()
-            grad = torch.cat([p.grad.detach().flatten() for p in ref_model.parameters() if p.grad is not None])
-            ref_cache[sample_id + '_preferred'] = {'logp': logp.detach().item(), 'grad': grad}
-
-            ref_model.zero_grad()
-
-            # Dispreferred
-            input_ids = prompt_dispreferred_ids[i].unsqueeze(0).clone().detach()
-            input_ids.requires_grad = True
-            logits = ref_model(input_ids).logits
-            logp = get_log_prob(logits, input_ids, prompt_lengths=torch.tensor([prompt_lengths[i].item()], device=device))
-            ref_model.zero_grad()
-            logp.sum().backward()
-            grad = torch.cat([p.grad.detach().flatten() for p in ref_model.parameters() if p.grad is not None])
-            ref_cache[sample_id + '_dispreferred'] = {'logp': logp.detach().item(), 'grad': grad}
-
-            ref_model.zero_grad()
+        for i, sample_id in enumerate(sample_ids):
+            ref_cache[f"{sample_id}_preferred"] = {
+                'logp': logp_pref[i].detach().cpu(),
+                'grad': grads_pref.detach().cpu()
+            }
+            ref_cache[f"{sample_id}_dispreferred"] = {
+                'logp': logp_dispref[i].detach().cpu(),
+                'grad': grads_dispref.detach().cpu()
+            }
 
     return ref_cache
+
+
 
 
 
