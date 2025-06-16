@@ -10,5 +10,5 @@ python src/train.py \
     --model_name "gpt2" \
     --dataset_name "jondurbin/truthy-dpo-v0.1" \
     --wandb_project "truthy-dpo" \
-    --dpo_type "approx" \
+    --dpo_type "exact" \
     --ref_cache_path "ref_cache.pt"

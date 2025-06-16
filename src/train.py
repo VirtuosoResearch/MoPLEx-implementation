@@ -113,60 +113,60 @@ def collate_fn(batch, tokenizer, max_length, device):
         'sample_ids': torch.tensor(sample_ids, device=device)
     }
 
-def train(model, ref_model, tokenizer, optimizer, train_dataloader, epochs=1, beta=0.1, 
-          loss_type='exact', delta_theta=None, ref_cache=None):
+
+def train(model, ref_model, tokenizer, optimizer, train_dataloader, delta_theta=None,
+          epochs=1, beta=0.1, loss_type='exact', ref_cache=None):
     model.train()
     ref_model.eval()
 
+    device = next(model.parameters()).device
+
     for epoch in range(epochs):
         for batch in tqdm(train_dataloader):
-            print(batch.keys())
             optimizer.zero_grad()
 
+            preferred_ids = batch['prompt_preferred_ids'].to(device)
+            dispreferred_ids = batch['prompt_dispreferred_ids'].to(device)
+            preferred_mask = batch['prompt_preferred_mask'].to(device)
+            dispreferred_mask = batch['prompt_dispreferred_mask'].to(device)
+            prompt_lengths = batch['prompt_lengths'].to(device)
+
             model_preferred_logits = model(
-                input_ids=batch['prompt_preferred_ids'],
-                attention_mask=batch['prompt_preferred_mask']
+                input_ids=preferred_ids,
+                attention_mask=preferred_mask
             ).logits
-            
+
             model_preferred_logprob = get_log_prob(
-                model_preferred_logits,
-                batch['prompt_preferred_ids'],
-                batch['prompt_lengths']
+                model_preferred_logits, preferred_ids, prompt_lengths
             )
 
             model_dispreferred_logits = model(
-                input_ids=batch['prompt_dispreferred_ids'],
-                attention_mask=batch['prompt_dispreferred_mask']
+                input_ids=dispreferred_ids,
+                attention_mask=dispreferred_mask
             ).logits
-            
+
             model_dispreferred_logprob = get_log_prob(
-                model_dispreferred_logits,
-                batch['prompt_dispreferred_ids'],
-                batch['prompt_lengths']
+                model_dispreferred_logits, dispreferred_ids, prompt_lengths
             )
 
             if loss_type == 'exact':
                 with torch.no_grad():
                     ref_preferred_logits = ref_model(
-                        input_ids=batch['prompt_preferred_ids'],
-                        attention_mask=batch['prompt_preferred_mask']
+                        input_ids=preferred_ids,
+                        attention_mask=preferred_mask
                     ).logits
-                    
+
                     ref_preferred_logprob = get_log_prob(
-                        ref_preferred_logits,
-                        batch['prompt_preferred_ids'],
-                        batch['prompt_lengths']
+                        ref_preferred_logits, preferred_ids, prompt_lengths
                     )
 
                     ref_dispreferred_logits = ref_model(
-                        input_ids=batch['prompt_dispreferred_ids'],
-                        attention_mask=batch['prompt_dispreferred_mask']
+                        input_ids=dispreferred_ids,
+                        attention_mask=dispreferred_mask
                     ).logits
-                    
+
                     ref_dispreferred_logprob = get_log_prob(
-                        ref_dispreferred_logits,
-                        batch['prompt_dispreferred_ids'],
-                        batch['prompt_lengths']
+                        ref_dispreferred_logits, dispreferred_ids, prompt_lengths
                     )
 
                 loss, preferred_relative_logprob, dispreferred_relative_logprob, reward_accuracies, reward_margins = calculate_DPO_loss(
@@ -178,8 +178,7 @@ def train(model, ref_model, tokenizer, optimizer, train_dataloader, epochs=1, be
                 )
 
             elif loss_type == 'approx':
-                assert delta_theta is not None and ref_cache is not None, \
-                    "delta_theta and ref_cache are required for approximate DPO."
+                assert ref_cache is not None and delta_theta is not None
 
                 reward_diff_star = []
                 grad_diff = []
@@ -191,37 +190,33 @@ def train(model, ref_model, tokenizer, optimizer, train_dataloader, epochs=1, be
                     reward_diff_star.append(r_pref['logp'] - r_dispref['logp'])
                     grad_diff.append(r_pref['grad'] - r_dispref['grad'])
 
-                reward_diff_star = torch.tensor(reward_diff_star, device=delta_theta.device)
-                grad_diff = torch.stack(grad_diff).to(delta_theta.device)
+                reward_diff_star = torch.tensor(reward_diff_star, device=device)
+                grad_diff = torch.stack(grad_diff).to(device)
 
                 loss, reward_accuracies, reward_margins = approximate_dpo_loss_cached(
                     reward_diff_star, grad_diff, delta_theta, beta
                 )
+
                 preferred_relative_logprob = reward_diff_star + beta * (grad_diff @ delta_theta)
-                dispreferred_relative_logprob = torch.zeros_like(preferred_relative_logprob)  # dummy
+                dispreferred_relative_logprob = torch.zeros_like(preferred_relative_logprob)
 
             else:
                 raise ValueError(f"Unknown loss_type: {loss_type}")
-
-            print("loss.requires_grad:", loss.requires_grad)
-            print("loss.grad_fn:", loss.grad_fn)
-            print("model_preferred_logprob.requires_grad:", model_preferred_logprob.requires_grad)
-            print("model_dispreferred_logprob.requires_grad:", model_dispreferred_logprob.requires_grad)
 
             loss.backward()
             optimizer.step()
 
             wandb.log({
                 'loss': loss.item(),
-                'preferred_relative_logprob': preferred_relative_logprob.item(),
-                'dispreferred_relative_logprob': dispreferred_relative_logprob.item(),
-                'reward_accuracy': reward_accuracies.item(),
-                'reward_margin': reward_margins.item()
+                'preferred_relative_logprob': preferred_relative_logprob.mean().item(),
+                'dispreferred_relative_logprob': dispreferred_relative_logprob.mean().item(),
+                'reward_accuracy': reward_accuracies.mean().item(),
+                'reward_margin': reward_margins.mean().item()
             })
+
 
 def main():
     parser = argparse.ArgumentParser()
-
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--beta", type=float, default=0.1)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -231,8 +226,8 @@ def main():
     parser.add_argument("--model_name", type=str, default="microsoft/phi-2")
     parser.add_argument("--dataset_name", type=str, default="jondurbin/truthy-dpo-v0.1")
     parser.add_argument("--wandb_project", type=str, default="truthy-dpo")
-    parser.add_argument("--dpo_type", type=str, choices=["exact", "approx"], default="exact", help="Choose DPO loss type: 'exact' or 'approx'")
-    parser.add_argument("--ref_cache_path", type=str, default=None, help="Path to cached reference gradients (required if dpo_type == 'approx')")
+    parser.add_argument("--dpo_type", type=str, choices=["exact", "approx"], default="exact")
+    parser.add_argument("--ref_cache_path", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -247,10 +242,7 @@ def main():
     tokenizer.pad_token = tokenizer.eos_token
     model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
     ref_model = AutoModelForCausalLM.from_pretrained(args.model_name).to(device)
-
     ref_model.requires_grad_(False)
-
-    optimizer = AdamW(model.parameters(), lr=args.lr)
 
     dataset = load_dataset(args.dataset_name, split="train")
     collate = partial(collate_fn, tokenizer=tokenizer, max_length=args.max_length, device=device)
@@ -258,7 +250,7 @@ def main():
 
     delta_theta, ref_cache = None, None
     if args.dpo_type == "approx":
-        assert args.ref_cache_path is not None, "Must provide --ref_cache_path for approx mode."
+        assert args.ref_cache_path is not None
 
         try:
             print(f"Loading reference cache from {args.ref_cache_path}...")
@@ -266,18 +258,27 @@ def main():
         except FileNotFoundError:
             print("Cache not found. Generating...")
             ref_dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate)
-
             ref_cache = generate_ref_cache(ref_model, ref_dataloader, device)
             save_ref_cache(ref_cache, args.ref_cache_path)
             print(f"Saved reference cache to {args.ref_cache_path}")
 
-        delta_theta = get_delta_theta(model, ref_model)
+        delta_theta = get_delta_theta(model, ref_model).to(device)
+
+        # Include delta_theta in optimizer
+        optimizer = AdamW([
+            {'params': model.parameters()},
+            {'params': [delta_theta], 'lr': args.lr}
+        ], lr=args.lr)
+
+    else:
+        optimizer = AdamW(model.parameters(), lr=args.lr)
 
     train(model, ref_model, tokenizer, optimizer, train_dataloader,
           epochs=args.epochs, beta=args.beta,
-          loss_type=args.dpo_type, delta_theta=delta_theta, ref_cache=ref_cache)
+          loss_type=args.dpo_type, ref_cache=ref_cache, delta_theta=delta_theta)
 
     model.save_pretrained("model-DPO")
 
 if __name__ == "__main__":
     main()
+

@@ -31,11 +31,14 @@ def get_log_prob(logits, labels, prompt_lengths):
 
 def get_delta_theta(current_model, ref_model):
     """
-    Compute delta_theta = theta - theta_star, i.e., the difference in flattened model parameters.
+    Return a torch.nn.Parameter representing delta_theta = current - ref.
+    This will be treated as a trainable parameter in approximate DPO.
     """
-    current_params = torch.cat([p.detach().flatten() for p in current_model.parameters()])
+    current_params = torch.cat([p.flatten() for p in current_model.parameters()])
     ref_params = torch.cat([p.detach().flatten() for p in ref_model.parameters()])
-    return current_params - ref_params
+    delta_init = current_params - ref_params
+    return torch.nn.Parameter(delta_init)  # requires_grad=True by default
+
 
 
 def load_ref_cache(path):
@@ -89,7 +92,7 @@ def calculate_DPO_loss(model_preferred_logprob, model_dispreferred_logprob,
 
 
 def generate_ref_cache(ref_model, dataloader, device):
-    ref_model.train()  # 确保模型在训练模式，虽然通常影响不大，但更保险
+    ref_model.train() 
     ref_cache = {}
 
     for batch in tqdm(dataloader, desc="Generating ref cache"):
