@@ -92,7 +92,10 @@ def calculate_DPO_loss(model_preferred_logprob, model_dispreferred_logprob,
 
 
 def generate_ref_cache(ref_model, dataloader, device):
-    ref_model.train() 
+    ref_model.train()
+    for param in ref_model.parameters():
+        param.requires_grad = True
+ 
     ref_cache = {}
 
     for batch in tqdm(dataloader, desc="Generating ref cache"):
@@ -118,12 +121,12 @@ def generate_ref_cache(ref_model, dataloader, device):
 
         for i, sample_id in enumerate(sample_ids):
             ref_cache[f"{sample_id}_preferred"] = {
-                'logp': logp_pref[i].detach().cpu(),
-                'grad': grads_pref.detach().cpu()
+                'logp': logp_pref[i].detach().to(device),
+                'grad': grads_pref.detach().to(device)
             }
             ref_cache[f"{sample_id}_dispreferred"] = {
-                'logp': logp_dispref[i].detach().cpu(),
-                'grad': grads_dispref.detach().cpu()
+                'logp': logp_dispref[i].detach().to(device),
+                'grad': grads_dispref.detach().to(device)
             }
 
     return ref_cache

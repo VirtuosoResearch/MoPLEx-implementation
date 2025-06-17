@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 
 python src/train.py \
-    --epochs 10 \
+    --epochs 20 \
     --batch_size 2 \
     --max_length 256 \
     --lr 1e-6 \
@@ -10,5 +10,5 @@ python src/train.py \
     --model_name "gpt2" \
     --dataset_name "jondurbin/truthy-dpo-v0.1" \
     --wandb_project "truthy-dpo" \
-    --dpo_type "exact" \
+    --dpo_type "approx" \
     --ref_cache_path "ref_cache.pt"
