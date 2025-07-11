@@ -1,6 +1,0 @@
-__pycache__/
-**/__pycache__/
-wandb/
-model-DPO/
-ref_cacheold.pt
-ref_cache.pt
