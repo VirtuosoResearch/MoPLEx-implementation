@@ -267,7 +267,7 @@ class DPOTrainer():
             input_data = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
             logits, _, _ = self.model(**input_data)
             with torch.no_grad():
-                old_logits, _, _ = self.ref_model(**input_data)
+                old_logits, _, _ = self.ref_model(**input_data)  
                 old_logprobs = logprobs_from_logits(old_logits[:, :-1, :], input_ids[:, 1:])
 
             logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])

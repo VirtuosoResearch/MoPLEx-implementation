@@ -12,6 +12,8 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification, Auto
 from trainers.network_utils import AutoModelForCausalLMWithValueHead
 from trainers.dpo_trainer import DPOTrainer
 from trainers.dpo_config import DPOConfig
+from trainers.approx_dpo_trainer import ApproxDPOTrainer
+
 #from alpaca_farm.models.reward_model import RewardModel, RewardConfig
 import torch
 from absl import flags, app
@@ -73,6 +75,8 @@ flags.DEFINE_string('cache_dir', '', 'the cache directory')
 flags.DEFINE_bool('ipo_loss', False, 'whether to use ipo loss')
 # flags for tpu
 flags.DEFINE_bool('use_tpu', False, 'whether to use tpus')
+# flags for approx_dpo
+flags.DEFINE_bool('approx_dpo', False, 'whether to use approx dpo')
 
 def get_dataset(path, num_samples=-1, return_test_data=True, num_samples_test=1000):
     assert os.path.exists(path)
@@ -321,7 +325,17 @@ def main(_):
     print('Sample Train prompt:', dataset[0]['query'])
     print('Sample Eval prompt:', eval_dataset[0]['query'])
 
-    trainer = DPOTrainer(
+    # trainer = DPOTrainer(
+    #     model=model,
+    #     config=config,
+    #     dataset=dataset,
+    #     tokenizer=tokenizer,
+    #     additional_config_kwargs=FLAGS.flag_values_dict(),
+    # )
+
+    TrainerClass = ApproxDPOTrainer if FLAGS.approx_dpo else DPOTrainer
+
+    trainer = TrainerClass(
         model=model,
         config=config,
         dataset=dataset,
