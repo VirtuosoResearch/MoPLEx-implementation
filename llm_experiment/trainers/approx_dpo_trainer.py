@@ -146,7 +146,7 @@ class ApproxDPOTrainer():
         input_ids_l = torch.cat((queries, responses_l), dim=1)
         mask_w = torch.cat((torch.zeros_like(queries), torch.ones_like(responses_w)), dim=1)[:, :-1]
         mask_l = torch.cat((torch.zeros_like(queries), torch.ones_like(responses_l)), dim=1)[:, :-1]
-        mask = mask_w
+        mask = torch.cat((mask_w, mask_l), dim=0)
         if preference_mask is not None:
             preference_mask = preference_mask.unsqueeze(1).repeat(1, mask.shape[1])
             mask = mask * preference_mask.to(mask.dtype).to(mask.device)
@@ -161,22 +161,50 @@ class ApproxDPOTrainer():
             entropy = entropy_from_logits(logits)
             return logprobs, old_logprobs, entropy, logits
 
+        # Compute logprobs and logits for winners and losers
         logprobs_w, old_logprobs_w, entropy_w, logits_w = process_input_ids(input_ids_w)
         logprobs_l, old_logprobs_l, entropy_l, logits_l = process_input_ids(input_ids_l)
-        
+
+        # Compute pi_logratios and ref_logratios
+        # TO DO: Save ref_logpratioss for later use
         pi_logratios = logprobs_w - logprobs_l
         ref_logratios = old_logprobs_w - old_logprobs_l
-        dpo_logit = self.config.temperature * (pi_logratios - ref_logratios)
 
-        if self.config.use_approx_dpo:
-            # Approximate DPO loss using Taylor expansion
-            sigmoid_dpo_logit = torch.sigmoid(dpo_logit.detach())
-            grad_term = (1 - sigmoid_dpo_logit)
-            taylor_loss = grad_term * dpo_logit
-            dpo_loss = masked_mean(taylor_loss, mask)
-        else:
-            dpo_loss = -F.logsigmoid(dpo_logit)
-            dpo_loss = masked_mean(dpo_loss, mask)
+        # Compute r_hat (score difference at theta*)
+        r_hat_diff = self.config.temperature * (pi_logratios.detach() - ref_logratios.detach())
+
+        # Compute gradients of log_probs w.r.t model parameters
+        grads_w = torch.autograd.grad(
+            outputs=(logprobs_w * mask_w).sum(),  # Mask winner responses
+            inputs=self.model.parameters(),
+            create_graph=True, retain_graph=True, allow_unused=True
+        )
+        grads_l = torch.autograd.grad(
+            outputs=(logprobs_l * mask_l).sum(),  # Mask loser responses
+            inputs=self.model.parameters(),
+            create_graph=True, retain_graph=True, allow_unused=True
+        )
+
+
+        # Compute theta - theta_star and grad_diff dot product in batches
+        first_order_term = torch.tensor(0.0, device=self.current_device)
+        for (p, p_star, gw, gl) in zip(self.model.parameters(), self.ref_model.parameters(), grads_w, grads_l):
+            if p.requires_grad and gw is not None and gl is not None:
+                theta_diff = (p - p_star).detach()
+                grad_diff = (gw - gl)
+                # Reshape to vectors
+                theta_diff_flat = theta_diff.view(-1)
+                grad_diff_flat = grad_diff.view(-1)
+                # Incrementally accumulate dot product
+                first_order_term += torch.dot(grad_diff_flat, theta_diff_flat)
+
+
+        # Final approximated logits for DPO loss
+        approx_logits = r_hat_diff + self.config.beta * first_order_term
+
+        dpo_loss = -F.logsigmoid(approx_logits)
+        dpo_loss = masked_mean(dpo_loss, mask[:approx_logits.size(0)]) 
+
 
         if return_stats:
             stats = dict(
