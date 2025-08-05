@@ -166,6 +166,21 @@ class DPOConfig:
     global_batch_size: tyro.conf.Suppress[int] = None
     """TO BE FILLED In RUNTIME: the effective `batch_size` across all processes"""
 
+    # save/load θ* and ∇θ* for ApproxDPO
+    save_pstar_at_epoch: int = 2
+    """Epoch after which p* and ∇p* (model state and gradients) are saved for ApproxDPO. Use -1 to disable."""
+    pstar_save_path: str = "./pstar.pt"
+    """File path to save (and later load) the model weights p* and gradients ∇p* for ApproxDPO use."""
+
+    # save/load θ 
+    save_p_at_epoch: int = 3
+    """Epoch after which p (model state only) is saved. Use -1 to disable."""
+    p_save_path: str = "./p.pt"
+    """File path to save the model weights p (without gradients)."""
+
+
+
+
     def __post_init__(self):
         if self.forward_batch_size is not None:
             warnings.warn(

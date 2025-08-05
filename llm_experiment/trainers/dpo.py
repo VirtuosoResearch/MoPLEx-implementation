@@ -77,6 +77,13 @@ flags.DEFINE_bool('ipo_loss', False, 'whether to use ipo loss')
 flags.DEFINE_bool('use_tpu', False, 'whether to use tpus')
 # flags for approx_dpo
 flags.DEFINE_bool('approx_dpo', False, 'whether to use approx dpo')
+# flags for saving p_star and grad_star
+flags.DEFINE_integer('save_pstar_at_epoch', -1, 'the epoch after which to save p_star and grad_star. Set to -1 to disable.')
+flags.DEFINE_string('pstar_save_path', './pstar_grads.pt', 'the file path to save p_star and grad_star')
+
+# flags for saving p
+# tba
+
 
 def get_dataset(path, num_samples=-1, return_test_data=True, num_samples_test=1000):
     assert os.path.exists(path)
