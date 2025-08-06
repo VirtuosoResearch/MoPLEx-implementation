@@ -18,7 +18,7 @@ betas=(0.05 0.1)
 gradient_accumulation_steps=8
 batch_size=16
 mini_batch_size=2
-downsample_ratio=0.01
+downsample_ratio=0.005
 
 data_min='Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength'
 data_max='Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_maxlength'

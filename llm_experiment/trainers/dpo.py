@@ -561,7 +561,7 @@ def main(_):
             
             output_batch = {k: pref_batch[k] for k in columns_to_log}
             #### Run Trainer step
-            train_stats = trainer.step(queries=pref_query_tensors, responses_w=pref_response_w_tensors, responses_l=pref_response_l_tensors)
+            train_stats = trainer.step(queries=pref_query_tensors, responses_w=pref_response_w_tensors, responses_l=pref_response_l_tensors, epoch=epoch)
             for key in train_stats:
                 stats[key] = train_stats[key]
 
@@ -583,6 +583,9 @@ def main(_):
                 rewards=rewards,
                 columns_to_log=columns_to_log
             )
+
+        trainer.end_of_epoch_step(epoch)
+
         save_model(model_name + f"_epoch_{epoch}", epoch)
 
 if __name__ == "__main__":

@@ -412,9 +412,7 @@ class DPOTrainer():
                 responses_w=responses_w_,
                 responses_l=responses_l_,
                 return_stats=True,
-                preference_mask=preference_mask_,
-                epoch=epoch + 1, 
-                is_epoch_end=is_epoch_end
+                preference_mask=preference_mask_
             )
 
             self.optimizer.zero_grad()
@@ -422,33 +420,34 @@ class DPOTrainer():
             self.optimizer.step()
             self.current_step += 1
 
-        
-        if is_epoch_end:
-            # save p* (params + grads) for ApproxDPO
-            if (
-                self.save_pstar_at_epoch >= 0 and
-                epoch == self.save_pstar_at_epoch and
-                not self.has_saved_pstar and
-                self.accelerator.is_main_process
-            ):
-                self.has_saved_pstar = True
-                print(f"Saving p* (params + grads) at epoch {epoch} to {self.pstar_save_path} ...")
-                self.save_pstar()
-
-            # save p (params only)
-            if (
-                hasattr(self, 'save_p_at_epoch') and
-                self.save_p_at_epoch >= 0 and
-                epoch == self.save_p_at_epoch and
-                not getattr(self, 'has_saved_p', False) and
-                self.accelerator.is_main_process
-            ):
-                self.has_saved_p = True
-                print(f"Saving p (params only) at epoch {epoch} to {self.p_save_path} ...")
-                self.save_p()
-
         return stats
+    
+    def end_of_epoch_step(self, epoch: int):
+        """Performs tasks at the end of an epoch, like saving models."""
+        print(f"Executing end-of-epoch tasks for epoch: {epoch}")
 
+        # save p* (params + grads) for ApproxDPO
+        if (
+            self.save_pstar_at_epoch >= 0 and
+            epoch == self.save_pstar_at_epoch and
+            not self.has_saved_pstar and
+            self.accelerator.is_main_process
+        ):
+            self.has_saved_pstar = True
+            print(f"Saving p* (params + grads) at epoch {epoch} to {self.pstar_save_path} ...")
+            self.save_pstar()
+
+        # save p (params only)
+        if (
+            hasattr(self, 'save_p_at_epoch') and
+            self.save_p_at_epoch >= 0 and
+            epoch == self.save_p_at_epoch and
+            not getattr(self, 'has_saved_p', False) and
+            self.accelerator.is_main_process
+        ):
+            self.has_saved_p = True
+            print(f"Saving p (params only) at epoch {epoch} to {self.p_save_path} ...")
+            self.save_p()
 
     def save_pstar(self):
         self.model.eval()
