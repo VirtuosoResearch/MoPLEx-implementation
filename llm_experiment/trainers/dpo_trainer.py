@@ -352,75 +352,73 @@ class DPOTrainer():
         else:
             return dpo_loss
     
-    # def step(
-    #     self,
-    #     queries: torch.LongTensor,
-    #     responses_w: torch.LongTensor,
-    #     responses_l: torch.LongTensor,
-    #     preference_mask: Optional[torch.BoolTensor] = None, # (bs,)
-    # ):
-    #     assert queries.ndim == 2 and responses_w.ndim == 2 and responses_l.ndim == 2
-    #     self.model.train()
-    #     bs = self.config.batch_size
-    #     sub_bs = self.config.mini_batch_size
-    #     assert bs % sub_bs == 0
-        
-    #     first = True
-    #     for i in tqdm.tqdm(range(0, bs, sub_bs), desc="Training with Minibatches", leave=False):
-    #         queries_ = queries[i : i + sub_bs]
-    #         responses_w_ = responses_w[i : i + sub_bs]
-    #         responses_l_ = responses_l[i : i + sub_bs]
-    #         preference_mask_ = preference_mask[i : i + sub_bs] if preference_mask is not None else None
-
-    #         loss, stats = self._step(
-    #             queries=queries_,
-    #             responses_w=responses_w_,
-    #             responses_l=responses_l_,
-    #             return_stats=True,
-    #             preference_mask=preference_mask_,
-    #         )
-            
-    #         self.optimizer.zero_grad()
-    #         self.accelerator.backward(loss)
-    #         self.optimizer.step()
-    #         self.current_step += 1
-    #     return stats
-
     def step(
         self,
         queries: torch.LongTensor,
         responses_w: torch.LongTensor,
         responses_l: torch.LongTensor,
-        preference_mask: Optional[torch.BoolTensor] = None,  # (bs,)
-        epoch: int = -1,
-        is_epoch_end: bool = False,
+        preference_mask: Optional[torch.BoolTensor] = None, # (bs,)
     ):
         assert queries.ndim == 2 and responses_w.ndim == 2 and responses_l.ndim == 2
         self.model.train()
         bs = self.config.batch_size
         sub_bs = self.config.mini_batch_size
         assert bs % sub_bs == 0
-
+        
+        first = True
         for i in tqdm.tqdm(range(0, bs, sub_bs), desc="Training with Minibatches", leave=False):
-            queries_ = queries[i: i + sub_bs]
-            responses_w_ = responses_w[i: i + sub_bs]
-            responses_l_ = responses_l[i: i + sub_bs]
-            preference_mask_ = preference_mask[i: i + sub_bs] if preference_mask is not None else None
+            queries_ = queries[i : i + sub_bs]
+            responses_w_ = responses_w[i : i + sub_bs]
+            responses_l_ = responses_l[i : i + sub_bs]
+            preference_mask_ = preference_mask[i : i + sub_bs] if preference_mask is not None else None
 
             loss, stats = self._step(
                 queries=queries_,
                 responses_w=responses_w_,
                 responses_l=responses_l_,
                 return_stats=True,
-                preference_mask=preference_mask_
+                preference_mask=preference_mask_,
             )
-
+            
             self.optimizer.zero_grad()
             self.accelerator.backward(loss)
             self.optimizer.step()
             self.current_step += 1
-
         return stats
+
+    # def step(
+    #     self,
+    #     queries: torch.LongTensor,
+    #     responses_w: torch.LongTensor,
+    #     responses_l: torch.LongTensor,
+    #     preference_mask: Optional[torch.BoolTensor] = None,  # (bs,)
+    # ):
+    #     assert queries.ndim == 2 and responses_w.ndim == 2 and responses_l.ndim == 2
+    #     self.model.train()
+    #     bs = self.config.batch_size
+    #     sub_bs = self.config.mini_batch_size
+    #     assert bs % sub_bs == 0
+
+    #     for i in tqdm.tqdm(range(0, bs, sub_bs), desc="Training with Minibatches", leave=False):
+    #         queries_ = queries[i: i + sub_bs]
+    #         responses_w_ = responses_w[i: i + sub_bs]
+    #         responses_l_ = responses_l[i: i + sub_bs]
+    #         preference_mask_ = preference_mask[i: i + sub_bs] if preference_mask is not None else None
+
+    #         loss, stats = self._step(
+    #             queries=queries_,
+    #             responses_w=responses_w_,
+    #             responses_l=responses_l_,
+    #             return_stats=True,
+    #             preference_mask=preference_mask_
+    #         )
+
+    #         self.optimizer.zero_grad()
+    #         self.accelerator.backward(loss)
+    #         self.optimizer.step()
+    #         self.current_step += 1
+
+    #     return stats
     
     def end_of_epoch_step(self, epoch: int):
         """Performs tasks at the end of an epoch, like saving models."""
@@ -451,21 +449,19 @@ class DPOTrainer():
 
     def save_pstar(self):
         self.model.eval()
+        device = next(self.model.parameters()).device
         with torch.no_grad():
-            params_vector = torch.cat([p.detach().cpu().flatten() for p in self.model.parameters()])
-            grads_vector = torch.cat([
-                (p.grad.detach().cpu().flatten() if p.grad is not None else torch.zeros_like(p.detach().flatten()))
-                for p in self.model.parameters()
-            ])
-        torch.save({"params": params_vector, "grads": grads_vector}, self.pstar_save_path)
+            params_vector = torch.cat([p.detach().to(device).flatten() for p in self.model.parameters()])
+        torch.save({"params": params_vector}, self.pstar_save_path)
         print(f"Saved p* to {self.pstar_save_path}")
         self.model.train()
 
 
     def save_p(self):
         self.model.eval()
+        device = next(self.model.parameters()).device
         with torch.no_grad():
-            params_vector = torch.cat([p.detach().cpu().flatten() for p in self.model.parameters()])
+            params_vector = torch.cat([p.detach().to(device).flatten() for p in self.model.parameters()])
         torch.save({"params": params_vector}, self.p_save_path)
         print(f"Saved p to {self.p_save_path}")
         self.model.train()

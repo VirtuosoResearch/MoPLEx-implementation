@@ -439,6 +439,8 @@ def main(_):
         pref_response_l_tensors = tokenized[len(pref_batch["response_w"]):]
         assert pref_response_l_tensors.shape[0] == len(pref_batch["response_l"])
         pref_response_l_tensors = accelerate.utils.send_to_device(pref_response_l_tensors, trainer.accelerator.device)
+
+        print(pref_response_w_tensors[0])
         
         return pref_batch, pref_query_tensors, pref_response_w_tensors, pref_response_l_tensors
     
@@ -561,7 +563,7 @@ def main(_):
             
             output_batch = {k: pref_batch[k] for k in columns_to_log}
             #### Run Trainer step
-            train_stats = trainer.step(queries=pref_query_tensors, responses_w=pref_response_w_tensors, responses_l=pref_response_l_tensors, epoch=epoch)
+            train_stats = trainer.step(queries=pref_query_tensors, responses_w=pref_response_w_tensors, responses_l=pref_response_l_tensors)
             for key in train_stats:
                 stats[key] = train_stats[key]
 

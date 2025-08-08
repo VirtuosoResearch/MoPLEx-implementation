@@ -167,15 +167,15 @@ class DPOConfig:
     """TO BE FILLED In RUNTIME: the effective `batch_size` across all processes"""
 
     # save/load θ* and ∇θ* for ApproxDPO
-    save_pstar_at_epoch: int = 0
+    save_pstar_at_epoch: int = 15
     """Epoch after which p* and ∇p* (model state and gradients) are saved for ApproxDPO. Use -1 to disable."""
-    pstar_save_path: str = f"../params/pstar_epoch{save_pstar_at_epoch}.pt"
+    pstar_save_path: str = f"./params/pstar_epoch{save_pstar_at_epoch}.pt"
     """File path to save (and later load) the model weights p* and gradients ∇p* for ApproxDPO use."""
 
     # save/load θ 
-    save_p_at_epoch: int = 1
+    save_p_at_epoch: int = 16
     """Epoch after which p (model state only) is saved. Use -1 to disable."""
-    p_save_path: str = f"../params/p_epoch{save_p_at_epoch}.pt"
+    p_save_path: str = f"./params/p_epoch{save_p_at_epoch}.pt"
     """File path to save the model weights p (without gradients)."""
 
 
