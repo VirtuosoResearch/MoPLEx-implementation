@@ -6,17 +6,24 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
 from absl import flags
+from collections import OrderedDict
+from functools import reduce
 
 #------------------------------------------------------------------
 # Utility functions for Jacobian computation
 #------------------------------------------------------------------
 
 FLAGS = flags.FLAGS
+PROMPT_TOKEN = '<|prompter|>'
+ASSISTANT_TOKEN = '<|assistant|>'
+EOS_TOKEN = '<|endoftext|>'
 
 def _select_params(model, param_filter=None):
     names, params = [], []
     for n, p in model.named_parameters():
-        if p.requires_grad and (param_filter is None or param_filter(n)):
+        print(f"Checking param {n} with requires_grad={p.requires_grad}")
+        #if p.requires_grad and (param_filter is None or param_filter(n)):
+        if p.requires_grad:
             names.append(n); params.append(p)
     if not params:
         raise ValueError("No params selected; adjust param_filter.")
@@ -73,7 +80,7 @@ def validate_tokenwise_simple(
     J_list, f1_list, f2_list, f_lin_list = [], [], [], []
     mae_list, rmse_list, pos_list = [], [], []
 
-    for b in range(B):
+    for b in range(1):
         valid_idx = torch.nonzero(labels[b] != -100, as_tuple=False).squeeze(-1)  # response tokens
         if valid_idx.numel() == 0:
             continue
@@ -224,8 +231,23 @@ def load_params_from_vector(model, vector, param_filter=None):
     if idx != vector.numel():
         raise ValueError(f"Vector has {vector.numel()} elems, loaded {idx}")
     
+def process_dataset(batch):
+    new_batch = {}
+    new_batch['query'] = batch['prompt']
+    new_batch['text_w'] =  batch['y_w'] 
+    new_batch['text_l'] = batch['y_l']
+    new_batch['response_w'] = [x.split(ASSISTANT_TOKEN)[-1] for x in batch['y_w']]
+    new_batch['response_l'] = [x.split(ASSISTANT_TOKEN)[-1] for x in batch['y_l']]
+    
+    shapes = {}
+    for k, v in new_batch.items():
+        shapes[k] = len(v)
+    if reduce(lambda x,y: x if x==y else -1, list(shapes.values())) == -1:
+        assert False, f"Shapes of all columns must be equal, but got {shapes}, {list(shapes.values())}"
+    return new_batch
 
 
+    
 
 
 model_name = "meta-llama/Llama-3.2-1B"  
@@ -240,28 +262,30 @@ if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
     tokenizer.pad_token = tokenizer.eos_token
 
 model_theta_star = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B", trust_remote_code=True)
-model_theta      = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B", trust_remote_code=True)
+model_2 = AutoModelForCausalLM.from_pretrained("models/model2", trust_remote_code=True)
+model_theta      = AutoModelForCausalLM.from_pretrained("models/model1", trust_remote_code=True)
+
 
 
 model_theta_star.resize_token_embeddings(len(tokenizer))
 model_theta.resize_token_embeddings(len(tokenizer))
 
 
-# Count params the loader will try to fill:
-load_uses_named = True  # your load_params_from_vector uses named_parameters()
-total_model_params = sum(p.numel() for n,p in model_theta_star.named_parameters() if p.requires_grad)
-print("model total requires_grad params:", total_model_params)
+# # Count params the loader will try to fill:
+# load_uses_named = True  # your load_params_from_vector uses named_parameters()
+# total_model_params = sum(p.numel() for n,p in model_theta_star.named_parameters() if p.requires_grad)
+# print("model total requires_grad params:", total_model_params)
 
 
-# Load p_epoch1 into model_theta1
-ckpt1 = torch.load("./params/pstar_epoch15.pt")
-vector1 = ckpt1["params"] if "params" in ckpt1 else ckpt1  # adjust key if needed
-load_params_from_vector(model_theta_star, vector1)
+# # Load p_epoch1 into model_theta1
+# ckpt1 = torch.load("./params/pstar_epoch15.pt")
+# vector1 = ckpt1["params"] if "params" in ckpt1 else ckpt1  # adjust key if needed
+# load_params_from_vector(model_theta_star, vector1)
 
-# Load p_epoch2 into model_theta2 (or use your 2nd epoch path)
-ckpt2 = torch.load("./params/p_epoch16.pt")
-vector2 = ckpt2["params"] if "params" in ckpt2 else ckpt2
-load_params_from_vector(model_theta, vector2)
+# # Load p_epoch2 into model_theta2 (or use your 2nd epoch path)
+# ckpt2 = torch.load("./params/p_epoch16.pt")
+# vector2 = ckpt2["params"] if "params" in ckpt2 else ckpt2
+# load_params_from_vector(model_theta, vector2)
 
 device = torch.device("cuda")
 model_theta_star.to(device)
@@ -270,8 +294,16 @@ model_theta.to(device)
 # Load a sample batch
 eval_pref_dataset = load_dataset(
     "Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength",
-    split="eval" 
+    split="train" 
 )
+remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
+pref_dataset = eval_pref_dataset.map(
+    process_dataset,
+    batched=True,
+    num_proc=32,
+    remove_columns=remove_columns,
+)
+
 
 tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
 if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
@@ -310,6 +342,7 @@ def get_small_pref_batch_tensors(
       pref_response_w_tensors: LongTensor [B, Lr]
       pref_response_l_tensors: LongTensor [B, Lr]
     """
+    print(dataset.column_names)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False,
                         collate_fn=collate_pref_batch)
     pref_batch = next(iter(loader))  # one small batch of raw strings
@@ -349,7 +382,7 @@ def get_small_pref_batch_tensors(
 
 pref_batch, pref_query_ids, pref_resp_w_ids, pref_resp_l_ids = get_small_pref_batch_tensors(
     tokenizer=tokenizer,
-    dataset=eval_pref_dataset,   
+    dataset=pref_dataset,   
     device=device,
     batch_size=2,                # tiny batch
     max_query_len=128,
@@ -357,6 +390,7 @@ pref_batch, pref_query_ids, pref_resp_w_ids, pref_resp_l_ids = get_small_pref_ba
     max_new_tokens=256,
     pad_to_max_length=False      # set True to mimic your TPU branch
 )
+print(pref_query_ids.shape, pref_resp_w_ids.shape, pref_resp_l_ids.shape)
 
 
 def build_teacher_forcing_inputs(tokenizer, pref_query_ids, pref_resp_w_ids):
