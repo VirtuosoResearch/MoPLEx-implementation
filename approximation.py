@@ -320,10 +320,6 @@ if __name__ == "__main__":
 
     remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
 
-    print(eval_pref_dataset)
-    print(eval_pref_dataset)
-    exit(0)
-
     pref_dataset = eval_pref_dataset.map(
         process_dataset,
         batched=True,

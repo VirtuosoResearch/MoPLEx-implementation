@@ -5,7 +5,7 @@ https://docs.google.com/document/d/1c4C8FhdSW8e904USuCePzgsQdhvtAJLvy9pk3aZub0s/
 
 - Finetuning with standard DPO
   ```bash
-  sh src/scripts/run_dpo.sh
+  sh scripts/run_dpo.sh
   ```
 
 - First-order approximation
