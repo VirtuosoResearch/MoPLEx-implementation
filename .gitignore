@@ -168,3 +168,4 @@ data
 outputs/
 tatsu-lab*
 cache/
+cmd_result/
