@@ -231,7 +231,8 @@ def approximation(model_theta1, model_theta2, pref_batch, pref_query_ids, pref_r
 if __name__ == "__main__":
     model_name = "meta-llama/Llama-3.2-3B"
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-
+    if tokenizer.padding_side == 'left':
+        tokenizer.padding_side = 'right'
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
     model_theta_star = AutoModelForCausalLM.from_pretrained(model_name)
