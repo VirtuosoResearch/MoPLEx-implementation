@@ -60,9 +60,6 @@ def validate_tokenwise_simple(
     with torch.no_grad():
         out2 = model_theta2(input_ids=input_ids, attention_mask=attention_mask, use_cache=False).logits
         logp2_full = _logprobs_from_logits(out2, labels)    # (B, L)
-    
-
-    print(asd)
 
     # 2) Param subset + Δθ in the SAME order
     param_names, params1 = _select_params(model_theta1, param_filter)
@@ -310,7 +307,7 @@ if __name__ == "__main__":
         tokenizer.pad_token = tokenizer.eos_token
 
     model_theta_star = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
-    model_theta      = AutoModelForCausalLM.from_pretrained("models/model1", trust_remote_code=True)
+    model_theta      = AutoModelForCausalLM.from_pretrained(model_name, trust_remote_code=True)
     model_theta_star.resize_token_embeddings(len(tokenizer))
     model_theta.resize_token_embeddings(len(tokenizer))
 
@@ -322,20 +319,17 @@ if __name__ == "__main__":
     )
 
     remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
+
+    print(eval_pref_dataset)
+    print(eval_pref_dataset)
+    exit(0)
+
     pref_dataset = eval_pref_dataset.map(
         process_dataset,
         batched=True,
         num_proc=32,
         remove_columns=remove_columns,
     )
-
-
-    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token = tokenizer.eos_token  # exactly what you did in training
-    # IMPORTANT: resize before loading vectors
-    model_theta_star.resize_token_embeddings(len(tokenizer))
-    model_theta.resize_token_embeddings(len(tokenizer))
 
     pref_batch, pref_query_ids, pref_resp_w_ids, pref_resp_l_ids = get_small_pref_batch_tensors(
         tokenizer=tokenizer,
