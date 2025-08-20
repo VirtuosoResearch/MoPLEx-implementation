@@ -1,0 +1,1 @@
+python motivation.py --model meta-llama/Llama-3.2-1B --batch_size 1

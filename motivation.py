@@ -10,6 +10,7 @@ from collections import OrderedDict
 from functools import reduce
 import numpy as np
 
+
 FLAGS = flags.FLAGS
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
@@ -229,11 +230,13 @@ def approximation(model_theta1, model_theta2, pref_batch, pref_query_ids, pref_r
     
 
 if __name__ == "__main__":
-    model_name = "meta-llama/Llama-3.2-3B"
+    model_name = "meta-llama/Llama-3.2-1B"
     tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
 
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
+    if tokenizer.padding_side == 'left':
+        tokenizer.padding_side = 'right'
     model_theta_star = AutoModelForCausalLM.from_pretrained(model_name)
     model_theta = AutoModelForCausalLM.from_pretrained(model_name)
     model_theta_star.resize_token_embeddings(len(tokenizer))
