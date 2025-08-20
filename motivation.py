@@ -9,7 +9,8 @@ from absl import flags
 from collections import OrderedDict
 from functools import reduce
 import numpy as np
-
+from transformers import BitsAndBytesConfig
+import argparse
 
 FLAGS = flags.FLAGS
 PROMPT_TOKEN = '<|prompter|>'
@@ -19,7 +20,7 @@ EOS_TOKEN = '<|endoftext|>'
 import math
 import random
 
-def perturb_model(model, rel_l2=0.0025, seed=42):
+def perturb_model(model, rel_l2, seed=42):
 
     rng = torch.Generator(device=next(model.parameters()).device)
     rng.manual_seed(seed)
@@ -229,49 +230,46 @@ def approximation(model_theta1, model_theta2, pref_batch, pref_query_ids, pref_r
     print(f"error_mean: {np.mean(error)}, error_std: {np.std(error)}")
     
 
-if __name__ == "__main__":
-    model_name = "meta-llama/Llama-3.2-1B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-
-    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
-        tokenizer.pad_token = tokenizer.eos_token
+def main(args):
+    model_name = args.model
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.padding_side == 'left':
         tokenizer.padding_side = 'right'
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_quant_type="nf4",
+        llm_int8_threshold=6.0
+    )
     model_theta_star = AutoModelForCausalLM.from_pretrained(model_name)
     model_theta = AutoModelForCausalLM.from_pretrained(model_name)
     model_theta_star.resize_token_embeddings(len(tokenizer))
     model_theta.resize_token_embeddings(len(tokenizer))
 
-    model_theta, _ = perturb_model(model_theta, rel_l2=0.01)
+    model_theta, _ = perturb_model(model_theta, rel_l2=args.distance)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 
     eval_pref_dataset = load_dataset(
-        "Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength",
+        args.dataset,
         split="train" 
     )
-
     remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
-
-    pref_dataset = eval_pref_dataset.map(
-        process_dataset,
-        batched=True,
-        num_proc=32,
-        remove_columns=remove_columns,
-    )
-
+    pref_dataset = eval_pref_dataset.map(process_dataset, batched=True, num_proc=32, remove_columns=remove_columns)
     pref_batch, pref_query_ids, pref_resp_w_ids, pref_resp_l_ids = get_small_pref_batch_tensors(
         tokenizer=tokenizer,
         dataset=pref_dataset,   
         device=device,
-        batch_size=2,                # tiny batch
+        batch_size=args.batch_size,
         max_query_len=128,
         max_resp_len=64,
         max_new_tokens=256,
         pad_to_max_length=False      # set True to mimic your TPU branch
     )
 
-    results = approximation(
+    approximation(
         model_theta1=model_theta_star,
         model_theta2=model_theta,
         pref_batch=pref_batch,
@@ -280,3 +278,13 @@ if __name__ == "__main__":
         pref_resp_l_ids=pref_resp_l_ids,
         device=device,
     )
+
+if __name__=="__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--dataset", default="Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength", type=str)
+    parser.add_argument("--device", default=0, type=int)
+    parser.add_argument("--model", default="meta-llama/Llama-3.2-1B", type=str)
+    parser.add_argument("--batch_size", default=2, type=int)
+    parser.add_argument("--distance", default=0.025, type=float)
+    args = parser.parse_args()
+    main(args)
