@@ -80,13 +80,13 @@ def collate_pref_batch(examples):
 @torch.no_grad()
 def get_small_pref_batch_tensors(
     tokenizer,
-    dataset,                 # e.g., your eval_pref_dataset
+    dataset, 
     device="cuda",
-    batch_size=2,            # small B (1–4)
+    batch_size=2,
     max_query_len=128,
     max_resp_len=64,
     max_new_tokens=256,
-    pad_to_max_length=False, # True mimics padding='max_length' in your code
+    pad_to_max_length=False,
 ):
     """
     Returns:
@@ -100,7 +100,6 @@ def get_small_pref_batch_tensors(
                         collate_fn=collate_pref_batch)
     pref_batch = next(iter(loader))  # one small batch of raw strings
 
-    # 1) Tokenize queries
     query_enc = tokenizer(
         pref_batch["query"],
         padding=("max_length" if pad_to_max_length else True),
@@ -122,7 +121,6 @@ def get_small_pref_batch_tensors(
     tokenized = resp_enc.input_ids  # LongTensor [B_w + B_l, Lr]
     B_w = len(pref_batch["response_w"])
 
-    # Split back into winner/loser chunks
     pref_response_w_tensors = tokenized[:B_w].to(device)        # [B, Lr]
     pref_response_l_tensors = tokenized[B_w:].to(device)        # [B, Lr]
 
@@ -223,7 +221,7 @@ def approximation(model_theta1, model_theta2, pref_batch, pref_query_ids, pref_r
     a = np.array(t2_w_approx.tolist() + t2_l_approx.tolist())
     b = np.array(t2_w_sum.tolist() + t2_l_sum.tolist())
 
-    error = np.abs(a-b) / np.maximum(np.abs(a),np.abs(b))
+    error = np.square(np.abs(a-b) / np.maximum(np.abs(a),np.abs(b)))
     print(np.abs(a-b))
     print(np.maximum(np.abs(a),np.abs(b)))
     print(error)
@@ -248,7 +246,7 @@ def main(args):
     model_theta_star.resize_token_embeddings(len(tokenizer))
     model_theta.resize_token_embeddings(len(tokenizer))
 
-    model_theta, _ = perturb_model(model_theta, rel_l2=args.distance)
+    model_theta, _ = perturb_model(model_theta, rel_l2=args.distance, seed=args.seed)
 
     device = torch.device(f"cuda:{args.device}" if torch.cuda.is_available() else "cpu")
 
@@ -286,5 +284,6 @@ if __name__=="__main__":
     parser.add_argument("--model", default="meta-llama/Llama-3.2-1B", type=str)
     parser.add_argument("--batch_size", default=2, type=int)
     parser.add_argument("--distance", default=0.025, type=float)
+    parser.add_argument("--seed", default=1, type=int)
     args = parser.parse_args()
     main(args)
