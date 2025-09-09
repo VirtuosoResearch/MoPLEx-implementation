@@ -151,6 +151,7 @@ ASSISTANT_TOKEN = '<|assistant|>'
 EOS_TOKEN = '<|endoftext|>'
 
 def main(_):
+    print("FLAGS.dataset_path: ",FLAGS.dataset_path)
     dataset = load_dataset(FLAGS.dataset_path, split="unlabeled", trust_remote_code=True)
     eval_dataset = load_dataset(FLAGS.dataset_path, split="val")
 

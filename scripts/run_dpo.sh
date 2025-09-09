@@ -4,9 +4,9 @@ wandb_project="dpo"
 model_name="meta-llama/Llama-3.2-1B"
 output_dir='outputs'
 export WANDB_PROJECT=$wandb_project
-export WANDB_API_KEY="f184d849774f4eeeb2c4cc8e863a5874455172e4"
-export WANDB_USERNAME="youranye2003"
-export WANDB_USER_EMAIL="youranye2003@gmail.com"
+export WANDB_API_KEY="b3ea34bec4058d216f518671f078ed74c5b1dda3"
+export WANDB_USERNAME="2462970640"
+export WANDB_USER_EMAIL="2462970640@qq.com"
 export HF_DATASETS_CACHE=$cache_dir
 
 wandb_project="01_30_dpo_ablation_all_datasets"
