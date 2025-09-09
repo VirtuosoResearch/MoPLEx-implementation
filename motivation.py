@@ -5,14 +5,12 @@ import torch
 from datasets import load_dataset
 from torch.utils.data import DataLoader
 from transformers import AutoTokenizer
-from absl import flags
 from collections import OrderedDict
 from functools import reduce
 import numpy as np
 from transformers import BitsAndBytesConfig
 import argparse
 
-FLAGS = flags.FLAGS
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
 EOS_TOKEN = '<|endoftext|>'
