@@ -1,7 +1,6 @@
-# Scalable preference tuning and inference from multiple sources
+# Scalable direct preference optimization and inference
 
-Document:
-https://docs.google.com/document/d/1c4C8FhdSW8e904USuCePzgsQdhvtAJLvy9pk3aZub0s/edit?tab=t.0#heading=h.84zfoewodm9w
+Document: https://docs.google.com/document/d/1K3690xE6Axo1hSqcxgbScRxwCSHCZf4RgrM27pF2Xrc/edit?usp=sharing
 
 - Finetuning with standard DPO
   ```bash
@@ -12,4 +11,3 @@ https://docs.google.com/document/d/1c4C8FhdSW8e904USuCePzgsQdhvtAJLvy9pk3aZub0s/
   ```bash
   python motivation.py
   ```
-  
