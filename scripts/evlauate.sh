@@ -1,0 +1,4 @@
+python trainers/dpo_evaluate.py \
+  --model_path outputs/01_30_dpo_ablation_all_datasets/dpo_relabeled_alpacafarm_pythiasft_20K_preference_data_minlength_beta0.05_lr1e-7_bs16_gradacc8/01_30_dpo_ablation_all_datasets_dpo_relabeled_alpacafarm_pythiasft_20K_preference_data_minlength_beta0.05_lr1e-7_bs16_gradacc8_epoch_14 \
+  --dataset_path 'Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength' \
+  --split test
