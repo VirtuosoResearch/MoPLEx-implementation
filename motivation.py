@@ -233,12 +233,7 @@ def main(args):
         tokenizer.padding_side = 'right'
     if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
         tokenizer.pad_token = tokenizer.eos_token
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_quant_type="nf4",
-        llm_int8_threshold=6.0
-    )
+
     model_theta_star = AutoModelForCausalLM.from_pretrained(model_name)
     model_theta = AutoModelForCausalLM.from_pretrained(model_name)
     model_theta_star.resize_token_embeddings(len(tokenizer))

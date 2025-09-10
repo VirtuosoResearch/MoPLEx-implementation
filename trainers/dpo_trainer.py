@@ -372,6 +372,13 @@ class DPOTrainer():
             responses_l_ = responses_l[i : i + sub_bs]
             preference_mask_ = preference_mask[i : i + sub_bs] if preference_mask is not None else None
 
+            print(queries_.size())
+            print(responses_w_.size())
+            print(responses_l_.size())
+            print("queries: ",self.tokenizer.decode(queries_))
+            print("response_w: ",self.tokenizer.decode(responses_w_))
+            print("response_l: ",self.tokenizer.decode(responses_w_))
+
             loss, stats = self._step(
                 queries=queries_,
                 responses_w=responses_w_,
@@ -379,7 +386,8 @@ class DPOTrainer():
                 return_stats=True,
                 preference_mask=preference_mask_,
             )
-            
+            print("loss: ", loss)
+            print("stats: ", stats)
             self.optimizer.zero_grad()
             self.accelerator.backward(loss)
             self.optimizer.step()

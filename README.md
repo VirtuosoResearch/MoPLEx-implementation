@@ -10,6 +10,6 @@ https://docs.google.com/document/d/1c4C8FhdSW8e904USuCePzgsQdhvtAJLvy9pk3aZub0s/
 
 - First-order approximation
   ```bash
-  python approximation.py
+  python motivation.py
   ```
   

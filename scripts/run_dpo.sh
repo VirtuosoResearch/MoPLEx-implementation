@@ -16,8 +16,8 @@ debug=false
 lrs=(1e-7 5e-7) 
 betas=(0.05 0.1)
 gradient_accumulation_steps=8
-batch_size=16
-mini_batch_size=2
+batch_size=4
+mini_batch_size=1
 downsample_ratio=0.01
 
 data_min='Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength'
