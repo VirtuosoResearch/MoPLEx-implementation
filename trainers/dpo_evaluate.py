@@ -32,7 +32,7 @@ def main():
     parser.add_argument("--field_l", type=str, default="response_l")
     args = parser.parse_args()
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
     tokenizer = AutoTokenizer.from_pretrained(args.model_path, use_fast=True)
     model = AutoModelForCausalLM.from_pretrained(args.model_path).to(device)
     model.eval()

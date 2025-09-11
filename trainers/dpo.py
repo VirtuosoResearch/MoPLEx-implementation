@@ -42,7 +42,7 @@ flags.DEFINE_string('tokenizer_type', "EleutherAI/pythia-1.4b", 'the model name'
 flags.DEFINE_string('pretrained_dir', "", 'the path to the pretrained model')
 flags.DEFINE_float('learning_rate', 1.0e-6, 'the learning rate')
 flags.DEFINE_float('cosine_annealing_lr_eta_min', 1.0e-7, 'the cosine annealing eta min')
-flags.DEFINE_integer('num_train_epochs', 50, 'the number of training epochs')
+flags.DEFINE_integer('num_train_epochs', 5, 'the number of training epochs')
 flags.DEFINE_integer('inner_iteration_steps', 1, 'the number of training epochs')
 flags.DEFINE_integer('eval_every_steps', 10, 'how often to evaluate')
 flags.DEFINE_integer('save_every_steps', 1000, 'how often to save checkpoints')
@@ -441,7 +441,7 @@ def main(_):
         assert pref_response_l_tensors.shape[0] == len(pref_batch["response_l"])
         pref_response_l_tensors = accelerate.utils.send_to_device(pref_response_l_tensors, trainer.accelerator.device)
 
-        print(pref_response_w_tensors[0])
+        # print(pref_response_w_tensors[0])
         
         return pref_batch, pref_query_tensors, pref_response_w_tensors, pref_response_l_tensors
     
