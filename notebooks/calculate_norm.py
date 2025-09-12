@@ -1,11 +1,27 @@
 import torch
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from trainers.network_utils import AutoModelForCausalLMWithValueHead
 
-model_path = "/home/michael/project/Preference-tuning-and-evaluation/outputs/01_30_dpo_ablation_all_datasets/dpo_relabeled_alpacafarm_pythiasft_20K_preference_data_minlength_beta0.05_lr1e-7_bs16_gradacc8/01_30_dpo_ablation_all_datasets_dpo_relabeled_alpacafarm_pythiasft_20K_preference_data_minlength_beta0.05_lr1e-7_bs16_gradacc8_num_batches_0"
+model_path = "/home/michael/project/Preference-tuning-and-evaluation/outputs/01_30_dpo_ablation_all_datasets/dpo_relabeled_alpacafarm_pythiasft_20K_preference_data_minlength_beta0.05_lr1e-7_bs4_gradacc4/01_30_dpo_ablation_all_datasets_dpo_relabeled_alpacafarm_pythiasft_20K_preference_data_minlength_beta0.05_lr1e-7_bs4_gradacc4_epoch_4"
 
 model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float32)
-
-raw_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
+# "EleutherAI/pythia-1.4b"
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
+tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
+tokenizer.padding_side = "left"
+tokenizer.truncation_side = "left"
+eos = tokenizer.eos_token
+policy = AutoModelForCausalLM.from_pretrained(
+    "meta-llama/Llama-3.2-1B",
+    cache_dir="cache", 
+    torch_dtype=torch.float32,
+    low_cpu_mem_usage=True,
+    device_map='auto',
+    trust_remote_code=True
+)
+policy.resize_token_embeddings(len(tokenizer))
+raw_model = AutoModelForCausalLMWithValueHead(policy)
+# raw_model = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.2-1B")
 
 total1, total2=0.0, 0.0
 
@@ -21,6 +37,8 @@ for p in raw_model.parameters():
 total2 = total2 **0.5
 print(total2)
 
+model = model.to("cpu")
+raw_model = raw_model.to("cpu")
 d_total = 0.0
 for p1, p2 in zip(model.parameters(), raw_model.parameters()):
     diff = p1.data-p2.data
