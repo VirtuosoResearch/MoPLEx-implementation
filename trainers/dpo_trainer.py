@@ -390,40 +390,6 @@ class DPOTrainer():
             self.optimizer.step()
             self.current_step += 1
         return stats
-
-    # def step(
-    #     self,
-    #     queries: torch.LongTensor,
-    #     responses_w: torch.LongTensor,
-    #     responses_l: torch.LongTensor,
-    #     preference_mask: Optional[torch.BoolTensor] = None,  # (bs,)
-    # ):
-    #     assert queries.ndim == 2 and responses_w.ndim == 2 and responses_l.ndim == 2
-    #     self.model.train()
-    #     bs = self.config.batch_size
-    #     sub_bs = self.config.mini_batch_size
-    #     assert bs % sub_bs == 0
-
-    #     for i in tqdm.tqdm(range(0, bs, sub_bs), desc="Training with Minibatches", leave=False):
-    #         queries_ = queries[i: i + sub_bs]
-    #         responses_w_ = responses_w[i: i + sub_bs]
-    #         responses_l_ = responses_l[i: i + sub_bs]
-    #         preference_mask_ = preference_mask[i: i + sub_bs] if preference_mask is not None else None
-
-    #         loss, stats = self._step(
-    #             queries=queries_,
-    #             responses_w=responses_w_,
-    #             responses_l=responses_l_,
-    #             return_stats=True,
-    #             preference_mask=preference_mask_
-    #         )
-
-    #         self.optimizer.zero_grad()
-    #         self.accelerator.backward(loss)
-    #         self.optimizer.step()
-    #         self.current_step += 1
-
-    #     return stats
     
     def end_of_epoch_step(self, epoch: int):
         """Performs tasks at the end of an epoch, like saving models."""

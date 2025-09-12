@@ -14,6 +14,8 @@ from trainers.dpo_trainer import DPOTrainer
 from trainers.dpo_config import DPOConfig
 from trainers.approx_dpo_trainer import ApproxDPOTrainer
 
+from datasets import Dataset, DatasetDict
+
 #from alpaca_farm.models.reward_model import RewardModel, RewardConfig
 import torch
 from absl import flags, app
@@ -81,78 +83,12 @@ flags.DEFINE_bool('approx_dpo', False, 'whether to use approx dpo')
 flags.DEFINE_integer('save_pstar_at_epoch', -1, 'the epoch after which to save p_star and grad_star. Set to -1 to disable.')
 flags.DEFINE_string('pstar_save_path', './pstar_grads.pt', 'the file path to save p_star and grad_star')
 
-# flags for saving p
-# tba
-
-
-def get_dataset(path, num_samples=-1, return_test_data=True, num_samples_test=1000):
-    assert os.path.exists(path)
-    folders = os.listdir(path)
-    regex = r"^\d+-\d+$"
-    folders = [x for x in folders if re.search(regex, x)]
-    folders.sort(key=lambda x: int(x.split("-")[0]))
-    total_samples = int(folders[-1].split("-")[-1])
-
-    assert 0 < num_samples <= total_samples - num_samples_test, f"num_samples {num_samples} must be between 0 and {total_samples} - {num_samples_test}"
-    assert 0 < num_samples_test <= total_samples, f"num_samples_test {num_samples_test} must be between 0 and {total_samples}"
-    
-    num_samples_train = num_samples if num_samples > 0 else total_samples - num_samples_test
-    test_folders = [x for x in folders if int(x.split("-")[0]) >= num_samples_train]
-    folders = [x for x in folders if int(x.split("-")[0]) < num_samples_train]
-    
-    datasets = [load_from_disk(os.path.join(path, x)) for x in folders]
-    full_data =  concatenate_datasets(datasets)
-    
-    if num_samples > 0:
-        full_data = full_data.select(range(num_samples))
-        
-    if return_test_data:
-        test_datasets = [load_from_disk(os.path.join(path, x)) for x in test_folders]
-        test_data = concatenate_datasets(test_datasets)
-        if num_samples_test > 0:
-            test_data = test_data.select(range(num_samples_test))
-        return full_data, test_data
-    
-    return full_data
-    
-
-def construct_dataset(
-    path,
-    num_samples=-1,
-    concatenate_prompt=False,
-    num_samples_test=1000,
-):
-    data, test_data = get_dataset(path, num_samples=num_samples, return_test_data=True, num_samples_test=num_samples_test)
-
-    if concatenate_prompt:
-        def map_fn(d):
-            for k in ["y_ref", "y_w", "y_l"]:
-                d[k] = d["prompt"] + d[k]
-            return d
-        
-        data = data.map(
-            map_fn,
-            num_proc=FLAGS.num_proc,
-        )
-
-    dataset_name = os.path.basename(path).split(".")[0]
-
-    ds = DatasetDict(
-        {
-            "train": data,
-            "test": test_data,
-        }
-    ) 
-    return dataset_name, ds
-
 
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
 EOS_TOKEN = '<|endoftext|>'
 
-from datasets import Dataset, DatasetDict
-
-def main(_):
+def load_train_eval_data(eos):
     print("FLAGS.dataset_path: ",FLAGS.dataset_path)
     dataset = load_dataset(FLAGS.dataset_path, split="unlabeled", trust_remote_code=True)
     eval_dataset = load_dataset(FLAGS.dataset_path, split="val")
@@ -177,66 +113,10 @@ def main(_):
     batch_size_pref_data = FLAGS.batch_size
     batch_size_online_data = 0
     
-    if FLAGS.preference_dataset_path in ['tatsu-lab/alpaca_farm', 'Asap7772/alpaca_human_preference_gold', 'Asap7772/alpaca_human_preference_minlength', 'Asap7772/alpaca_human_preference_maxlength']:
-        if FLAGS.preference_dataset_path == 'tatsu-lab/alpaca_farm':
-            pref_dataset = load_dataset(FLAGS.preference_dataset_path, FLAGS.preference_dataset_subset, split="preference")
-        else:
-            split='train' if 'length' in FLAGS.preference_dataset_path else FLAGS.preference_dataset_split
-
-            pref_dataset = load_dataset(FLAGS.preference_dataset_path, split=split)
-        pref_dataset = pref_dataset.train_test_split(test_size=0.1, seed=FLAGS.seed)
-        
-        def process_dataset(batch):
-            new_batch = defaultdict(list)
-            for inst, inp, out1, out2, pref in zip(batch['instruction'], batch['input'], batch['output_1'], batch['output_2'], batch['preference']):
-                if pref == 1:
-                    selected = out1
-                    rejected = out2
-                else:
-                    selected = out2
-                    rejected = out1
-                if inp:
-                    text = f"{PROMPT_TOKEN}{inst}\n{inp}{EOS_TOKEN}{ASSISTANT_TOKEN}"
-                else:
-                    text = f"{PROMPT_TOKEN}{inst}{EOS_TOKEN}{ASSISTANT_TOKEN}"
-                
-                new_batch['prompt'].append(text)
-                new_batch['y_w'].append(f"{text}{selected}{EOS_TOKEN}")
-                new_batch['y_l'].append(f"{text}{rejected}{EOS_TOKEN}")
-            return new_batch
-        
-        pref_dataset = pref_dataset.map(
-            process_dataset,
-            batched=FLAGS.batched,
-            num_proc=FLAGS.num_proc,
-        )
-
-        if FLAGS.downsample_ratio < '1.0':
-            downsample_ratio = float(FLAGS.downsample_ratio)
-            if downsample_ratio <= 0 or downsample_ratio > 1:
-                raise ValueError(f"downsample_ratio must be between 0 and 1, but got {downsample_ratio}")
-            pref_dataset = pref_dataset.shuffle(seed=FLAGS.seed).select(range(int(len(pref_dataset) * downsample_ratio)))
-        
-        pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
-        remove_columns = ['instruction', 'input', 'output_1', 'output_2', 'preference', 'raw_preference', 'prompt', 'y_w', 'y_l']
-    else:
-        # print("*"*20)
-        # print(FLAGS.preference_dataset_path)
-        # print("*"*20)
-        # exit(0)
-        if FLAGS.preference_dataset_path.startswith('Asap7772'):
-            pref_dataset_name = os.path.basename(FLAGS.preference_dataset_path)
-            pref_dataset = load_dataset(FLAGS.preference_dataset_path)
-        else:
-            pref_dataset_name, pref_dataset = construct_dataset(
-                path=FLAGS.preference_dataset_path,
-                num_samples=FLAGS.preference_num_samples,
-                concatenate_prompt=False,
-            )
-        print('Loaded dataset', pref_dataset_name)
-        
-        pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
-        remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
+    pref_dataset = load_dataset(FLAGS.preference_dataset_path)
+    
+    pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
+    remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
 
     if FLAGS.downsample_ratio < '1.0':
         downsample_ratio = float(FLAGS.downsample_ratio)
@@ -245,7 +125,6 @@ def main(_):
         pref_dataset = pref_dataset.shuffle(seed=FLAGS.seed).select(range(int(len(pref_dataset) * downsample_ratio)))
         eval_pref_dataset = eval_pref_dataset.shuffle(seed=FLAGS.seed).select(range(int(len(eval_pref_dataset) * downsample_ratio)))
         
-
     def process_dataset(batch):
         new_batch = {}
         new_batch['query'] = batch['prompt']
@@ -310,28 +189,6 @@ def main(_):
         seed=FLAGS.seed,
     )
 
-    print(FLAGS.tokenizer_type)
-
-    tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer_type)
-    tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
-    tokenizer.padding_side = "left"
-    tokenizer.truncation_side = "left"
-    eos = tokenizer.eos_token
-    
-    print(FLAGS.pretrained_dir)
-    print(FLAGS.cache_dir)
-    # exit(0)
-    policy = AutoModelForCausalLM.from_pretrained(
-        FLAGS.pretrained_dir,
-        cache_dir=FLAGS.cache_dir, 
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-        device_map='auto',
-        trust_remote_code=True
-    )
-    policy.resize_token_embeddings(len(tokenizer))
-    model = AutoModelForCausalLMWithValueHead(policy)
-
     def formatting_prompts_func(example):
         inst, inp = example['instruction'], example['input']
         if inp:
@@ -346,6 +203,63 @@ def main(_):
 
     print('Sample Train prompt:', dataset[0]['query'])
     print('Sample Eval prompt:', eval_dataset[0]['query'])
+
+    pref_dataset_dataloader = torch.utils.data.DataLoader(
+        pref_dataset,
+        batch_size=max(batch_size_pref_data, 1),
+        collate_fn=None,
+        shuffle=True,
+        drop_last=True,
+    )
+    train_as_eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
+        pref_dataset,
+        batch_size=FLAGS.mini_batch_size,
+        collate_fn=None,
+        shuffle=True,
+        drop_last=True,
+    )
+    eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
+        eval_pref_dataset,
+        batch_size=FLAGS.mini_batch_size,
+        collate_fn=None,
+        shuffle=True,
+        drop_last=True,
+    )
+    all_eval_dataloaders = {
+        "train_as_eval_pref": train_as_eval_pref_dataset_dataloader,
+        "eval_pref": eval_pref_dataset_dataloader,
+    }
+    
+    zipped_dataloaders = pref_dataset_dataloader
+    total_len = len(pref_dataset_dataloader)
+
+    return dataset, eval_dataset, config, output_dir, model_name, all_eval_dataloaders, zipped_dataloaders, total_len
+
+def main(_):
+
+    print(FLAGS.tokenizer_type)
+
+    tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer_type)
+    tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
+    eos = tokenizer.eos_token
+    
+    print(FLAGS.pretrained_dir)
+    print(FLAGS.cache_dir)
+
+    policy = AutoModelForCausalLM.from_pretrained(
+        FLAGS.pretrained_dir,
+        cache_dir=FLAGS.cache_dir, 
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+        device_map='auto',
+        trust_remote_code=True
+    )
+    policy.resize_token_embeddings(len(tokenizer))
+    model = AutoModelForCausalLMWithValueHead(policy)
+
+    dataset, eval_dataset, config, output_dir, model_name, all_eval_dataloaders, zipped_dataloaders, total_len = load_train_eval_data(eos)
 
     TrainerClass = ApproxDPOTrainer if FLAGS.approx_dpo else DPOTrainer
 
@@ -395,39 +309,7 @@ def main(_):
             if trainer.accelerator.is_main_process:
                 tokenizer.save_pretrained(checkpoint_dir)
             trainer.accelerator.print(f"Checkpointing Epoch {epoch_num} -> {checkpoint_dir}")
- 
-    pref_dataset_dataloader = torch.utils.data.DataLoader(
-        pref_dataset,
-        batch_size=max(batch_size_pref_data, 1),
-        collate_fn=None,
-        shuffle=True,
-        drop_last=True,
-    )
-    
-    train_as_eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
-        pref_dataset,
-        batch_size=FLAGS.mini_batch_size,
-        collate_fn=None,
-        shuffle=True,
-        drop_last=True,
-    )
-    
-    eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
-        eval_pref_dataset,
-        batch_size=FLAGS.mini_batch_size,
-        collate_fn=None,
-        shuffle=True,
-        drop_last=True,
-    )
-    
-    all_eval_dataloaders = {
-        "train_as_eval_pref": train_as_eval_pref_dataset_dataloader,
-        "eval_pref": eval_pref_dataset_dataloader,
-    }
 
-    
-    zipped_dataloaders = pref_dataset_dataloader
-    total_len = len(pref_dataset_dataloader)
     
     @empty_cache_decorator
     @torch.no_grad()
