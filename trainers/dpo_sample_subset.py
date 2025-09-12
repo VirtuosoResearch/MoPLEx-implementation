@@ -150,6 +150,8 @@ PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
 EOS_TOKEN = '<|endoftext|>'
 
+from datasets import Dataset, DatasetDict
+
 def main(_):
     print("FLAGS.dataset_path: ",FLAGS.dataset_path)
     dataset = load_dataset(FLAGS.dataset_path, split="unlabeled", trust_remote_code=True)
@@ -167,7 +169,7 @@ def main(_):
     print(len(eval_dataset), 'eval samples after downsampling')
 
     output_dir = f"{FLAGS.output_dir}/{FLAGS.wandb_project}/{FLAGS.run_name}"
-    model_name = f"{FLAGS.wandb_project}_{FLAGS.run_name}"
+    model_name = f"{FLAGS.run_name}"
     
     print('Output dir:', output_dir)
     print('Model name:', model_name)
@@ -178,13 +180,6 @@ def main(_):
     if FLAGS.preference_dataset_path in ['tatsu-lab/alpaca_farm', 'Asap7772/alpaca_human_preference_gold', 'Asap7772/alpaca_human_preference_minlength', 'Asap7772/alpaca_human_preference_maxlength']:
         if FLAGS.preference_dataset_path == 'tatsu-lab/alpaca_farm':
             pref_dataset = load_dataset(FLAGS.preference_dataset_path, FLAGS.preference_dataset_subset, split="preference")
-            
-            # print("*"*20)
-            # print(FLAGS.preference_dataset_path)
-            # print(split)
-            # print("*"*20)
-            # exit(0)
-            
         else:
             split='train' if 'length' in FLAGS.preference_dataset_path else FLAGS.preference_dataset_split
 
@@ -266,7 +261,6 @@ def main(_):
             assert False, f"Shapes of all columns must be equal, but got {shapes}, {list(shapes.values())}"
         return new_batch
 
-
     pref_dataset = pref_dataset.map(
         process_dataset,
         batched=FLAGS.batched,
@@ -274,6 +268,8 @@ def main(_):
         remove_columns=remove_columns,
     )
     
+    print("len(pref_dataset): ",len(pref_dataset))
+
     eval_pref_dataset = eval_pref_dataset.map(
         process_dataset,
         batched=FLAGS.batched,
@@ -316,7 +312,7 @@ def main(_):
 
     print(FLAGS.tokenizer_type)
 
-    tokenizer = AutoTokenizer.from_pretrained(FLAGS.pretrained_dir)
+    tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer_type)
     tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "left"
@@ -350,14 +346,6 @@ def main(_):
 
     print('Sample Train prompt:', dataset[0]['query'])
     print('Sample Eval prompt:', eval_dataset[0]['query'])
-
-    # trainer = DPOTrainer(
-    #     model=model,
-    #     config=config,
-    #     dataset=dataset,
-    #     tokenizer=tokenizer,
-    #     additional_config_kwargs=FLAGS.flag_values_dict(),
-    # )
 
     TrainerClass = ApproxDPOTrainer if FLAGS.approx_dpo else DPOTrainer
 
@@ -592,10 +580,6 @@ def main(_):
             stats['epoch'] = epoch + sub_iteration/len(zipped_dataloaders)
             stats['total_iterations'] = total_iterations
             stats['gradient_steps'] = total_iterations * FLAGS.inner_iteration_steps
-
-            if stats['total_iterations'] % FLAGS.save_every_steps == 0:
-                num_batches = stats['total_iterations']
-                save_model(model_name + f"_num_batches_{num_batches}", epoch)
 
             total_iterations += 1
             trainer.log_stats(
