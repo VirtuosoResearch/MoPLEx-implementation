@@ -9,16 +9,17 @@ export WANDB_USERNAME="2462970640"
 export WANDB_USER_EMAIL="2462970640@qq.com"
 export HF_DATASETS_CACHE=$cache_dir
 
-wandb_project="01_30_dpo_ablation_all_datasets"
+wandb_project="09_13_dpo_ablation_all_datasets"
 which_exp=${1:--1}
 dryrun=false
 debug=false
 lrs=(1e-7 5e-7) 
-betas=(0.05 0.1)
+betas=(0.05)
 gradient_accumulation_steps=4
 batch_size=4
 mini_batch_size=2
 downsample_ratio=0.01
+seed = 3
 
 data_min='Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength'
 data_max='Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_maxlength'
@@ -43,13 +44,14 @@ for lr in "${lrs[@]}"; do
         continue
     fi
 
-    run_name="dpo_${dataset_basename}_beta${beta}_lr${lr}_bs${batch_size}_gradacc${gradient_accumulation_steps}"
+    run_name="dpo_${dataset_basename}_beta${beta}_lr${lr}_bs${batch_size}_gradacc${gradient_accumulation_steps}_sd${seed}"
     echo "Running experiment $exp_num: $run_name"
 
     command="python -m trainers.dpo \
         --wandb_project $wandb_project \
         --run_name $run_name \
         --inner_iteration_steps 1 \
+        --tokenizer_type $model_name \
         --batch_size $batch_size \
         --mini_batch_size $mini_batch_size \
         --pretrained_dir $model_name \
@@ -60,6 +62,7 @@ for lr in "${lrs[@]}"; do
         --learning_rate $lr \
         --output_dir $output_dir \
         --downsample_ratio $downsample_ratio \
+        --seed $seed \
     "
 
     if [[ $ipo_loss = true ]]; then
