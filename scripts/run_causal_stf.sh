@@ -44,7 +44,7 @@ command="python ./trainers/sft.py \
     --dataset_path \"$dataset_path\" \
     --pretrained_dir=\"$model\" \
     --output_dir=\"$output_dir\" \
-    --num_train_epochs 10
+    --num_train_epochs 20
 "
 
 

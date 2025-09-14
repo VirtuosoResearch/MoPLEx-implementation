@@ -106,6 +106,8 @@ def main(_):
     if FLAGS.dataset_path == "tatsu-lab/alpaca_farm":
         dataset = load_dataset(FLAGS.dataset_path, split="sft")
         eval_dataset = load_dataset(FLAGS.dataset_path, split="val")
+        dataset = dataset.shuffle(seed=42).select(range(min(100, len(dataset))))
+        eval_dataset = eval_dataset.shuffle(seed=42).select(range(min(100, len(eval_dataset))))
     else:
         dataset_name, dataset = construct_dataset(
             path=FLAGS.dataset_path,
