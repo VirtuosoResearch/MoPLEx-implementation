@@ -57,6 +57,7 @@ echo "Running experiment $run_name"
 command="python -m trainers.dpo_sample_subset \
     --wandb_project $wandb_project \
     --run_name $run_name \
+    --tokenizer_type $model_name \
     --inner_iteration_steps 1 \
     --batch_size $batch_size \
     --mini_batch_size $mini_batch_size \
