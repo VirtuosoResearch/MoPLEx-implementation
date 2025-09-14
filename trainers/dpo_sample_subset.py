@@ -90,7 +90,7 @@ EOS_TOKEN = '<|endoftext|>'
 
 def load_train_eval_data(eos):
     print("FLAGS.dataset_path: ",FLAGS.dataset_path)
-    dataset = load_dataset(FLAGS.dataset_path, split="unlabeled", trust_remote_code=True)
+    dataset = load_dataset(FLAGS.dataset_path, split="unlabeled")
     eval_dataset = load_dataset(FLAGS.dataset_path, split="val")
 
     print(len(dataset), 'train samples')
@@ -254,7 +254,6 @@ def main(_):
         torch_dtype=torch.float32,
         low_cpu_mem_usage=True,
         device_map='auto',
-        trust_remote_code=True
     )
     policy.resize_token_embeddings(len(tokenizer))
     model = AutoModelForCausalLMWithValueHead(policy)

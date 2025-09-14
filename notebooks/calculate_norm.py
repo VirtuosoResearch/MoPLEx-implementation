@@ -15,7 +15,6 @@ policy = AutoModelForCausalLM.from_pretrained(
     torch_dtype=torch.float32,
     low_cpu_mem_usage=True,
     device_map='auto',
-    trust_remote_code=True
 )
 policy.resize_token_embeddings(len(tokenizer))
 raw_model = AutoModelForCausalLMWithValueHead(policy)

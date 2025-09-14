@@ -152,7 +152,7 @@ EOS_TOKEN = '<|endoftext|>'
 
 def main(_):
     print("FLAGS.dataset_path: ",FLAGS.dataset_path)
-    dataset = load_dataset(FLAGS.dataset_path, split="unlabeled", trust_remote_code=True)
+    dataset = load_dataset(FLAGS.dataset_path, split="unlabeled")
     eval_dataset = load_dataset(FLAGS.dataset_path, split="val")
 
     print(len(dataset), 'train samples')
@@ -178,12 +178,6 @@ def main(_):
     if FLAGS.preference_dataset_path in ['tatsu-lab/alpaca_farm', 'Asap7772/alpaca_human_preference_gold', 'Asap7772/alpaca_human_preference_minlength', 'Asap7772/alpaca_human_preference_maxlength']:
         if FLAGS.preference_dataset_path == 'tatsu-lab/alpaca_farm':
             pref_dataset = load_dataset(FLAGS.preference_dataset_path, FLAGS.preference_dataset_subset, split="preference")
-            
-            # print("*"*20)
-            # print(FLAGS.preference_dataset_path)
-            # print(split)
-            # print("*"*20)
-            # exit(0)
             
         else:
             split='train' if 'length' in FLAGS.preference_dataset_path else FLAGS.preference_dataset_split
@@ -216,19 +210,9 @@ def main(_):
             num_proc=FLAGS.num_proc,
         )
 
-        if FLAGS.downsample_ratio < '1.0':
-            downsample_ratio = float(FLAGS.downsample_ratio)
-            if downsample_ratio <= 0 or downsample_ratio > 1:
-                raise ValueError(f"downsample_ratio must be between 0 and 1, but got {downsample_ratio}")
-            pref_dataset = pref_dataset.shuffle(seed=FLAGS.seed).select(range(int(len(pref_dataset) * downsample_ratio)))
-        
         pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
         remove_columns = ['instruction', 'input', 'output_1', 'output_2', 'preference', 'raw_preference', 'prompt', 'y_w', 'y_l']
     else:
-        # print("*"*20)
-        # print(FLAGS.preference_dataset_path)
-        # print("*"*20)
-        # exit(0)
         if FLAGS.preference_dataset_path.startswith('Asap7772'):
             pref_dataset_name = os.path.basename(FLAGS.preference_dataset_path)
             pref_dataset = load_dataset(FLAGS.preference_dataset_path)
@@ -305,6 +289,7 @@ def main(_):
         },
         tracker_kwargs={
             "wandb": {
+                "entity": "VirtuosoResearch",
                 "name": FLAGS.run_name, 
                 "id": unique_str,
                 "dir": wandb_output_dir,
@@ -331,7 +316,6 @@ def main(_):
         torch_dtype=torch.float32,
         low_cpu_mem_usage=True,
         device_map='auto',
-        trust_remote_code=True
     )
     policy.resize_token_embeddings(len(tokenizer))
     model = AutoModelForCausalLMWithValueHead(policy)
