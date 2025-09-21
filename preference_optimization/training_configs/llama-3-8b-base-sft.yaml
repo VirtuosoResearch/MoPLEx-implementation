@@ -1,5 +1,5 @@
 # Model arguments
-model_name_or_path: meta-llama/Meta-Llama-3-8B
+model_name_or_path: Qwen/Qwen2-0.5B-Instruct
 model_revision: main
 torch_dtype: bfloat16
 attn_implementation: flash_attention_2
@@ -32,8 +32,8 @@ lr_scheduler_type: cosine
 max_seq_length: 2048
 max_steps: -1
 num_train_epochs: 1
-output_dir: /scratch/gpfs/DANQIC/ym0081/checkpoints_new/llama-3-8b-sft
-run_name: llama-3-8b-sft
+output_dir: /preference_optimization/outputs/llama-3-8b-base-simpo
+run_name: base-dpo
 overwrite_output_dir: true
 per_device_eval_batch_size: 8
 per_device_train_batch_size: 8

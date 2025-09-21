@@ -33,8 +33,8 @@ from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 logger = logging.get_logger(__name__)
 
-# Enable logging in a Hugging Face Space
-os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
+# # Enable logging in a Hugging Face Space
+# os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 def main(script_args, training_args, model_args, dataset_args):
@@ -112,8 +112,8 @@ def main(script_args, training_args, model_args, dataset_args):
 
     # Save and push to Hub
     trainer.save_model(training_args.output_dir)
-    if training_args.push_to_hub:
-        trainer.push_to_hub(dataset_name=script_args.dataset_name)
+    # if training_args.push_to_hub:
+    #     trainer.push_to_hub(dataset_name=script_args.dataset_name)
 
 
 def make_parser(subparsers: Optional[argparse._SubParsersAction] = None):

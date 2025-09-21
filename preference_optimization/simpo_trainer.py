@@ -110,7 +110,7 @@ class SimPOTrainer(Trainer):
                 "You passed a model_id to the SimPOTrainer. This will automatically create an "
                 "`AutoModelForCausalLM` or a `PeftModel` (if you passed a `peft_config`) for you."
             )
-            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs, torch_dtype=torch.bfloat16)
+            model = AutoModelForCausalLM.from_pretrained(model, **model_init_kwargs)
 
         # Initialize this variable to False. This helps tracking the case when `peft_module_casting_to_bf16`
         # has been called in order to properly call autocast if needed.

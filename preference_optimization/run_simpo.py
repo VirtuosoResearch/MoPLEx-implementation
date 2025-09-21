@@ -180,6 +180,18 @@ def main():
     #####################################
     data_args.truncation_side = "left"  # Truncate from left to ensure we don't lose labels in final turn
     tokenizer = get_tokenizer(model_args, data_args)
+    if "Qwen" in model_args.model_name_or_path:
+        # If BOS is missing, set a safe value many Qwen3 builds use:
+        if tokenizer.bos_token_id is None:
+            # Commonly Qwen3 uses the PAD/EOD token id as BOS (151643 in many builds)
+            # Prefer whatever your tokenizer reports:
+            fallback = getattr(tokenizer, "pad_token_id", None)
+            if fallback is None:
+                # last resort: use eos if present
+                fallback = tokenizer.eos_token_id
+            tokenizer.bos_token_id = fallback
+            tokenizer.bos_token = tokenizer.convert_ids_to_tokens(fallback)
+
 
     if "mistral" in model_args.model_name_or_path.lower():
         change_template = "mistral"
