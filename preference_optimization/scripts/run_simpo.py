@@ -40,6 +40,8 @@ from simpo_trainer import SimPOTrainer
 from simpo_config import SimPOConfig
 from dataclasses import dataclass, field
 from typing import Optional, Literal
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +122,12 @@ def apply_chat_template(
         )
     return example
 
+'''
+TODO:
+2. Add multiple preferences 
+3. Add loading reference model 
+4. Add evaluation of reward acccuracy
+'''
 
 def main():
     parser = H4ArgumentParser((ModelArguments, DataArguments, SimPOConfig))
