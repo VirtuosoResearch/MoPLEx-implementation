@@ -276,6 +276,7 @@ def main():
         eval_dataset=raw_datasets["test"],
         tokenizer=tokenizer,
         peft_config=get_peft_config(model_args),
+        logger=logger,
     )
 
     ###############

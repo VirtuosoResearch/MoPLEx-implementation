@@ -92,6 +92,7 @@ class SimPOTrainer(Trainer):
         preprocess_logits_for_metrics: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None,
         peft_config: Optional[Dict] = None,
         compute_metrics: Optional[Callable[[EvalLoopOutput], Dict]] = None,
+        logger: Optional[Any] = None,
     ):
         if args.model_init_kwargs is None:
             model_init_kwargs = {}
@@ -293,6 +294,8 @@ class SimPOTrainer(Trainer):
             raise AttributeError(
                 "Your `Trainer` does not have an `accelerator` object. Consider upgrading `transformers`."
             )
+
+        self.logger = logger 
 
     def build_tokenized_answer(self, prompt, answer):
         """
