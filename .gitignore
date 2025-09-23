@@ -157,7 +157,7 @@ cardiffnlp
 wandb
 *checkpoints*/
 .vscode
-*data*/
+data/
 slurm-*.out
 model_checkpoints/
 relabeled_samples*/

@@ -139,4 +139,139 @@ raw_datasets = raw_datasets.map(
     remove_columns=column_names,
     desc="Formatting comparisons with prompt template",
 )
+
+# Replace column names with what TRL needs, text_chosen -> chosen and text_rejected -> rejected
+for split in ["train", "test"]:
+    raw_datasets[split] = raw_datasets[split].rename_columns(
+        {"text_prompt": "prompt", "text_chosen": "chosen", "text_rejected": "rejected"}
+    )
+
+# {'prompt': '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nDo you know something about crystallography and structure factor?<|im_end|>\n',
+#  'chosen': '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>assistant\nCrystallography is the science of the arrangement of atoms in solids. It is a vast and interdisciplinary field that has applications in physics, chemistry, materials science, biology, and engineering.\n\nThe structure factor is a mathematical function that is used to describe the diffraction of waves by a crystal. It is a complex number that is related to the atomic positions in the crystal.\n\nThe structure factor can be used to calculate the intensity of the diffracted waves. This information can be used to determine the atomic positions in the crystal and to study the structure of materials.\n\nCrystallography is a powerful tool for understanding the structure of materials. It has been used to determine the structures of many important materials, including metals, semiconductors, and pharmaceuticals. It is also used to study the structure of biological materials, such as proteins and DNA.\n\nThe structure factor is a key concept in crystallography. It is used to describe the diffraction of waves by a crystal and to calculate the intensity of the diffracted waves. This information can be used to determine the atomic positions in the crystal and to study the structure of materials.<|im_end|>\n',
+#  'rejected': "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>assistant\nCertainly! Crystallography is the study of the structure, arrangement of atoms, and properties of crystals. Structure factor, on the other hand, is a mathematical parameter that describes the arrangement of atoms or molecules in a crystal. It is used to determine the crystallographic properties of a crystal, such as its unit cell dimensions and symmetry.\n\nIf you have any specific questions about crystallography or structure factors, I'd be happy to help!<|im_end|>\n"}
+
 # %%
+# Load the original ultrafeedback dataset
+from datasets import load_dataset
+
+columns_to_keep = ['instruction', 'completions']
+
+raw_datasets = load_dataset("openbmb/UltraFeedback", cache_dir="./cache/")
+raw_datasets['train'] = raw_datasets['train'].remove_columns([col for col in raw_datasets['train'].column_names if col not in columns_to_keep])
+# %%
+completion = raw_datasets['train'][0]['completions']
+# %%
+from datasets import load_dataset, DatasetDict, concatenate_datasets
+import hashlib
+import random
+import time
+
+# Load revision with the fixes to overall_score
+ds = load_dataset("openbmb/UltraFeedback", split="train", cache_dir="./cache/")
+
+# Load TrutfulQA prompts to ensure we remove samples from evol_instruct
+tqa_a = load_dataset("truthful_qa", "generation", split="validation")
+tqa_b = load_dataset("truthful_qa", "multiple_choice", split="validation")
+
+total_rows = ds.num_rows
+
+ds = ds.filter(lambda x: x["source"] != "truthful_qa", num_proc=4)
+print(f"Remaining samples after removing the TruthfulQA source [{ds.num_rows} / {total_rows}]")
+
+contaminated_prompts = list(set(tqa_a["question"] + tqa_b["question"]))
+ds = ds.filter(lambda x: x["instruction"] not in contaminated_prompts, num_proc=4)
+print(f"Remaining samples after removing the contaminated prompts [{ds.num_rows} / {total_rows}]")
+
+def get_pairwise_completions(completions, criterion="overall_score", seed=42):
+    random.seed(seed)
+    start = time.time()
+    if criterion == "overall_score" or criterion == 'fine-grained_score':
+        scores_and_completions = [(c[criterion], c["response"], c["model"]) for c in completions]
+    elif criterion == "helpfulness" or criterion == 'honesty' or criterion == 'instruction_following' or criterion == 'truthfulness':
+        scores_and_completions = [(float(c['annotations'][criterion]['Rating']), c["response"], c["model"]) for c in completions]
+    else:
+        raise ValueError(f"Criterion {criterion} not supported!")
+
+    if len(scores_and_completions) < 2:
+        return None, None
+    chosen = max(scores_and_completions, key=lambda x: x[0])
+    rejected = random.choice(scores_and_completions)
+    while rejected == chosen:
+        end = time.time()
+        if end - start > 3:
+            print("Timeout")
+            print(chosen, rejected)
+            break
+        rejected = random.choice(scores_and_completions)
+    return chosen, rejected
+
+def format_prompt(x, criterion="overall_score"):
+    prompt = x["instruction"]
+    chosen, rejected = get_pairwise_completions(x["completions"], criterion=criterion)
+    chosen_messages = []
+    rejected_messages = []
+    chosen_messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": chosen[1] if chosen is not None else "N/A"},
+    ]
+    rejected_messages = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": rejected[1] if rejected is not None else "N/A"},
+    ]
+    return {
+        "prompt": prompt,
+        "prompt_id": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        "chosen": chosen_messages,
+        "rejected": rejected_messages,
+        "messages": chosen_messages, # Use best-ranked example for SFT
+        "score_chosen": chosen[0] if chosen is not None else -100.0,
+        "score_rejected": rejected[0] if rejected is not None else -100.0,
+        "criterion": criterion,
+    }
+
+ds_list = []
+for criterion in ["overall_score", "helpfulness"]:
+    tmp_ds = ds.map(format_prompt, num_proc=8, remove_columns=ds.column_names, fn_kwargs={"criterion": criterion}, desc=f"Formatting prompts for {criterion}")
+    tmp_ds = tmp_ds.filter(lambda x: x["score_chosen"] != -100 or x["score_rejected"] != -100, num_proc=8)
+    ds_list.append(tmp_ds)
+
+def remove_last_step_for_rl(example):
+    example["messages"] = example["messages"][:-1]  # remove the assistant response
+    return example
+
+def filter_empty_messages(example):
+    if example["messages"][-1]["role"] == "user":
+        example["messages"] = example["messages"][:-1]
+    if example["chosen"][-1]["role"] == "user":
+        example["chosen"] = example["chosen"][:-1]
+    if example["rejected"][-1]["role"] == "user":
+        example["rejected"] = example["rejected"][:-1]
+    return example
+
+
+from collections import defaultdict
+all_ds = defaultdict(list)
+for ds in ds_list:
+    split_dataset = ds.train_test_split(test_size=2000, seed=42, shuffle=True)
+    test_datasets = split_dataset["test"].train_test_split(0.5, seed=42, shuffle=True)
+
+    all_ds["train_prefs"].append(split_dataset["train"].map(filter_empty_messages))
+    all_ds["train_sft"].append(split_dataset["train"].map(filter_empty_messages))
+    # Keep more examples for test accuracy
+    all_ds["test_prefs"].append(concatenate_datasets([test_datasets["train"], test_datasets["test"]]).map(filter_empty_messages))
+    all_ds["test_sft"].append(test_datasets["train"].map(filter_empty_messages))
+    all_ds["train_gen"].append(all_ds["train_sft"][-1].map(remove_last_step_for_rl))
+    all_ds["test_gen"].append(all_ds["test_sft"][-1].map(remove_last_step_for_rl))
+
+for k in all_ds.keys():
+    all_ds[k] = concatenate_datasets(all_ds[k])
+
+assistant_rows = []
+# check that gen split does not end with `assistant`, should print 0
+for idx, row in enumerate(all_ds["train_gen"]):
+    if row["messages"][-1]["role"] == "assistant":
+        assistant_rows.append(row)
+for row in all_ds["test_gen"]:
+    if row["messages"][-1]["role"] == "assistant":
+        assistant_rows.append(row)
+assert len(assistant_rows) == 0
