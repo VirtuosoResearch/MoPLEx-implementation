@@ -40,6 +40,9 @@ from simpo_trainer import SimPOTrainer
 from simpo_config import SimPOConfig
 from dataclasses import dataclass, field
 from typing import Optional, Literal
+
+from data_processing.load_ultrafeedback import load_ultrafeedback_multi_preferences
+
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
 
@@ -124,9 +127,9 @@ def apply_chat_template(
 
 '''
 TODO:
-2. Add multiple preferences 
-3. Add loading reference model 
-4. Add evaluation of reward acccuracy
+- Add evaluation of reward acccuracy
+- Run RLHF with PPO
+- Run DPO
 '''
 
 def main():
@@ -163,13 +166,19 @@ def main():
     ###############
     # Load datasets
     ###############
-    raw_datasets = get_datasets(
-        data_args,
-        splits=data_args.dataset_splits,
-        configs=data_args.dataset_configs,
-        columns_to_keep=["messages", "chosen", "rejected", "prompt", "completion", "label"],
-        # seed=training_args.seed,
-    )
+
+    if data_args.load_multi_preference:
+        if data_args.load_multi_preference_dataset == "openbmb/UltraFeedback":
+            criterions = data_args.load_multi_preference_criterions.split(",")
+            raw_datasets = load_ultrafeedback_multi_preferences(criterions=criterions)
+    else:
+        raw_datasets = get_datasets(
+            data_args,
+            splits=data_args.dataset_splits,
+            configs=data_args.dataset_configs,
+            columns_to_keep=["messages", "chosen", "rejected", "prompt", "completion", "label"],
+            # seed=training_args.seed,
+        )
     logger.info(
         f"Training on the following splits: {[split + ' : ' + str(dset.num_rows) for split, dset in raw_datasets.items()]}"
     )
@@ -200,6 +209,8 @@ def main():
     #####################
     # Apply chat template
     #####################
+    if "criterion" in column_names: # keep the criterion column if it exists
+        column_names.remove("criterion")
     raw_datasets = raw_datasets.map(
         apply_chat_template,
         fn_kwargs={

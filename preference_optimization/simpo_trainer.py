@@ -495,6 +495,11 @@ class SimPOTrainer(Trainer):
                 batch["chosen_decoder_input_ids"] = model.prepare_decoder_input_ids_from_labels(
                     labels=torch.tensor(batch["chosen_labels"])
                 )
+        
+        if "criterion" in feature:
+            batch["criterion"] = feature["criterion"]
+        else:
+            batch["criterion"] = "uniform"
 
         return batch
 
@@ -693,6 +698,7 @@ class SimPOTrainer(Trainer):
     ):
         """Compute the SimPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
+        criterion = batch["criterion"][0]
         prefix = "eval_" if train_eval == "eval" else ""
 
         (
@@ -729,6 +735,15 @@ class SimPOTrainer(Trainer):
         metrics[f"{prefix}logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
         metrics[f"{prefix}logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
         metrics[f"{prefix}logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
+
+        metrics[f"{prefix}{criterion}_rewards/chosen"] = chosen_rewards.mean().cpu()
+        metrics[f"{prefix}{criterion}_rewards/rejected"] = rejected_rewards.mean().cpu()
+        metrics[f"{prefix}{criterion}_rewards/accuracies"] = reward_accuracies.mean().cpu()
+        metrics[f"{prefix}{criterion}_rewards/margins"] = (chosen_rewards - rejected_rewards).mean().cpu()
+        metrics[f"{prefix}{criterion}_logps/rejected"] = policy_rejected_logps.detach().mean().cpu()
+        metrics[f"{prefix}{criterion}_logps/chosen"] = policy_chosen_logps.detach().mean().cpu()
+        metrics[f"{prefix}{criterion}_logits/rejected"] = policy_rejected_logits.detach().mean().cpu()
+        metrics[f"{prefix}{criterion}_logits/chosen"] = policy_chosen_logits.detach().mean().cpu()
 
         return loss, metrics
 

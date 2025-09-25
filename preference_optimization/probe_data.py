@@ -126,7 +126,8 @@ def apply_chat_template(
         )
     return example
 
-
+if "criterion" in column_names: # keep the criterion column if it exists
+    column_names.remove("criterion")
 raw_datasets = raw_datasets.map(
     apply_chat_template,
     fn_kwargs={
@@ -150,16 +151,6 @@ for split in ["train", "test"]:
 #  'chosen': '<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>assistant\nCrystallography is the science of the arrangement of atoms in solids. It is a vast and interdisciplinary field that has applications in physics, chemistry, materials science, biology, and engineering.\n\nThe structure factor is a mathematical function that is used to describe the diffraction of waves by a crystal. It is a complex number that is related to the atomic positions in the crystal.\n\nThe structure factor can be used to calculate the intensity of the diffracted waves. This information can be used to determine the atomic positions in the crystal and to study the structure of materials.\n\nCrystallography is a powerful tool for understanding the structure of materials. It has been used to determine the structures of many important materials, including metals, semiconductors, and pharmaceuticals. It is also used to study the structure of biological materials, such as proteins and DNA.\n\nThe structure factor is a key concept in crystallography. It is used to describe the diffraction of waves by a crystal and to calculate the intensity of the diffracted waves. This information can be used to determine the atomic positions in the crystal and to study the structure of materials.<|im_end|>\n',
 #  'rejected': "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>assistant\nCertainly! Crystallography is the study of the structure, arrangement of atoms, and properties of crystals. Structure factor, on the other hand, is a mathematical parameter that describes the arrangement of atoms or molecules in a crystal. It is used to determine the crystallographic properties of a crystal, such as its unit cell dimensions and symmetry.\n\nIf you have any specific questions about crystallography or structure factors, I'd be happy to help!<|im_end|>\n"}
 
-# %%
-# Load the original ultrafeedback dataset
-from datasets import load_dataset
-
-columns_to_keep = ['instruction', 'completions']
-
-raw_datasets = load_dataset("openbmb/UltraFeedback", cache_dir="./cache/")
-raw_datasets['train'] = raw_datasets['train'].remove_columns([col for col in raw_datasets['train'].column_names if col not in columns_to_keep])
-# %%
-completion = raw_datasets['train'][0]['completions']
 # %%
 from datasets import load_dataset, DatasetDict, concatenate_datasets
 import hashlib
@@ -232,7 +223,7 @@ def format_prompt(x, criterion="overall_score"):
     }
 
 ds_list = []
-for criterion in ["overall_score", "helpfulness", "honesty", "instruction_following", "truthfulness"]:
+for criterion in ["overall_score", "helpfulness",]:
     tmp_ds = ds.map(format_prompt, num_proc=8, remove_columns=ds.column_names, fn_kwargs={"criterion": criterion}, desc=f"Formatting prompts for {criterion}")
     tmp_ds = tmp_ds.filter(lambda x: x["score_chosen"] != -100 or x["score_rejected"] != -100, num_proc=8)
     ds_list.append(tmp_ds)
