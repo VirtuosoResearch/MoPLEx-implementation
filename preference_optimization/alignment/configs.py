@@ -234,6 +234,15 @@ class DataArguments:
             )
         },
     )
+    load_multi_preference: bool = field(
+        default=False,
+    )
+    load_multi_preference_dataset: str = field(
+        default="openbmb/UltraFeedback",
+    )
+    load_multi_preference_criterions: str = field(
+        default="overall_score,helpfulness,honesty,instruction_following,truthfulness",
+    )
 
 
 @dataclass

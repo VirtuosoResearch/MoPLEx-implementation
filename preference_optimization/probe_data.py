@@ -188,7 +188,9 @@ def get_pairwise_completions(completions, criterion="overall_score", seed=42):
     if criterion == "overall_score" or criterion == 'fine-grained_score':
         scores_and_completions = [(c[criterion], c["response"], c["model"]) for c in completions]
     elif criterion == "helpfulness" or criterion == 'honesty' or criterion == 'instruction_following' or criterion == 'truthfulness':
-        scores_and_completions = [(float(c['annotations'][criterion]['Rating']), c["response"], c["model"]) for c in completions]
+        scores_and_completions = [(float(c['annotations'][criterion]['Rating']), c["response"], c["model"]) \
+                                  if c['annotations'][criterion]['Rating'] != 'N/A' else (0.0, c["response"], c["model"])   
+                                  for c in completions]
     else:
         raise ValueError(f"Criterion {criterion} not supported!")
 
@@ -230,7 +232,7 @@ def format_prompt(x, criterion="overall_score"):
     }
 
 ds_list = []
-for criterion in ["overall_score", "helpfulness"]:
+for criterion in ["overall_score", "helpfulness", "honesty", "instruction_following", "truthfulness"]:
     tmp_ds = ds.map(format_prompt, num_proc=8, remove_columns=ds.column_names, fn_kwargs={"criterion": criterion}, desc=f"Formatting prompts for {criterion}")
     tmp_ds = tmp_ds.filter(lambda x: x["score_chosen"] != -100 or x["score_rejected"] != -100, num_proc=8)
     ds_list.append(tmp_ds)
@@ -275,3 +277,19 @@ for row in all_ds["test_gen"]:
     if row["messages"][-1]["role"] == "assistant":
         assistant_rows.append(row)
 assert len(assistant_rows) == 0
+
+# %%
+splits = ["train_prefs", "test_prefs"]
+columns_to_keep = ['prompt', 'chosen', 'rejected', 'messages', 'criterion']
+
+raw_datasets = DatasetDict()
+
+for split in splits:
+    dataset = all_ds[split]
+    dataset = dataset.remove_columns([col for col in dataset.column_names if col not in columns_to_keep])
+    if 'train' in split:
+        raw_datasets['train'] = dataset
+    elif 'test' in split:
+        raw_datasets['test'] = dataset
+
+# %%

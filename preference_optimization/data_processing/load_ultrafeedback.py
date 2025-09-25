@@ -4,6 +4,9 @@ import random
 import time
 
 def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpfulness", "honesty", "instruction_following", "truthfulness"]):
+    splits = ["train_prefs", "test_prefs"]
+    columns_to_keep = ['prompt', 'chosen', 'rejected', 'messages', 'criterion']
+    
     # Load revision with the fixes to overall_score
     ds = load_dataset("openbmb/UltraFeedback", split="train", cache_dir="./cache/")
 
@@ -26,7 +29,9 @@ def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpful
         if criterion == "overall_score" or criterion == 'fine-grained_score':
             scores_and_completions = [(c[criterion], c["response"], c["model"]) for c in completions]
         elif criterion == "helpfulness" or criterion == 'honesty' or criterion == 'instruction_following' or criterion == 'truthfulness':
-            scores_and_completions = [(float(c['annotations'][criterion]['Rating']), c["response"], c["model"]) for c in completions]
+            scores_and_completions = [(float(c['annotations'][criterion]['Rating']), c["response"], c["model"]) \
+                                  if c['annotations'][criterion]['Rating'] != 'N/A' else (0.0, c["response"], c["model"])   
+                                  for c in completions]
         else:
             raise ValueError(f"Criterion {criterion} not supported!")
 
@@ -68,7 +73,7 @@ def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpful
         }
 
     ds_list = []
-    for criterion in ["overall_score", "helpfulness"]:
+    for criterion in criterions:
         tmp_ds = ds.map(format_prompt, num_proc=8, remove_columns=ds.column_names, fn_kwargs={"criterion": criterion}, desc=f"Formatting prompts for {criterion}")
         tmp_ds = tmp_ds.filter(lambda x: x["score_chosen"] != -100 or x["score_rejected"] != -100, num_proc=8)
         ds_list.append(tmp_ds)
@@ -114,4 +119,15 @@ def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpful
             assistant_rows.append(row)
     assert len(assistant_rows) == 0
 
-    return DatasetDict(all_ds)
+    all_ds = DatasetDict(all_ds)
+    raw_datasets = DatasetDict()
+
+    for split in splits:
+        dataset = all_ds[split]
+        dataset = dataset.remove_columns([col for col in dataset.column_names if col not in columns_to_keep])
+        if 'train' in split:
+            raw_datasets['train'] = dataset
+        elif 'test' in split:
+            raw_datasets['test'] = dataset
+
+    return raw_datasets
