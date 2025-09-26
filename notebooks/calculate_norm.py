@@ -4,7 +4,7 @@ from trainers.network_utils import AutoModelForCausalLMWithValueHead
 
 
 # "EleutherAI/pythia-1.4b"
-tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-1.4b")
+tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-3.2-1B")
 tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
 tokenizer.padding_side = "left"
 tokenizer.truncation_side = "left"
@@ -28,10 +28,9 @@ total2 = total2 **0.5
 print("raw_model : ", total2)
 
 for i in range(0,15):
-    model_path = f"/home/michael/project/Preference-tuning-and-evaluation/outputs/all_data/max_beta0.05_lr1e-7_bs4_ga4/max_beta0.05_lr1e-7_bs4_ga4_epoch_{i}"
+    model_path = f"/home/michael/project/Preference-tuning-and-evaluation/outputs/all_data/max_beta0.05_lr1e-7_bs4_ga4_sd3/max_beta0.05_lr1e-7_bs4_ga4_sd3_epoch_{i}"
 
     model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.float32)
-
     total1= 0.0
 
     for p in model.parameters():
