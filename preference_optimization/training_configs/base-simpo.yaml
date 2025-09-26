@@ -10,6 +10,8 @@ dataset_splits:
 - train_prefs
 - test_prefs
 preprocessing_num_workers: 12
+load_multi_preference: True
+load_multi_preference_criterions: "overall_score,helpfulness,honesty,instruction_following,truthfulness"
 
 # SimPOTrainer arguments
 bf16: true
@@ -31,8 +33,8 @@ max_length: 2048
 max_prompt_length: 1800
 num_train_epochs: 1
 optim: adamw_torch
-output_dir: outputs/base-simpo-qwen-v1
-run_name: base-simpo
+output_dir: outputs/base-simpo-qwen-multi-v2
+run_name: base-simpo-multi-v2
 per_device_train_batch_size: 2
 per_device_eval_batch_size: 4
 push_to_hub: false

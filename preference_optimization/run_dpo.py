@@ -1,12 +1,3 @@
-# /// script
-# dependencies = [
-#     "trl",
-#     "peft",
-#     "trackio",
-#     "kernels",
-# ]
-# ///
-
 import argparse
 import os
 from typing import Optional
@@ -32,9 +23,6 @@ from trl.trainer.utils import SIMPLE_CHAT_TEMPLATE
 
 
 logger = logging.get_logger(__name__)
-
-# # Enable logging in a Hugging Face Space
-# os.environ.setdefault("TRACKIO_SPACE_ID", "trl-trackio")
 
 
 def main(script_args, training_args, model_args, dataset_args):
@@ -98,7 +86,7 @@ def main(script_args, training_args, model_args, dataset_args):
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None,
-        processing_class=tokenizer,
+        tokenizer=tokenizer,
         peft_config=peft_config,
     )
 

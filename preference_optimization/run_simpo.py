@@ -33,14 +33,11 @@ from alignment import (
     get_tokenizer,
     is_adapter_model,
 )
-from trl import (
-    DPOConfig,
-    DPOTrainer,
-)
 from alignment.data import maybe_insert_system_message, is_openai_format
 from peft import PeftConfig, PeftModel
 from simpo_trainer import SimPOTrainer
 from simpo_config import SimPOConfig
+from dpo_trainer import DPOTrainer
 from dataclasses import dataclass, field
 from typing import Optional, Literal
 
@@ -131,7 +128,6 @@ def apply_chat_template(
 '''
 TODO:
 - Run RLHF with PPO
-- Run DPO
 '''
 
 def main():
