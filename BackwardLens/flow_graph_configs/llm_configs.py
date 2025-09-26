@@ -49,7 +49,7 @@ class GraphConfigs:
         try:
             with open(fpath, "r") as f:
                 data = json.load(f)
-                print(data)
+                # print(data)
         except:
             print(f'Try to automatically assuming which config to load from {fpath}...')
             if 'gpt2' in fpath:
@@ -63,10 +63,10 @@ class GraphConfigs:
             else:
                 raise ValueError(f'Could not automatically determine which config to load from {fpath}')
 
-            print(f'Loading config from {fpath}')
+            # print(f'Loading config from {fpath}')
             with open(fpath, "r") as f:
                 data = json.load(f)
-                print(data)
+                # print(data)
 
         return cls(**data)
 
@@ -108,6 +108,6 @@ def auto_model_to_path_config(name_or_model):
 
 def auto_model_to_config(name_or_model, annot=True):
     config_path = auto_model_to_path_config(name_or_model)
-    if annot:
-        print(f'Loading config from {config_path}')
+    # if annot:
+    #     print(f'Loading config from {config_path}')
     return GraphConfigs.from_json(config_path)
