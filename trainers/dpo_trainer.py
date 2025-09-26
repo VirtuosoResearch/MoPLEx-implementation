@@ -3,6 +3,8 @@ from torch import nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 from transformers import PreTrainedModel, PreTrainedTokenizerBase
+from torch.optim import AdamW
+from transformers import get_linear_schedule_with_warmup
 from transformers import logging
 from typing import Optional, Union, Dict, List, Tuple, NamedTuple, Callable, Iterable, Any, Mapping
 import numpy as np
@@ -61,6 +63,7 @@ class DPOTrainer():
             log_with=config.log_with,
             gradient_accumulation_steps=config.gradient_accumulation_steps,
             project_config=ProjectConfiguration(**config.project_kwargs),
+            deepspeed_plugin=None,            # disable DeepSpeed
             **config.accelerator_kwargs,
         )
         
@@ -181,15 +184,6 @@ class DPOTrainer():
         # post process for PP
         self.current_device = self.accelerator.device
         self.running = RunningMoments(self.accelerator)
-        self.save_pstar_at_epoch = getattr(self.config, "save_pstar_at_epoch", -1)
-        self.pstar_save_path = getattr(self.config, "pstar_save_path", "./pstar.pt")
-        self.has_saved_pstar = False
-
-        self.save_p_at_epoch = getattr(self.config, "save_p_at_epoch", -1)
-        self.p_save_path = getattr(self.config, "p_save_path", "./p.pt")
-        self.has_saved_p = False
-
-
         
     def prepare_dataloader(self, dataset: Union[torch.utils.data.Dataset, Dataset], data_collator=None):
         """
@@ -276,7 +270,7 @@ class DPOTrainer():
             input_data = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
             logits, _, _ = self.model(**input_data)
             with torch.no_grad():
-                old_logits, _, _ = self.ref_model(**input_data)  
+                old_logits, _, _ = self.ref_model(**input_data)
                 old_logprobs = logprobs_from_logits(old_logits[:, :-1, :], input_ids[:, 1:])
 
             logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
@@ -372,10 +366,6 @@ class DPOTrainer():
             responses_l_ = responses_l[i : i + sub_bs]
             preference_mask_ = preference_mask[i : i + sub_bs] if preference_mask is not None else None
 
-            # print("queries: ",self.tokenizer.decode(queries_[0]),"\n\n")
-            # print("response_w: ",self.tokenizer.decode(responses_w_[0]),"\n\n")
-            # print("response_l: ",self.tokenizer.decode(responses_l_[0]),"\n\n")
-
             loss, stats = self._step(
                 queries=queries_,
                 responses_w=responses_w_,
@@ -383,8 +373,7 @@ class DPOTrainer():
                 return_stats=True,
                 preference_mask=preference_mask_,
             )
-            # print("loss: ", loss)
-            # print("stats: ", stats)
+            
             self.optimizer.zero_grad()
             self.accelerator.backward(loss)
             self.optimizer.step()

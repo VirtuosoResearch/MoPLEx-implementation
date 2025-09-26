@@ -1,15 +1,15 @@
 cache_dir="cache"
-wandb_project="dpo"
+wandb_project="scalable-preference-optimization"
 model_name="meta-llama/Llama-3.2-1B"
 output_dir='outputs'
 
 export WANDB_PROJECT=$wandb_project
-export WANDB_API_KEY="b3ea34bec4058d216f518671f078ed74c5b1dda3"
-export WANDB_USERNAME="2462970640"
-export WANDB_USER_EMAIL="2462970640@qq.com"
+export WANDB_API_KEY="f9eff99469395e6de92d9b693ae24e149ac0fdd9"
+export WANDB_USERNAME="lidongyue12138"
+export WANDB_USER_EMAIL="lidongyue12138@gmail.com"
 export HF_DATASETS_CACHE=$cache_dir
 
-wandb_project="all_data"
+wandb_project="scalable-preference-optimization"
 which_exp=${1:--1}
 dryrun=false
 debug=false
@@ -35,7 +35,7 @@ if [[ $debug = true ]]; then
     export WANDB_MODE="dryrun"
 fi
 
-preference_dataset_path=$data_max
+preference_dataset_path='tatsu-lab/alpaca_farm'
 
 dataset_basename=$(basename -- $preference_dataset_path)
 
@@ -54,11 +54,11 @@ fi
 run_name="${dataset_basename}_beta${beta}_lr${lr}_bs${batch_size}_ga${gradient_accumulation_steps}_sd${seed}"
 echo "Running experiment $run_name"
 
-command="python -m trainers.dpo_sample_subset \
+command="python -m trainers.dpo \
     --wandb_project $wandb_project \
     --run_name $run_name \
-    --tokenizer_type $model_name \
     --inner_iteration_steps 1 \
+    --tokenizer_type $model_name \
     --batch_size $batch_size \
     --mini_batch_size $mini_batch_size \
     --pretrained_dir $model_name \

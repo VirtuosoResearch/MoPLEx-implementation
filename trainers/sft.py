@@ -116,7 +116,7 @@ def main(_):
         )
         print('Loaded dataset', dataset_name)
         dataset, eval_dataset = dataset['train'], dataset['test']
-    tokenizer = AutoTokenizer.from_pretrained(FLAGS.pretrained_dir, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(FLAGS.pretrained_dir)
     tokenizer.pad_token = tokenizer.eos_token
     eos = tokenizer.eos_token
 
@@ -137,7 +137,7 @@ def main(_):
         def formatting_prompts_func(example): 
             return example[FLAGS.sft_key]
 
-    model = AutoModelForCausalLM.from_pretrained(FLAGS.pretrained_dir, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(FLAGS.pretrained_dir)
     
     if FLAGS.use_tpu:
         extra_kwargs = dict(
