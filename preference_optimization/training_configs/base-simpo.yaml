@@ -19,7 +19,7 @@ beta: 2.0
 gamma_beta_ratio: 0.5
 do_eval: true
 evaluation_strategy: steps
-eval_steps: 400
+eval_steps: 200
 gradient_accumulation_steps: 16
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:

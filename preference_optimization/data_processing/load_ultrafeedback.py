@@ -2,8 +2,13 @@ from datasets import load_dataset, DatasetDict, concatenate_datasets
 import hashlib
 import random
 import time
+import numpy as np
 
-def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpfulness", "honesty", "instruction_following", "truthfulness"]):
+def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpfulness", "honesty", "instruction_following", "truthfulness"],
+                                         load_specific_pairs = False, 
+                                         load_specific_pairs_idxes = [2, 3],
+                                         load_indexes_path = None,
+                                         test_size = 2000):
     splits = ["train_prefs", "test_prefs"]
     columns_to_keep = ['prompt', 'chosen', 'rejected', 'messages', 'criterion']
     
@@ -37,8 +42,15 @@ def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpful
 
         if len(scores_and_completions) < 2:
             return None, None
-        chosen = max(scores_and_completions, key=lambda x: x[0])
-        rejected = random.choice(scores_and_completions)
+        
+        if load_specific_pairs:
+            pairs = [scores_and_completions[idx] for idx in load_specific_pairs_idxes]
+            chosen = max(pairs, key=lambda x: x[0])
+            rejected = min(pairs, key=lambda x: x[0])
+        else:
+            chosen = max(scores_and_completions, key=lambda x: x[0])
+            rejected = random.choice(scores_and_completions)
+        
         while rejected == chosen:
             end = time.time()
             if end - start > 3:
@@ -78,6 +90,11 @@ def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpful
         tmp_ds = tmp_ds.filter(lambda x: x["score_chosen"] != -100 or x["score_rejected"] != -100, num_proc=8)
         ds_list.append(tmp_ds)
 
+    indexes = np.load(load_indexes_path) if load_indexes_path is not None else None
+    if indexes is not None:
+        for i, ds in enumerate(ds_list):
+            ds_list[i] = ds.select(indexes)
+
     def remove_last_step_for_rl(example):
         example["messages"] = example["messages"][:-1]  # remove the assistant response
         return example
@@ -95,7 +112,7 @@ def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpful
     from collections import defaultdict
     all_ds = defaultdict(list)
     for ds in ds_list:
-        split_dataset = ds.train_test_split(test_size=2000, seed=42, shuffle=True)
+        split_dataset = ds.train_test_split(test_size=test_size, seed=42, shuffle=True)
         test_datasets = split_dataset["test"].train_test_split(0.5, seed=42, shuffle=True)
 
         all_ds["train_prefs"].append(split_dataset["train"].map(filter_empty_messages))

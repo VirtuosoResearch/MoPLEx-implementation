@@ -157,6 +157,9 @@ import hashlib
 import random
 import time
 
+load_specific_pairs = True
+load_specific_pairs_idxes = [2, 3]
+
 # Load revision with the fixes to overall_score
 ds = load_dataset("openbmb/UltraFeedback", split="train", cache_dir="./cache/")
 
@@ -187,8 +190,14 @@ def get_pairwise_completions(completions, criterion="overall_score", seed=42):
 
     if len(scores_and_completions) < 2:
         return None, None
-    chosen = max(scores_and_completions, key=lambda x: x[0])
-    rejected = random.choice(scores_and_completions)
+    
+    if load_specific_pairs:
+        pairs = [scores_and_completions[idx] for idx in load_specific_pairs_idxes]
+        chosen = max(pairs, key=lambda x: x[0])
+        rejected = min(pairs, key=lambda x: x[0])
+    else:
+        chosen = max(scores_and_completions, key=lambda x: x[0])
+        rejected = random.choice(scores_and_completions)
     while rejected == chosen:
         end = time.time()
         if end - start > 3:
@@ -223,10 +232,62 @@ def format_prompt(x, criterion="overall_score"):
     }
 
 ds_list = []
-for criterion in ["overall_score", "helpfulness",]:
+for criterion in ["overall_score", "helpfulness", "honesty", "instruction_following", "truthfulness"]:
     tmp_ds = ds.map(format_prompt, num_proc=8, remove_columns=ds.column_names, fn_kwargs={"criterion": criterion}, desc=f"Formatting prompts for {criterion}")
     tmp_ds = tmp_ds.filter(lambda x: x["score_chosen"] != -100 or x["score_rejected"] != -100, num_proc=8)
     ds_list.append(tmp_ds)
+
+# %%
+# compute the conflict rate between different criteria
+from itertools import combinations
+
+conflict_indexes = []
+for i, j in combinations(range(len(ds_list)), 2):
+    ds1 = ds_list[i]
+    ds2 = ds_list[j]
+    
+    conflict_count = 0
+    total_count = 0
+    idxes = []
+    for k, item in enumerate(ds1):
+        item_2 = ds2[k]
+        score1_chosen = item["score_chosen"]
+        score1_rejected = item["score_rejected"]
+        score2_chosen = item_2["score_chosen"]
+        score2_rejected = item_2["score_rejected"]
+        if (score1_chosen - score1_rejected) * (score2_chosen - score2_rejected) < 0:
+            conflict_count += 1
+            idxes.append(k)
+        total_count
+    conflict_indexes.append(idxes)
+    print(i, j, conflict_count, total_count, conflict_count / len(ds1))
+
+# %%
+for i, j in combinations(range(len(conflict_indexes)), 2):
+    common = set(conflict_indexes[i]).intersection(set(conflict_indexes[j]))
+    print(i, j, len(common), len(conflict_indexes[i]), len(conflict_indexes[j]))
+
+indexes = set()
+for k in [0, 1, 2, 3]:
+    idxes = conflict_indexes[k]
+    indexes = indexes.union(set(idxes))
+print(f"Total conflict examples: {len(indexes)}")
+
+for k in [5, 8]:
+    idxes = conflict_indexes[k][:int(len(conflict_indexes[k]) * 0.9)]
+    indexes = indexes.difference(set(idxes))
+print(f"Total conflict examples: {len(indexes)}")
+
+# %%
+import numpy as np
+indexes = list(indexes)
+np.save("./data_processing/data/load_indexes.npy", indexes)
+
+# %%
+for i, ds in enumerate(ds_list):
+    ds_list[i] = ds.select(list(indexes))
+
+# %%
 
 def remove_last_step_for_rl(example):
     example["messages"] = example["messages"][:-1]  # remove the assistant response
@@ -269,7 +330,6 @@ for row in all_ds["test_gen"]:
         assistant_rows.append(row)
 assert len(assistant_rows) == 0
 
-# %%
 splits = ["train_prefs", "test_prefs"]
 columns_to_keep = ['prompt', 'chosen', 'rejected', 'messages', 'criterion']
 

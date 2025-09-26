@@ -166,7 +166,13 @@ def main():
     ###############
 
     if data_args.load_multi_preference:
-        if data_args.load_multi_preference_dataset == "openbmb/UltraFeedback":
+        if data_args.load_multi_preference_dataset == "openbmb/UltraFeedback" and data_args.load_specific_pairs:
+            criterions = data_args.load_multi_preference_criterions.split(",")
+            raw_datasets = load_ultrafeedback_multi_preferences(criterions=criterions, load_specific_pairs=data_args.load_specific_pairs,
+                                                               load_specific_pairs_idxes=[2, 3],
+                                                               load_indexes_path="./data_processing/indexes/load_indexes.npy", 
+                                                               test_size=data_args.test_size)
+        else:
             criterions = data_args.load_multi_preference_criterions.split(",")
             raw_datasets = load_ultrafeedback_multi_preferences(criterions=criterions)
     else:

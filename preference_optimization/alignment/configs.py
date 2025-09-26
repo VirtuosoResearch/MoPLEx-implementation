@@ -243,6 +243,12 @@ class DataArguments:
     load_multi_preference_criterions: str = field(
         default="overall_score,helpfulness,honesty,instruction_following,truthfulness",
     )
+    load_specific_pairs: bool = field(
+        default=True,
+    )
+    test_size: int = field(
+        default=2000,
+    )
 
 
 @dataclass
