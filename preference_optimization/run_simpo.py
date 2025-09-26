@@ -23,7 +23,6 @@ from transformers import AutoModelForCausalLM, set_seed
 
 from alignment import (
     DataArguments,
-    DPOConfig,
     H4ArgumentParser,
     ModelArguments,
     get_checkpoint,
@@ -33,6 +32,10 @@ from alignment import (
     get_quantization_config,
     get_tokenizer,
     is_adapter_model,
+)
+from trl import (
+    DPOConfig,
+    DPOTrainer,
 )
 from alignment.data import maybe_insert_system_message, is_openai_format
 from peft import PeftConfig, PeftModel
@@ -127,13 +130,12 @@ def apply_chat_template(
 
 '''
 TODO:
-- Add evaluation of reward acccuracy
 - Run RLHF with PPO
 - Run DPO
 '''
 
 def main():
-    parser = H4ArgumentParser((ModelArguments, DataArguments, SimPOConfig))
+    parser = H4ArgumentParser((ModelArguments, DataArguments, SimPOConfig), conflict_handler="resolve")
     model_args, data_args, training_args = parser.parse()
 
     #######
@@ -280,15 +282,27 @@ def main():
     #########################
     # Instantiate SimPO trainer
     #########################
-    trainer = SimPOTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=raw_datasets["train"],
-        eval_dataset=raw_datasets["test"],
-        tokenizer=tokenizer,
-        peft_config=get_peft_config(model_args),
-        logger=logger,
-    )
+
+    if training_args.training_method == "dpo":
+        trainer = DPOTrainer(
+            model,
+            None,
+            args=training_args,
+            train_dataset=raw_datasets["train"],
+            eval_dataset=raw_datasets["test"] if training_args.eval_strategy != "no" else None,
+            tokenizer=tokenizer,
+            peft_config=get_peft_config(model_args),
+        )
+    elif training_args.training_method == "simpo":
+        trainer = SimPOTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=raw_datasets["train"],
+            eval_dataset=raw_datasets["test"],
+            tokenizer=tokenizer,
+            peft_config=get_peft_config(model_args),
+            logger=logger,
+        )
 
     ###############
     # Training loop
