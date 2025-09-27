@@ -51,13 +51,13 @@ def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpful
             chosen = max(scores_and_completions, key=lambda x: x[0])
             rejected = random.choice(scores_and_completions)
         
-        while rejected == chosen:
-            end = time.time()
-            if end - start > 3:
-                print("Timeout")
-                print(chosen, rejected)
-                break
-            rejected = random.choice(scores_and_completions)
+            while rejected == chosen:
+                end = time.time()
+                if end - start > 3:
+                    print("Timeout")
+                    print(chosen, rejected)
+                    break
+                rejected = random.choice(scores_and_completions)
         return chosen, rejected
 
     def format_prompt(x, criterion="overall_score"):

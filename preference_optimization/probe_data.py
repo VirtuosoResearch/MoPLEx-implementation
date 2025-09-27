@@ -198,13 +198,13 @@ def get_pairwise_completions(completions, criterion="overall_score", seed=42):
     else:
         chosen = max(scores_and_completions, key=lambda x: x[0])
         rejected = random.choice(scores_and_completions)
-    while rejected == chosen:
-        end = time.time()
-        if end - start > 3:
-            print("Timeout")
-            print(chosen, rejected)
-            break
-        rejected = random.choice(scores_and_completions)
+        while rejected == chosen:
+            end = time.time()
+            if end - start > 3:
+                print("Timeout")
+                print(chosen, rejected)
+                break
+            rejected = random.choice(scores_and_completions)
     return chosen, rejected
 
 def format_prompt(x, criterion="overall_score"):
@@ -251,14 +251,17 @@ for i, j in combinations(range(len(ds_list)), 2):
     idxes = []
     for k, item in enumerate(ds1):
         item_2 = ds2[k]
-        score1_chosen = item["score_chosen"]
-        score1_rejected = item["score_rejected"]
-        score2_chosen = item_2["score_chosen"]
-        score2_rejected = item_2["score_rejected"]
-        if (score1_chosen - score1_rejected) * (score2_chosen - score2_rejected) < 0:
+        chosen_1 = item["chosen"]
+        chosen_2 = item_2["chosen"]
+        # print(chosen_1 == chosen_2)
+        if chosen_1 != chosen_2:
             conflict_count += 1
             idxes.append(k)
-        total_count
+        total_count += 1
+        # if chosen_1 != chosen_2:
+        #     print(chosen_1)
+        #     print(chosen_2)
+        #     break
     conflict_indexes.append(idxes)
     print(i, j, conflict_count, total_count, conflict_count / len(ds1))
 
@@ -281,7 +284,7 @@ print(f"Total conflict examples: {len(indexes)}")
 # %%
 import numpy as np
 indexes = list(indexes)
-np.save("./data_processing/data/load_indexes.npy", indexes)
+np.save("./data_processing/indexes/load_indexes.npy", indexes)
 
 # %%
 for i, ds in enumerate(ds_list):

@@ -10,7 +10,7 @@ for criterion in "${criterions[@]}"; do
         load_multi_preference_criterions="$criterion" \
         output_dir="outputs/base-simpo-qwen-single-$criterion-controlled" \
         run_name="base-simpo-single-$criterion-controlled" \
-        load_specific_pairs=True num_train_epochs=10 test_size=1000
+        load_specific_pairs=True num_train_epochs=5 test_size=2000
 done
 
 # export WANDB_PROJECT="scalable-preference-optimization"

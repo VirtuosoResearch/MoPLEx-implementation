@@ -6,4 +6,4 @@ CUDA_VISIBLE_DEVICES=1 ACCELERATE_LOG_LEVEL=info accelerate launch run_simpo.py 
     load_multi_preference_criterions="overall_score,helpfulness,honesty,instruction_following,truthfulness" \
     output_dir="outputs/base-simpo-qwen-multi-controlled" \
     run_name="base-simpo-multi-controlled" \
-    load_specific_pairs=True num_train_epochs=10 test_size=1000
+    load_specific_pairs=True num_train_epochs=5 test_size=2000
