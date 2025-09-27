@@ -23,7 +23,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL)
 model = AutoModelForCausalLM.from_pretrained(MODEL).to(device)
 model.eval()
 
-ds = load_dataset(DATASET, split=f"train")
+ds = load_dataset(DATASET, split=f"test[:{N_EXAMPLES}]")
 
 def get_prompt_and_target(ex):
     rr = ex["requested_rewrite"]
@@ -73,12 +73,14 @@ layer = model.transformer.h[EDIT_LAYER]
 down_proj = layer.mlp.c_proj
 W0 = down_proj.weight.clone()
 
-for ex in tqdm(ds, desc="Editing"):
-    prompt, target_new = get_prompt_and_target(ex)
+for dp in tqdm(ds, desc="Edit"):
+    prompt, target_new = get_prompt_and_target(dp)
 
     delta_W = forward_pass_shift_edit(model, tokenizer, prompt, target_new,
                                       layer_idx=EDIT_LAYER, eta=ETA)
 
+for dp in tqdm(ds, desc="Test"):
+    prompt, target_new = get_prompt_and_target(dp)
     ok = check_efficacy(model, tokenizer, prompt, target_new)
     success += int(ok)
     # print(ok, int(ok))
