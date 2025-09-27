@@ -640,7 +640,7 @@ class SimPOTrainer(Trainer):
             average_log_prob=True,
             is_encoder_decoder=self.is_encoder_decoder,
             label_pad_token_id=self.label_pad_token_id,
-        )
+        ) # the average log probability per (non-masked) token of each sequence
 
         chosen_logps = all_logps[:len_chosen]
         rejected_logps = all_logps[len_chosen:]

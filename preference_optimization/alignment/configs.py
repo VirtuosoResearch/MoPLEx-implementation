@@ -146,7 +146,7 @@ class ModelArguments:
             )
         },
     )
-    trust_remote_code: bool = field(default=False, metadata={"help": "Trust remote code when loading a model."})
+    trust_remote_code: bool = field(default=True, metadata={"help": "Trust remote code when loading a model."})
     attn_implementation: Optional[str] = field(
         default=None,
         metadata={
