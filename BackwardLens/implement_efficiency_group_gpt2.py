@@ -10,20 +10,17 @@ parser.add_argument("--sample", default=200, type=int)
 parser.add_argument("--layer", default=40, type=int)
 args = parser.parse_args()
 
-MODEL = args.model
 DATASET = "azhx/counterfact"
-N_EXAMPLES = args.sample
 ETA = 0.24 
-EDIT_LAYER = args.layer
 TOPK = 1
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-tokenizer = AutoTokenizer.from_pretrained(MODEL)
-model = AutoModelForCausalLM.from_pretrained(MODEL).to(device)
+tokenizer = AutoTokenizer.from_pretrained(args.model)
+model = AutoModelForCausalLM.from_pretrained(args.model).to(device)
 model.eval()
 
-ds = load_dataset(DATASET, split=f"test[:{N_EXAMPLES}]")
+ds = load_dataset(DATASET, split=f"test[:{args.sample}]")
 
 def get_prompt_and_target(ex):
     rr = ex["requested_rewrite"]
@@ -35,7 +32,20 @@ def get_prompt_and_target(ex):
         target_new = " " + target_new
     return prompt, target_new
 
-def forward_pass_shift_edit(model, tokenizer, prompt, target, layer_idx=EDIT_LAYER, eta=ETA):
+def check_efficacy_greedy(model, tokenizer, prompt, target):
+    enc = tokenizer(prompt, return_tensors="pt").to(device)
+    tgt_ids = tokenizer(target, return_tensors="pt", add_special_tokens=False).input_ids[0].to(device)
+    out = model.generate(
+        **enc,
+        max_new_tokens=len(tgt_ids),
+        do_sample=False, num_beams=1,
+        pad_token_id=tokenizer.eos_token_id
+    )[0]
+    gen_ids = out[enc["input_ids"].shape[1]:]
+    gen_ids = gen_ids[:len(tgt_ids)]
+    return torch.equal(gen_ids, tgt_ids)
+
+def forward_pass_shift_edit(model, tokenizer, prompt, target, layer_idx=args.layer, eta=ETA):
     inputs = tokenizer(prompt, return_tensors="pt").to(device)
 
     layer = model.transformer.h[layer_idx]
@@ -58,18 +68,8 @@ def forward_pass_shift_edit(model, tokenizer, prompt, target, layer_idx=EDIT_LAY
 
     return delta_W
 
-def check_efficacy(model, tokenizer, prompt, target, topk=TOPK):
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        logits = model(**inputs).logits[:, -1, :]
-        probs = logits.softmax(-1)
-        topk_ids = probs.topk(topk).indices[0].tolist()
-        decoded = [tokenizer.decode(i) for i in topk_ids]
-    # print(decoded)
-    return target.strip() in [d.strip() for d in decoded]
-
 success = 0
-layer = model.transformer.h[EDIT_LAYER]
+layer = model.transformer.h[args.layer]
 down_proj = layer.mlp.c_proj
 W0 = down_proj.weight.clone()
 
@@ -77,16 +77,14 @@ for dp in tqdm(ds, desc="Edit"):
     prompt, target_new = get_prompt_and_target(dp)
 
     delta_W = forward_pass_shift_edit(model, tokenizer, prompt, target_new,
-                                      layer_idx=EDIT_LAYER, eta=ETA)
+                                      layer_idx=args.layer, eta=ETA)
 
 for dp in tqdm(ds, desc="Test"):
     prompt, target_new = get_prompt_and_target(dp)
-    ok = check_efficacy(model, tokenizer, prompt, target_new)
+    ok = check_efficacy_greedy(model, tokenizer, prompt, target_new)
+    # print(ok)
     success += int(ok)
-    # print(ok, int(ok))
 
-    with torch.no_grad():
-        down_proj.weight.copy_(W0)
 
-eff = success / N_EXAMPLES * 100
-print(f"\nEfficacy: {eff:.2f}%  (success {success}/{N_EXAMPLES})")
+eff = success / args.sample * 100
+print(f"\nEfficacy: {eff:.2f}%  (success {success}/{args.sample})")

@@ -23,7 +23,7 @@ tokenizer = AutoTokenizer.from_pretrained(MODEL)
 model = AutoModelForCausalLM.from_pretrained(MODEL).to(device)
 model.eval()
 
-ds = load_dataset(DATASET, split=f"train")
+ds = load_dataset(DATASET, split=f"train[:{N_EXAMPLES}]")
 
 def get_prompt_and_target(ex):
     rr = ex["requested_rewrite"]
@@ -58,15 +58,18 @@ def forward_pass_shift_edit(model, tokenizer, prompt, target, layer_idx=EDIT_LAY
 
     return delta_W
 
-def check_efficacy(model, tokenizer, prompt, target, topk=TOPK):
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
-    with torch.no_grad():
-        logits = model(**inputs).logits[:, -1, :]
-        probs = logits.softmax(-1)
-        topk_ids = probs.topk(topk).indices[0].tolist()
-        decoded = [tokenizer.decode(i) for i in topk_ids]
-    # print(decoded)
-    return target.strip() in [d.strip() for d in decoded]
+def check_efficacy_greedy(model, tokenizer, prompt, target):
+    enc = tokenizer(prompt, return_tensors="pt").to(device)
+    tgt_ids = tokenizer(target, return_tensors="pt", add_special_tokens=False).input_ids[0].to(device)
+    out = model.generate(
+        **enc,
+        max_new_tokens=len(tgt_ids),
+        do_sample=False, num_beams=1,
+        pad_token_id=tokenizer.eos_token_id
+    )[0]
+    gen_ids = out[enc["input_ids"].shape[1]:]
+    gen_ids = gen_ids[:len(tgt_ids)]
+    return torch.equal(gen_ids, tgt_ids)
 
 success = 0
 layer = model.transformer.h[EDIT_LAYER]
@@ -79,7 +82,7 @@ for ex in tqdm(ds, desc="Editing"):
     delta_W = forward_pass_shift_edit(model, tokenizer, prompt, target_new,
                                       layer_idx=EDIT_LAYER, eta=ETA)
 
-    ok = check_efficacy(model, tokenizer, prompt, target_new)
+    ok = check_efficacy_greedy(model, tokenizer, prompt, target_new)
     success += int(ok)
     # print(ok, int(ok))
 
