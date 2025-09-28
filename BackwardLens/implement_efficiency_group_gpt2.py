@@ -6,13 +6,12 @@ import argparse
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="gpt2-xl", type=str)
-parser.add_argument("--sample", default=200, type=int)
+parser.add_argument("--sample", default=500, type=int)
 parser.add_argument("--layer", default=40, type=int)
 args = parser.parse_args()
 
 DATASET = "azhx/counterfact"
 ETA = 0.24 
-TOPK = 1
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
