@@ -53,24 +53,20 @@ def check_efficacy_greedy(model, tokenizer, prompt, target):
     gen_ids = out[enc["input_ids"].shape[1]:][:len(tgt_ids)]
     return torch.equal(gen_ids, tgt_ids)
 
-# --- Step 1: collect per-example features (h_last) and target embeddings ---
 layer = None
 down_proj = None
 W0 = None
 
 def collect_records():
     global layer, down_proj, W0
-    recs = []  # list of dicts: {prompt, target, h_last (1,d), target_emb (d)}
-    # Prepare layer references
+    recs = []
     layer = model.transformer.h[args.layer]
     down_proj = layer.mlp.c_proj
     if W0 is None:
         W0 = down_proj.weight.clone()
 
-    # Hook to capture pre-MLP input's last token representation at the layer
     cache = {}
     def hook_fn(mod, inp, out):
-        # inp[0]: [B, T, D]; take the last token of the input sequence
         cache["h_last"] = inp[0][:, -1, :].detach()
 
     handle = down_proj.register_forward_hook(hook_fn)
@@ -78,22 +74,20 @@ def collect_records():
     for ex in tqdm(ds, desc="Collect h_last/targets"):
         prompt, target = get_prompt_and_target(ex)
 
-        # forward to get h_last
         inputs = tokenizer(prompt, return_tensors="pt").to(device)
         cache.clear()
         _ = model(**inputs, use_cache=False)
-        h_last = cache["h_last"].cpu().squeeze(0)  # [D]
+        h_last = cache["h_last"].cpu().squeeze(0)
 
-        # target embedding from lm_head for the last token of target
         target_ids = tokenizer(target, return_tensors="pt", add_special_tokens=False).input_ids.to(device)
         target_id_last = target_ids[0, -1].item()
-        target_emb = model.lm_head.weight[target_id_last].detach().cpu()  # [V,D] row -> [D]
+        target_emb = model.lm_head.weight[target_id_last].detach().cpu()
 
         recs.append({
             "prompt": prompt,
             "target": target,
-            "h": h_last,           # torch.cpu float tensor [D]
-            "tgt_emb": target_emb  # torch.cpu float tensor [D]
+            "h": h_last,
+            "tgt_emb": target_emb
         })
 
     handle.remove()
@@ -103,60 +97,46 @@ def collect_records():
 def kmeans_cosine(X, k, iters=25, seed=42):
     torch.manual_seed(seed)
     N, D = X.shape
-    # Normalize for cosine
     Xn = X / (X.norm(dim=1, keepdim=True) + 1e-12)
-    # init: pick k random points
     perm = torch.randperm(N)[:k]
     C = Xn[perm].clone()
 
     empty_retries = 0
     for _ in range(iters):
-        # cosine similarity = Xn @ C.T ; we want max similarity == min (1 - cos)
-        # Assign to nearest (max cos)
-        sim = Xn @ C.T  # [N, k]
+        sim = Xn @ C.T
         labels = sim.argmax(dim=1)
 
-        # Recompute centroids as mean on the *unnormalized* Xn (still ok then renorm)
         new_C = torch.zeros_like(C)
         for j in range(k):
             idx = (labels == j).nonzero(as_tuple=True)[0]
             if idx.numel() == 0:
-                # handle empty cluster: re-seed with a random point
                 ridx = torch.randint(0, N, (1,))
                 new_C[j] = Xn[ridx]
                 empty_retries += 1
             else:
                 new_C[j] = Xn[idx].mean(dim=0)
-                # renormalize
         C = new_C / (new_C.norm(dim=1, keepdim=True) + 1e-12)
 
     return labels, C
 
-# --- Step 3: run group-wise edits/evals ---
 def rank1_delta(h_cpu, tgt_emb_cpu, eta):
-    # Both are CPU; produce CPU delta (we'll move to device dtype later)
-    # delta W = eta * h[:,None] @ tgt_emb[None,:]
-    h = h_cpu.unsqueeze(1)         # [D,1]
-    t = tgt_emb_cpu.unsqueeze(0)   # [1,D]
-    return eta * (h @ t)           # [D,D]
+    h = h_cpu.unsqueeze(1)
+    t = tgt_emb_cpu.unsqueeze(0)
+    return eta * (h @ t)
 
 def run_group_pipeline(recs, n_groups, eta, kmeans_iters):
     global down_proj, W0
-    # Build feature matrix H: [N, D]
-    H = torch.stack([r["h"] for r in recs], dim=0)  # CPU
+    H = torch.stack([r["tgt_emb"] for r in recs], dim=0)
     labels, _ = kmeans_cosine(H, k=n_groups, iters=kmeans_iters, seed=args.seed)
 
-    # Build index lists per cluster
     groups = [[] for _ in range(n_groups)]
     for i, lab in enumerate(labels.tolist()):
         groups[lab].append(i)
 
-    # Evaluate per-group
     per_group = []
     total_success = 0
     total_count = 0
 
-    # We'll reuse the same references
     layer = model.transformer.h[args.layer]
     down_proj = layer.mlp.c_proj
 
@@ -165,11 +145,9 @@ def run_group_pipeline(recs, n_groups, eta, kmeans_iters):
             per_group.append({"group": gi, "size": 0, "success": 0, "eff": float("nan")})
             continue
 
-        # Reset weights
         with torch.no_grad():
             down_proj.weight.copy_(W0)
 
-        # Sum group deltas (compute on CPU then move once)
         delta_sum_cpu = None
         for i in idxs:
             d = rank1_delta(recs[i]["h"], recs[i]["tgt_emb"], eta)
@@ -177,13 +155,10 @@ def run_group_pipeline(recs, n_groups, eta, kmeans_iters):
                 delta_sum_cpu = d
             else:
                 delta_sum_cpu += d
-
-        # Apply once
         with torch.no_grad():
             delta_dev = delta_sum_cpu.to(down_proj.weight.dtype).to(down_proj.weight.device)
             down_proj.weight.add_(delta_dev)
 
-        # Test on this group's prompts
         success = 0
         for i in idxs:
             ok = check_efficacy_greedy(model, tokenizer, recs[i]["prompt"], recs[i]["target"])
@@ -194,7 +169,6 @@ def run_group_pipeline(recs, n_groups, eta, kmeans_iters):
         total_success += success
         total_count += len(idxs)
 
-    # Restore weights at the end
     with torch.no_grad():
         down_proj.weight.copy_(W0)
 
@@ -202,9 +176,7 @@ def run_group_pipeline(recs, n_groups, eta, kmeans_iters):
     return groups, per_group, overall_eff
 
 def main():
-    # 1) collect records
     recs = collect_records()
-    # 2) group-wise pipeline
     groups, per_group, overall_eff = run_group_pipeline(
         recs, n_groups=args.groups, eta=args.eta, kmeans_iters=args.kmeans_iters
     )
