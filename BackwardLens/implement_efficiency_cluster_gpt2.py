@@ -9,7 +9,7 @@ import random
 parser = argparse.ArgumentParser()
 parser.add_argument("--model", default="gpt2-xl", type=str)
 parser.add_argument("--sample", default=500, type=int)
-parser.add_argument("--layer", default=40, type=int)
+parser.add_argument("--layer", default=47, type=int)
 parser.add_argument("--groups", default=10, type=int, help="number of clusters")
 parser.add_argument("--eta", default=0.24, type=float)
 parser.add_argument("--kmeans_iters", default=25, type=int)
