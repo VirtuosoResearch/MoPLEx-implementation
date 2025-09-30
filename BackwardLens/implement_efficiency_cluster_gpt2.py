@@ -4,6 +4,8 @@ from datasets import load_dataset
 from tqdm import tqdm
 import argparse
 import math
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 import random
 
 parser = argparse.ArgumentParser()
@@ -94,30 +96,24 @@ def collect_records():
     return recs
 
 # --- Step 2: cosine k-means (PyTorch, CPU) ---
-def kmeans_cosine(X, k, iters=25, seed=42):
-    torch.manual_seed(seed)
-    N, D = X.shape
-    Xn = X / (X.norm(dim=1, keepdim=True) + 1e-12)
-    perm = torch.randperm(N)[:k]
-    C = Xn[perm].clone()
-
-    empty_retries = 0
-    for _ in range(iters):
-        sim = Xn @ C.T
-        labels = sim.argmax(dim=1)
-
-        new_C = torch.zeros_like(C)
-        for j in range(k):
-            idx = (labels == j).nonzero(as_tuple=True)[0]
-            if idx.numel() == 0:
-                ridx = torch.randint(0, N, (1,))
-                new_C[j] = Xn[ridx]
-                empty_retries += 1
-            else:
-                new_C[j] = Xn[idx].mean(dim=0)
-        C = new_C / (new_C.norm(dim=1, keepdim=True) + 1e-12)
-
-    return labels, C
+def kmeans_cosine(X, k, iters, seed: int = 42):
+    print(X.shape)
+    assert X.dim() == 2, "X must be [N, D]"
+    X_cpu = X.detach().cpu()
+    Xn = X_cpu / (X_cpu.norm(dim=1, keepdim=True) + 1e-12)
+    X_np = Xn.numpy()
+    km = KMeans(
+        n_clusters=k,
+        random_state=seed,
+        n_init=10,
+        max_iter=iters,
+        algorithm="auto",
+        verbose=0,
+    )
+    km.fit(X_np)
+    labels_np = km.labels_
+    labels = torch.from_numpy(labels_np).long()
+    return labels
 
 def rank1_delta(h_cpu, tgt_emb_cpu, eta):
     h = h_cpu.unsqueeze(1)
@@ -127,7 +123,24 @@ def rank1_delta(h_cpu, tgt_emb_cpu, eta):
 def run_group_pipeline(recs, n_groups, eta, kmeans_iters):
     global down_proj, W0
     H = torch.stack([r["tgt_emb"] for r in recs], dim=0)
-    labels, _ = kmeans_cosine(H, k=n_groups, iters=kmeans_iters, seed=args.seed)
+    # H = []
+    # for r in recs:
+    #     emb = r["tgt_emb"].unsqueeze(0)
+    #     h = r["h"].unsqueeze(1)
+    #     nabla = h @ emb
+    #     nabla = nabla.view(-1)
+    #     H.append(nabla)
+    # H = torch.stack(H, dim=0)
+    # jl = torch.randn(H.size(1), 1024).to(H.device)
+    # jl = torch.nn.functional.normalize(jl, p=2, dim=0)
+    # H = (H @ jl)
+    # import math
+    # k = 526
+    # g = torch.Generator(device=H.device).manual_seed(args.seed)
+    # R = torch.randn(H.size(1), k, generator=g, device=H.device)
+    # H = (H @ R) / math.sqrt(k)
+    # H = torch.nn.functional.normalize(H, p=2, dim=1)
+    labels = kmeans_cosine(H, k=n_groups, iters=kmeans_iters, seed=args.seed)
 
     groups = [[] for _ in range(n_groups)]
     for i, lab in enumerate(labels.tolist()):
