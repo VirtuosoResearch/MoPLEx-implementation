@@ -46,7 +46,10 @@ def load_ultrafeedback_multi_preferences(criterions = ["overall_score", "helpful
         if load_specific_pairs:
             pairs = [scores_and_completions[idx] for idx in load_specific_pairs_idxes]
             chosen = max(pairs, key=lambda x: x[0])
-            rejected = min(pairs, key=lambda x: x[0])
+            if pairs[0][0] == pairs[1][0]:
+                rejected = pairs[1]
+            else:
+                rejected = min(pairs, key=lambda x: x[0])
         else:
             chosen = max(scores_and_completions, key=lambda x: x[0])
             rejected = random.choice(scores_and_completions)

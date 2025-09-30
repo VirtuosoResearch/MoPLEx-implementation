@@ -194,7 +194,10 @@ def get_pairwise_completions(completions, criterion="overall_score", seed=42):
     if load_specific_pairs:
         pairs = [scores_and_completions[idx] for idx in load_specific_pairs_idxes]
         chosen = max(pairs, key=lambda x: x[0])
-        rejected = min(pairs, key=lambda x: x[0])
+        if pairs[0][0] == pairs[1][0]:
+            rejected = pairs[1]
+        else:
+            rejected = min(pairs, key=lambda x: x[0])
     else:
         chosen = max(scores_and_completions, key=lambda x: x[0])
         rejected = random.choice(scores_and_completions)
@@ -236,6 +239,26 @@ for criterion in ["overall_score", "helpfulness", "honesty", "instruction_follow
     tmp_ds = ds.map(format_prompt, num_proc=8, remove_columns=ds.column_names, fn_kwargs={"criterion": criterion}, desc=f"Formatting prompts for {criterion}")
     tmp_ds = tmp_ds.filter(lambda x: x["score_chosen"] != -100 or x["score_rejected"] != -100, num_proc=8)
     ds_list.append(tmp_ds)
+
+# %%
+# load indexes 
+import numpy as np
+
+indexes = np.load("./data_processing/indexes/load_indexes.npy")
+if indexes is not None:
+    for i, ds in enumerate(ds_list):
+        ds_list[i] = ds.select(indexes)
+
+# %%
+indexes = set()
+for ds in ds_list:
+    count = 0
+    for i in range(len(ds)):
+        if ds[i]["chosen"] == ds[i]["rejected"]:
+            count += 1
+            indexes.add(i)
+    print(f"Number of ties: {count} / {len(ds)}")
+
 
 # %%
 # compute the conflict rate between different criteria
