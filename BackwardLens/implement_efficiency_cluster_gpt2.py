@@ -106,9 +106,7 @@ def collect_records():
     handle.remove()
     return recs
 
-
-# --- Step 2: cosine k-means (PyTorch, CPU) ---
-def kmeans_cosine(X, k, iters, seed: int = 42):
+def kmeans_cosine(X, k, iters, seed=42):
     print(X.shape)
     assert X.dim() == 2, "X must be [N, D]"
     X_cpu = X.detach().cpu()
