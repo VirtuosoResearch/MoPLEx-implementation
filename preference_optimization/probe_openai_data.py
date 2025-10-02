@@ -65,7 +65,7 @@ from itertools import product
 groups = list(product(age_groups, continents_groups, gender_groups)) 
 groups = ["{}_{}_{}".format(age, continent, gender) for age, continent, gender in groups]
 group_to_annotators = defaultdict(list)
-annotator_ids = set()
+annotator_ids = list()
 ground_truth_cluster_labels = []
 for i, annotator in enumerate(raw_datasets_annotators['train']):
     demographics = annotator['demographics']
@@ -75,10 +75,17 @@ for i, annotator in enumerate(raw_datasets_annotators['train']):
     gender = demographics['gender'] 
     if gender in 'Non-binary or Prefer not to say':
         ground_truth_cluster_labels.append(0) # skip non-binary or prefer not to say due to small sample size
+        annotator_ids.append(annotator['annotator_id'])
         continue
     group_to_annotators["{}_{}_{}".format(age_to_age_group[age], country_to_continents[country], gender)].append(annotator['annotator_id'])
     ground_truth_cluster_labels.append(groups.index("{}_{}_{}".format(age_to_age_group[age], country_to_continents[country], gender)))
-    annotator_ids.add(annotator['annotator_id'])
+    annotator_ids.append(annotator['annotator_id'])
+# %%
+import numpy as np
+np.save('./data_processing/collective-alignment/annotator_ids.npy', np.array(annotator_ids))
+
+# %%
+annotator_ids = np.load('./data_processing/collective-alignment/annotator_ids.npy', allow_pickle=True).tolist()
 
 # %%
 for key, val in group_to_annotators.items():
@@ -207,7 +214,6 @@ import hashlib
 import random
 import time
 
-# Load revision with the fixes to overall_score
 ds = load_dataset("openai/collective-alignment-1", "comparisons")
 total_rows = ds.num_rows
 
@@ -319,3 +325,12 @@ ds = ds['train']
 tmp_ds = ds.map(format_prompt, num_proc=8, remove_columns=ds.column_names)
 tmp_ds = tmp_ds.filter(lambda x: x["score_chosen"] != -100 or x["score_rejected"] != -100, num_proc=8)
 ds_list.append(tmp_ds)
+
+# %%
+from data_processing.load_collective_alignment import load_collective_alignment
+
+dataset = load_collective_alignment(annotators = None,
+                             load_specific_pairs = True, 
+                             load_specific_pairs_idxes = [[0,1], [0,2], [0,3], [1,2], [1,3], [2,3]],
+                             load_indexes_path = None)
+# %%
