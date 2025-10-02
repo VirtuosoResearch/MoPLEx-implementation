@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Literal
 
 from data_processing.load_ultrafeedback import load_ultrafeedback_multi_preferences
+from data_processing.load_collective_alignment import load_collective_alignment
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
@@ -125,11 +126,6 @@ def apply_chat_template(
         )
     return example
 
-'''
-TODO:
-- Run RLHF with PPO
-'''
-
 def main():
     parser = H4ArgumentParser((ModelArguments, DataArguments, SimPOConfig), conflict_handler="resolve")
     model_args, data_args, training_args = parser.parse()
@@ -164,17 +160,19 @@ def main():
     ###############
     # Load datasets
     ###############
-
     if data_args.load_multi_preference:
-        if data_args.load_multi_preference_dataset == "openbmb/UltraFeedback" and data_args.load_specific_pairs:
-            criterions = data_args.load_multi_preference_criterions.split(",")
-            raw_datasets = load_ultrafeedback_multi_preferences(criterions=criterions, load_specific_pairs=data_args.load_specific_pairs,
-                                                               load_specific_pairs_idxes=[2, 3],
-                                                               load_indexes_path="./data_processing/indexes/load_indexes.npy", 
-                                                               test_size=data_args.test_size)
-        else:
-            criterions = data_args.load_multi_preference_criterions.split(",")
-            raw_datasets = load_ultrafeedback_multi_preferences(criterions=criterions)
+        if data_args.load_multi_preference_dataset == "openbmb/UltraFeedback":
+            if data_args.load_specific_pairs:
+                criterions = data_args.load_multi_preference_criterions.split(",")
+                raw_datasets = load_ultrafeedback_multi_preferences(criterions=criterions, load_specific_pairs=data_args.load_specific_pairs,
+                                                                load_specific_pairs_idxes=[2, 3],
+                                                                load_indexes_path="./data_processing/indexes/load_indexes.npy", 
+                                                                test_size=data_args.test_size)
+            else:
+                criterions = data_args.load_multi_preference_criterions.split(",")
+                raw_datasets = load_ultrafeedback_multi_preferences(criterions=criterions)
+        elif data_args.load_multi_preference_dataset == "openai/collective-alignment-1":
+            raw_datasets = load_collective_alignment(load_specific_pairs_idxes=[[0,1], [0,2], [0,3], [1,2], [1,3], [2,3]])
     else:
         raw_datasets = get_datasets(
             data_args,
