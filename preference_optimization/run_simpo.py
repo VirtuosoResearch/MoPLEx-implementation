@@ -201,12 +201,18 @@ def main():
                     raise ValueError(
                         "`annotator_ids` must be a comma separated list of integers."
                     ) from exc
-            annotator_ids = [0,1]
+            
+            # Parse subset_id if provided (overrides annotator_ids)
+            subset_id = None
+            if hasattr(data_args, 'subset_id') and data_args.subset_id is not None:
+                subset_id = data_args.subset_id
+            
             raw_datasets = load_imdb_preference_with_source(
                 seed=training_args.seed,
                 test_size=data_args.test_size,
                 sources=sources,
                 annotator_ids=annotator_ids,
+                subset_id=subset_id,
             )
     else:
         raw_datasets = get_datasets(
