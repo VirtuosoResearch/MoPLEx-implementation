@@ -43,6 +43,7 @@ from typing import Optional, Literal
 
 from data_processing.load_ultrafeedback import load_ultrafeedback_multi_preferences
 from data_processing.load_collective_alignment import load_collective_alignment
+from data_processing.load_imdb_preference_with_source import load_imdb_preference_with_source
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
@@ -181,6 +182,23 @@ def main():
                 subset_indices = data[data_args.subset_id]["subset_indices"]
                 annotators = subset_indices
             raw_datasets = load_collective_alignment(annotators=annotators, load_specific_pairs_idxes=[[0,1], [0,2], [0,3], [1,2], [1,3], [2,3]])
+        elif data_args.load_multi_preference_dataset == "imdb_preference_with_source":
+            subset_indices = None
+            if data_args.subset_indices:
+                try:
+                    subset_indices = [
+                        int(idx.strip()) for idx in data_args.subset_indices.split(",") if idx.strip()
+                    ]
+                except ValueError as exc:
+                    raise ValueError(
+                        "`subset_indices` must be a comma separated list of integers."
+                    ) from exc
+            raw_datasets = load_imdb_preference_with_source(
+                seed=training_args.seed,
+                subset_indices=subset_indices,
+                subset_id=data_args.subset_id,
+                test_size=data_args.test_size,
+            )
     else:
         raw_datasets = get_datasets(
             data_args,

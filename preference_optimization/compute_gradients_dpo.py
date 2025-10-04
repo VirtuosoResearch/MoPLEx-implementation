@@ -126,6 +126,7 @@ model.to(device)
 # get data loader on the preference data
 import numpy as np
 from torch.utils.data import DataLoader
+from torch.nn import functional as F
 from trl.trainer.utils import DPODataCollatorWithPadding
 
 class training_args:
@@ -133,6 +134,8 @@ class training_args:
     max_prompt_length = 1024
     truncation_mode = "keep_end" 
     label_pad_token_id = -100
+    dpo_beta = 0.1
+    label_smoothing = 0.0
 
 def build_tokenized_answer(prompt, answer):
     """
@@ -371,7 +374,10 @@ def concatenated_inputs(
             elif k.endswith("_attention_mask"):
                 pad_value = 0
             concatenated_key = k.replace("chosen", "concatenated")
-            concatenated_batch[concatenated_key] = pad_to_length(batch[k], max_length, pad_value=pad_value)
+            tensor = pad_to_length(batch[k], max_length, pad_value=pad_value)
+            if device is not None:
+                tensor = tensor.to(device=device)
+            concatenated_batch[concatenated_key] = tensor
     for k in batch:
         if k.startswith("rejected") and isinstance(batch[k], torch.Tensor):
             if "labels" in k or is_encoder_decoder:
@@ -381,10 +387,13 @@ def concatenated_inputs(
             elif k.endswith("_attention_mask"):
                 pad_value = 0
             concatenated_key = k.replace("rejected", "concatenated")
+            tensor = pad_to_length(batch[k], max_length, pad_value=pad_value)
+            if device is not None:
+                tensor = tensor.to(device=device)
             concatenated_batch[concatenated_key] = torch.cat(
                 (
                     concatenated_batch[concatenated_key],
-                    pad_to_length(batch[k], max_length, pad_value=pad_value),
+                    tensor,
                 ),
                 dim=0,
             ).to(device=device)
@@ -397,9 +406,193 @@ def concatenated_inputs(
 
     return concatenated_batch
 
-def concatenated_forward(model, batch):
-    pass
 
-def compute_loss_and_outputs(model, batch):
-    # compute dpo loss given a batch
-    pass
+def _compute_sequence_logps(
+    logits: torch.FloatTensor,
+    labels: torch.LongTensor,
+    label_pad_token_id: int,
+    *,
+    is_encoder_decoder: bool = False,
+) -> Tuple[torch.FloatTensor, torch.Tensor, torch.FloatTensor, torch.FloatTensor]:
+    if logits.shape[:-1] != labels.shape:
+        raise ValueError("Logits (batch and sequence length dim) and labels must have the same shape.")
+
+    if not is_encoder_decoder:
+        labels = labels[:, 1:].clone()
+        logits = logits[:, :-1, :]
+
+    loss_mask = labels != label_pad_token_id
+    safe_labels = labels.clone()
+    safe_labels[~loss_mask] = 0
+
+    per_token_logps = torch.gather(
+        logits.log_softmax(-1),
+        dim=2,
+        index=safe_labels.unsqueeze(2),
+    ).squeeze(2)
+
+    masked_logps = per_token_logps * loss_mask
+    sequence_logps = masked_logps.sum(-1)
+    token_counts = loss_mask.sum(-1)
+
+    return sequence_logps, loss_mask, masked_logps, token_counts
+
+
+def concatenated_forward(model, batch):
+    device = next(model.parameters()).device
+
+    concatenated_batch = concatenated_inputs(
+        batch,
+        label_pad_token_id=training_args.label_pad_token_id,
+        device=device,
+    )
+
+    input_ids = concatenated_batch["concatenated_input_ids"].to(device)
+    attention_mask = concatenated_batch["concatenated_attention_mask"].to(device)
+    labels = concatenated_batch.get("concatenated_labels")
+    if labels is None:
+        raise KeyError("concatenated_labels missing from batch; check data collator output.")
+    labels = labels.to(device)
+
+    outputs = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        use_cache=False,
+        return_dict=True,
+    )
+
+    logits = outputs.logits
+    sequence_logps, loss_mask, masked_logps, token_counts = _compute_sequence_logps(
+        logits,
+        labels,
+        training_args.label_pad_token_id,
+    )
+
+    len_chosen = batch["chosen_labels"].shape[0]
+
+    return {
+        "chosen_logps": sequence_logps[:len_chosen],
+        "rejected_logps": sequence_logps[len_chosen:],
+        "chosen_logits": logits[:len_chosen],
+        "rejected_logits": logits[len_chosen:],
+        "concatenated_logits": logits,
+        "concatenated_labels": labels,
+        "loss_mask": loss_mask,
+        "per_token_logps": masked_logps,
+        "token_counts": token_counts,
+        "model_outputs": outputs,
+        "num_chosen": len_chosen,
+    }
+
+
+def compute_loss_and_outputs(
+    model,
+    batch,
+    *,
+    beta: Optional[float] = None,
+    label_smoothing: Optional[float] = None,
+    reference_chosen_logps: Optional[torch.FloatTensor] = None,
+    reference_rejected_logps: Optional[torch.FloatTensor] = None,
+):
+    beta = training_args.dpo_beta if beta is None else beta
+    label_smoothing = training_args.label_smoothing if label_smoothing is None else label_smoothing
+
+    forward_dict = concatenated_forward(model, batch)
+
+    policy_chosen_logps = forward_dict["chosen_logps"]
+    policy_rejected_logps = forward_dict["rejected_logps"]
+    device = policy_chosen_logps.device
+
+    if reference_chosen_logps is None:
+        reference_chosen_logps = batch.get("reference_chosen_logps")
+    if reference_rejected_logps is None:
+        reference_rejected_logps = batch.get("reference_rejected_logps")
+
+    if reference_chosen_logps is None:
+        reference_chosen_logps = torch.zeros_like(policy_chosen_logps)
+    else:
+        reference_chosen_logps = reference_chosen_logps.to(device)
+    if reference_rejected_logps is None:
+        reference_rejected_logps = torch.zeros_like(policy_rejected_logps)
+    else:
+        reference_rejected_logps = reference_rejected_logps.to(device)
+
+    pi_logratios = policy_chosen_logps - policy_rejected_logps
+    ref_logratios = reference_chosen_logps - reference_rejected_logps
+    logits = pi_logratios - ref_logratios
+
+    losses = (
+        -F.logsigmoid(beta * logits) * (1 - label_smoothing)
+        - F.logsigmoid(-beta * logits) * label_smoothing
+    )
+
+    loss = losses.mean()
+
+    forward_dict.update(
+        {
+            "loss": loss,
+            "losses": losses,
+            "dpo_logits": logits,
+            "policy_chosen_logps": policy_chosen_logps,
+            "policy_rejected_logps": policy_rejected_logps,
+            "reference_chosen_logps": reference_chosen_logps,
+            "reference_rejected_logps": reference_rejected_logps,
+            "chosen_rewards": policy_chosen_logps - reference_chosen_logps,
+            "rejected_rewards": policy_rejected_logps - reference_rejected_logps,
+            "beta": beta,
+            "label_smoothing": label_smoothing,
+        }
+    )
+
+    return loss, forward_dict
+
+
+def compute_label_token_gradients(
+    model,
+    batch,
+    *,
+    beta: Optional[float] = None,
+    label_smoothing: Optional[float] = None,
+    reference_chosen_logps: Optional[torch.FloatTensor] = None,
+    reference_rejected_logps: Optional[torch.FloatTensor] = None,
+):
+    model.train()
+    model.zero_grad(set_to_none=True)
+
+    loss, forward_dict = compute_loss_and_outputs(
+        model,
+        batch,
+        beta=beta,
+        label_smoothing=label_smoothing,
+        reference_chosen_logps=reference_chosen_logps,
+        reference_rejected_logps=reference_rejected_logps,
+    )
+
+    concatenated_logits = forward_dict["concatenated_logits"]
+    concatenated_logits.retain_grad()
+
+    loss.backward()
+
+    gradients = concatenated_logits.grad
+    if gradients is None:
+        raise RuntimeError("Gradients were not computed for concatenated logits.")
+
+    mask = forward_dict["loss_mask"].to(gradients.dtype)
+    masked_gradients = gradients[:, :-1, :] * mask.unsqueeze(-1)
+
+    num_chosen = forward_dict["num_chosen"]
+    chosen_grads = masked_gradients[:num_chosen].detach()
+    rejected_grads = masked_gradients[num_chosen:].detach()
+
+    model.zero_grad(set_to_none=True)
+
+    return {
+        "loss": loss.detach(),
+        "chosen_gradients": chosen_grads,
+        "rejected_gradients": rejected_grads,
+        "mask": mask.detach(),
+        "metadata": {
+            "beta": forward_dict["beta"],
+            "label_smoothing": forward_dict["label_smoothing"],
+        },
+    }
