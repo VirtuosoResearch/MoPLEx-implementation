@@ -72,11 +72,22 @@ def load_imdb_preference_with_source(
     subset_indices: Union[Sequence[int], None] = None,
     subset_id: Union[int, None] = None,
     subset_indices_path: str = _DEFAULT_SUBSET_PATH,
+    sources: Optional[Sequence[str]] = None,
 ) -> DatasetDict:
     """Load the local IMDb preference dataset formatted for preference optimization."""
 
     dataset = load_dataset("json", data_files=data_path, split="train")
     dataset = dataset.filter(_has_required_content)
+    if sources:
+        if isinstance(sources, str):
+            source_set = {sources}
+        else:
+            source_set = set(sources)
+
+        def _keep_source(example):
+            return example.get("preference_source") in source_set
+
+        dataset = dataset.filter(_keep_source)
     formatted = dataset.map(_format_example, remove_columns=dataset.column_names)
 
     resolved_test_size = _resolve_test_size(test_size, len(formatted))
