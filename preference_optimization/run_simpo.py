@@ -43,6 +43,7 @@ from typing import Optional, Literal
 
 from data_processing.load_ultrafeedback import load_ultrafeedback_multi_preferences
 from data_processing.load_collective_alignment import load_collective_alignment
+from data_processing.load_imdb_preference_with_source import load_imdb_preference_with_source
 
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning, module="pynvml")
@@ -181,6 +182,32 @@ def main():
                 subset_indices = data[data_args.subset_id]["subset_indices"]
                 annotators = subset_indices
             raw_datasets = load_collective_alignment(annotators=annotators, load_specific_pairs_idxes=[[0,1], [0,2], [0,3], [1,2], [1,3], [2,3]])
+        elif data_args.load_multi_preference_dataset == "imdb_preference_with_source":
+            # Parse sources if provided
+            sources = None
+            if data_args.preference_sources:
+                sources = [
+                    src.strip() for src in data_args.preference_sources.split(",") if src.strip()
+                ]
+            
+            # Parse annotator IDs if provided
+            annotator_ids = None
+            if hasattr(data_args, 'annotator_ids') and data_args.annotator_ids:
+                try:
+                    annotator_ids = [
+                        int(idx.strip()) for idx in data_args.annotator_ids.split(",") if idx.strip()
+                    ]
+                except ValueError as exc:
+                    raise ValueError(
+                        "`annotator_ids` must be a comma separated list of integers."
+                    ) from exc
+            annotator_ids = [0,1]
+            raw_datasets = load_imdb_preference_with_source(
+                seed=training_args.seed,
+                test_size=data_args.test_size,
+                sources=sources,
+                annotator_ids=annotator_ids,
+            )
     else:
         raw_datasets = get_datasets(
             data_args,

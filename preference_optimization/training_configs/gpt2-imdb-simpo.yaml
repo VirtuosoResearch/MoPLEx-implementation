@@ -1,0 +1,39 @@
+# Model arguments
+model_name_or_path: gpt2
+torch_dtype: float32
+attn_implementation: eager
+
+# Data training arguments
+load_multi_preference: true
+load_multi_preference_dataset: imdb_preference_with_source
+preprocessing_num_workers: 4
+test_size: 0.1
+
+# SimPOTrainer arguments
+beta: 2.0
+gamma_beta_ratio: 0.5
+training_method: simpo
+do_eval: true
+evaluation_strategy: epoch
+gradient_accumulation_steps: 4
+gradient_checkpointing: false
+hub_model_id: gpt2-imdb-simpo
+learning_rate: 5.0e-5
+log_level: info
+logging_steps: 50
+lr_scheduler_type: cosine
+max_length: 512
+max_prompt_length: 448
+num_train_epochs: 1
+optim: adamw_torch
+output_dir: outputs/gpt2-imdb-simpo
+run_name: gpt2-imdb-simpo
+per_device_train_batch_size: 2
+per_device_eval_batch_size: 4
+push_to_hub: false
+save_strategy: epoch
+save_total_limit: 5
+seed: 42
+warmup_ratio: 0.1
+report_to:
+- tensorboard
