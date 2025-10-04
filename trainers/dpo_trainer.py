@@ -184,6 +184,13 @@ class DPOTrainer():
         # post process for PP
         self.current_device = self.accelerator.device
         self.running = RunningMoments(self.accelerator)
+        self.save_pstar_at_epoch = getattr(self.config, "save_pstar_at_epoch", -1)
+        self.pstar_save_path = getattr(self.config, "pstar_save_path", "./pstar.pt")
+        self.has_saved_pstar = False
+
+        self.save_p_at_epoch = getattr(self.config, "save_p_at_epoch", -1)
+        self.p_save_path = getattr(self.config, "p_save_path", "./p.pt")
+        self.has_saved_p = False
         
     def prepare_dataloader(self, dataset: Union[torch.utils.data.Dataset, Dataset], data_collator=None):
         """
@@ -365,6 +372,10 @@ class DPOTrainer():
             responses_w_ = responses_w[i : i + sub_bs]
             responses_l_ = responses_l[i : i + sub_bs]
             preference_mask_ = preference_mask[i : i + sub_bs] if preference_mask is not None else None
+
+            # print("queries: ",self.tokenizer.decode(queries_[0]),"\n\n")
+            # print("response_w: ",self.tokenizer.decode(responses_w_[0]),"\n\n")
+            # print("response_l: ",self.tokenizer.decode(responses_l_[0]),"\n\n")
 
             loss, stats = self._step(
                 queries=queries_,
