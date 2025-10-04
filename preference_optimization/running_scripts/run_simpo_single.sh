@@ -13,6 +13,14 @@ for criterion in "${criterions[@]}"; do
         load_specific_pairs=True num_train_epochs=5 test_size=2000
 done
 
+CUDA_VISIBLE_DEVICES=0 ACCELERATE_LOG_LEVEL=info accelerate launch run_simpo.py training_configs/base-simpo.yaml \
+        beta=2.0 training_method="simpo" \
+        output_dir="outputs/base-simpo-qwen-single-controlled" \
+        run_name="base-simpo-single-controlled" \
+        load_specific_pairs=True num_train_epochs=1 test_size=2000 \
+        load_multi_preference_dataset=openai/collective-alignment-1 \
+        subset_id=0
+
 # export WANDB_PROJECT="scalable-preference-optimization"
 # export WANDB_ENTITY="VirtuosoResearch"
 # export WANDB_NAME="dpo"

@@ -160,6 +160,7 @@ def main():
     ###############
     # Load datasets
     ###############
+    logger.info(f"Loading datasets with {data_args.load_multi_preference_dataset=} and {data_args.load_multi_preference_criterions=}")
     if data_args.load_multi_preference:
         if data_args.load_multi_preference_dataset == "openbmb/UltraFeedback":
             if data_args.load_specific_pairs:
@@ -172,7 +173,14 @@ def main():
                 criterions = data_args.load_multi_preference_criterions.split(",")
                 raw_datasets = load_ultrafeedback_multi_preferences(criterions=criterions)
         elif data_args.load_multi_preference_dataset == "openai/collective-alignment-1":
-            raw_datasets = load_collective_alignment(load_specific_pairs_idxes=[[0,1], [0,2], [0,3], [1,2], [1,3], [2,3]])
+            annotators = None
+            if data_args.subset_id is not None:
+                import json
+                with open("./data_processing/collective-alignment/subset_indices.json", "r") as f:
+                    data = json.load(f)
+                subset_indices = data[data_args.subset_id]["subset_indices"]
+                annotators = subset_indices
+            raw_datasets = load_collective_alignment(annotators=annotators, load_specific_pairs_idxes=[[0,1], [0,2], [0,3], [1,2], [1,3], [2,3]])
     else:
         raw_datasets = get_datasets(
             data_args,
