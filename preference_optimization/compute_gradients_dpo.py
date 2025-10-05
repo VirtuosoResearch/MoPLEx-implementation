@@ -2,18 +2,23 @@
 from alignment import get_datasets, get_tokenizer
 from data_processing.load_ultrafeedback import load_ultrafeedback_multi_preferences
 from data_processing.load_collective_alignment import load_collective_alignment
+from data_processing.load_imdb_preference_with_source import load_imdb_preference_with_source
 from run_simpo import apply_chat_template
 
 
 class data_args:
     load_multi_preference = True
     load_specific_pairs = True
-    load_multi_preference_dataset = "openai/collective-alignment-1"
+    load_multi_preference_dataset = "imdb_preference_with_source"
 
     preprocessing_num_workers = 4
     auto_insert_empty_system_msg = True
     chat_template = None
     truncation_side = None
+
+    preference_sources = None
+    annotator_ids = None
+    test_size = 2000 # No use, predefined
 
 class model_args:
     model_name_or_path = "Qwen/Qwen2-0.5B-Instruct"
@@ -39,6 +44,38 @@ if data_args.load_multi_preference:
         raw_datasets = load_collective_alignment(
             annotators = None,
             load_specific_pairs_idxes=[[0,1], [0,2], [0,3], [1,2], [1,3], [2,3]]
+        )
+    elif data_args.load_multi_preference_dataset == "imdb_preference_with_source":
+        # Parse sources if provided
+        sources = None
+        if data_args.preference_sources:
+            sources = [
+                src.strip() for src in data_args.preference_sources.split(",") if src.strip()
+            ]
+        
+        # Parse annotator IDs if provided
+        annotator_ids = None
+        if hasattr(data_args, 'annotator_ids') and data_args.annotator_ids:
+            try:
+                annotator_ids = [
+                    int(idx.strip()) for idx in data_args.annotator_ids.split(",") if idx.strip()
+                ]
+            except ValueError as exc:
+                raise ValueError(
+                    "`annotator_ids` must be a comma separated list of integers."
+                ) from exc
+        
+        # Parse subset_id if provided (overrides annotator_ids)
+        subset_id = None
+        if hasattr(data_args, 'subset_id') and data_args.subset_id is not None:
+            subset_id = data_args.subset_id
+        
+        raw_datasets = load_imdb_preference_with_source(
+            seed=42,
+            test_size=data_args.test_size,
+            sources=sources,
+            annotator_ids=annotator_ids,
+            # subset_id=subset_id,
         )
 else:
     raw_datasets = get_datasets(
@@ -78,6 +115,8 @@ else:
 #####################
 if "criterion" in column_names: # keep the criterion column if it exists
     column_names.remove("criterion")
+if "annotator" in column_names: # keep the annotator column if it exists
+    column_names.remove("annotator")
 raw_datasets = raw_datasets.map(
     apply_chat_template,
     fn_kwargs={
@@ -103,6 +142,21 @@ eval_dataset = raw_datasets["test"]
 # load the model
 import torch
 from transformers import AutoModelForCausalLM
+from peft import get_peft_model, LoraConfig, TaskType
+
+class training_args:
+    max_length = 2048
+    max_prompt_length = 1024
+    truncation_mode = "keep_end" 
+    label_pad_token_id = -100
+    dpo_beta = 0.1
+    label_smoothing = 0.0
+    
+    # LoRA configurations
+    lora_r = 8
+    lora_alpha = 32
+    lora_dropout = 0.1
+    lora_target_modules = ["q_proj", "v_proj", "k_proj", "o_proj"]
 
 model_kwargs = dict(
         revision=model_args.model_revision,
@@ -114,10 +168,25 @@ model_kwargs = dict(
         attn_implementation=None,
     )
 
+# Load base model
 model = AutoModelForCausalLM.from_pretrained(
     model_args.model_name_or_path,
     **model_kwargs,
 )
+
+# Configure LoRA
+peft_config = LoraConfig(
+    task_type=TaskType.CAUSAL_LM,
+    r=training_args.lora_r,
+    lora_alpha=training_args.lora_alpha,
+    lora_dropout=training_args.lora_dropout,
+    target_modules=training_args.lora_target_modules,
+    bias="none"
+)
+
+# Apply LoRA adapter
+model = get_peft_model(model, peft_config)
+
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model.to(device)
 
@@ -128,14 +197,8 @@ import numpy as np
 from torch.utils.data import DataLoader
 from torch.nn import functional as F
 from trl.trainer.utils import DPODataCollatorWithPadding
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
-class training_args:
-    max_length = 2048
-    max_prompt_length = 1024
-    truncation_mode = "keep_end" 
-    label_pad_token_id = -100
-    dpo_beta = 0.1
-    label_smoothing = 0.0
 
 def build_tokenized_answer(prompt, answer):
     """
@@ -326,16 +389,16 @@ data_collator = DPODataCollatorWithPadding(
         is_encoder_decoder=False,
     )
 train_dataloader = DataLoader(
-    raw_datasets["train"],
-    shuffle=True,
-    collate_fn=data_collator,
-    batch_size=2,
-)
-test_dataloader = DataLoader(
-    raw_datasets["test"],
+    train_dataset,
     shuffle=False,
     collate_fn=data_collator,
-    batch_size=2,
+    batch_size=1,
+)
+test_dataloader = DataLoader(
+    eval_dataset,
+    shuffle=False,
+    collate_fn=data_collator,
+    batch_size=1,
 )
 
 # %%
@@ -547,52 +610,147 @@ def compute_loss_and_outputs(
     return loss, forward_dict
 
 
-def compute_label_token_gradients(
-    model,
-    batch,
-    *,
-    beta: Optional[float] = None,
-    label_smoothing: Optional[float] = None,
-    reference_chosen_logps: Optional[torch.FloatTensor] = None,
-    reference_rejected_logps: Optional[torch.FloatTensor] = None,
-):
-    model.train()
-    model.zero_grad(set_to_none=True)
+# def compute_label_token_gradients(
+#     model,
+#     batch,
+#     *,
+#     beta: Optional[float] = None,
+#     label_smoothing: Optional[float] = None,
+#     reference_chosen_logps: Optional[torch.FloatTensor] = None,
+#     reference_rejected_logps: Optional[torch.FloatTensor] = None,
+# ):
+#     model.train()
+#     model.zero_grad(set_to_none=True)
 
+#     loss, forward_dict = compute_loss_and_outputs(
+#         model,
+#         batch,
+#         beta=beta,
+#         label_smoothing=label_smoothing,
+#         reference_chosen_logps=reference_chosen_logps,
+#         reference_rejected_logps=reference_rejected_logps,
+#     )
+
+#     concatenated_logits = forward_dict["concatenated_logits"]
+#     concatenated_logits.retain_grad()
+
+#     loss.backward()
+
+#     gradients = concatenated_logits.grad
+#     if gradients is None:
+#         raise RuntimeError("Gradients were not computed for concatenated logits.")
+
+#     mask = forward_dict["loss_mask"].to(gradients.dtype)
+#     masked_gradients = gradients[:, :-1, :] * mask.unsqueeze(-1)
+
+#     num_chosen = forward_dict["num_chosen"]
+#     chosen_grads = masked_gradients[:num_chosen].detach()
+#     rejected_grads = masked_gradients[num_chosen:].detach()
+
+#     model.zero_grad(set_to_none=True)
+
+#     return {
+#         "loss": loss.detach(),
+#         "chosen_gradients": chosen_grads,
+#         "rejected_gradients": rejected_grads,
+#         "mask": mask.detach(),
+#         "metadata": {
+#             "beta": forward_dict["beta"],
+#             "label_smoothing": forward_dict["label_smoothing"],
+#         },
+#     }
+
+# %%
+# Iterate over the training set and compute the gradients to dpo logits
+import os
+from tqdm import tqdm
+import numpy as np
+import torch.nn.functional as F
+
+# Create directory to store gradients
+base_gradient_dir = "gradients"
+os.makedirs(base_gradient_dir, exist_ok=True)
+
+project_gradients_dim = 400  # Dimension of the projected space
+removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "embed_tokens", "norm", "word_embeddings" ]
+gradients_dim = 0
+for name, param in model.named_parameters():
+    if any([key in name for key in removing_keys]):
+        continue
+    if param.requires_grad:
+        gradients_dim += param.numel()
+
+# Concatenate gradients for each annotator and create projection matrix
+project_matrix = (2 * np.random.randint(2, size=(gradients_dim, project_gradients_dim)) - 1).astype(float)
+project_matrix *= 1 / np.sqrt(project_gradients_dim)
+
+num_annotators = 40
+counts_for_annotators = [0] * num_annotators
+
+# %%
+# Iterate over training data
+def get_model_params(model):
+    return [param for param in model.parameters() if param.requires_grad]
+
+params = get_model_params(model)
+model.eval()  # Set model to evaluation mode
+for batch_idx, batch in enumerate(tqdm(train_dataloader, desc="Computing gradients")):
+    # Get gradients for this batch
     loss, forward_dict = compute_loss_and_outputs(
         model,
         batch,
-        beta=beta,
-        label_smoothing=label_smoothing,
-        reference_chosen_logps=reference_chosen_logps,
-        reference_rejected_logps=reference_rejected_logps,
     )
+    logits = forward_dict["dpo_logits"].mean()*training_args.dpo_beta
+    
+    # Get the chosen and rejected gradients
+    grads = torch.autograd.grad(logits, params, retain_graph=False, create_graph=False)
 
-    concatenated_logits = forward_dict["concatenated_logits"]
-    concatenated_logits.retain_grad()
+    # flatten the gradients 
+    grads = [g.flatten() for g in grads if g is not None]
+    flat_grads = torch.cat(grads).cpu().numpy()  # Convert to numpy
 
-    loss.backward()
+    # Project the gradients
+    projected_grads = np.dot(flat_grads, project_matrix)
 
-    gradients = concatenated_logits.grad
-    if gradients is None:
-        raise RuntimeError("Gradients were not computed for concatenated logits.")
+    # Get annotator IDs for this batch (assuming they're in the batch)
+    annotator_ids = batch.get('annotator', ['default'] * batch['chosen_input_ids'].size(0))
 
-    mask = forward_dict["loss_mask"].to(gradients.dtype)
-    masked_gradients = gradients[:, :-1, :] * mask.unsqueeze(-1)
+    # Create directory for this annotator
+    annotator_dir = os.path.join(base_gradient_dir, "annotator_" + str(annotator_ids[0]))
+    os.makedirs(annotator_dir, exist_ok=True)
+    
+    # Save the projected gradients and projection matrix
+    idx = counts_for_annotators[annotator_ids[0]]
+    counts_for_annotators[annotator_ids[0]] += 1
+    torch.save(projected_grads, os.path.join(annotator_dir, f'projected_gradients_{idx}.pt'))
 
-    num_chosen = forward_dict["num_chosen"]
-    chosen_grads = masked_gradients[:num_chosen].detach()
-    rejected_grads = masked_gradients[num_chosen:].detach()
 
-    model.zero_grad(set_to_none=True)
 
-    return {
-        "loss": loss.detach(),
-        "chosen_gradients": chosen_grads,
-        "rejected_gradients": rejected_grads,
-        "mask": mask.detach(),
-        "metadata": {
-            "beta": forward_dict["beta"],
-            "label_smoothing": forward_dict["label_smoothing"],
-        },
-    }
+# # Keep track of example index across batches
+# global_idx = 0
+
+# # Iterate over training data
+# model.train()
+# for batch_idx, batch in enumerate(tqdm(train_dataloader, desc="Computing gradients")):
+#     # Get the flattened gradients for this batch
+#     batch_grads = compute_dpo_logits_gradient(model, batch, beta=training_args.dpo_beta)
+    
+#     # Project the gradients using the Rademacher matrix
+#     projected_grads = torch.matmul(rademacher_matrix, batch_grads.cpu())
+    
+#     # Get annotator IDs for this batch
+#     annotator_ids = batch.get('annotator', ['default'] * batch['chosen_input_ids'].size(0))
+    
+#     # Save projected gradients for each example in the batch
+#     for idx, annotator in enumerate(annotator_ids):
+#         # Create directory for this annotator if it doesn't exist
+#         annotator_dir = os.path.join(base_gradient_dir, str(annotator))
+#         os.makedirs(annotator_dir, exist_ok=True)
+        
+#         # Save the projected gradients
+#         torch.save(projected_grads, os.path.join(annotator_dir, f'projected_gradients_{global_idx + idx}.pt'))
+    
+#     global_idx += len(annotator_ids)
+
+# # Save the projection matrix for future reference
+# torch.save(rademacher_matrix, os.path.join(base_gradient_dir, 'projection_matrix.pt'))
