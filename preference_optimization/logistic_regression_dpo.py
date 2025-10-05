@@ -17,7 +17,7 @@ class data_args:
     truncation_side = None
 
     preference_sources = None
-    annotator_ids = None
+    annotator_ids = "0,1,2"
     test_size = 2000 # No use, predefined
 
 class model_args:
@@ -190,17 +190,21 @@ peft_config = LoraConfig(
 # Apply LoRA adapter
 model = get_peft_model(model, peft_config)
 
-# save initial lora parameters
-state_dict = model.state_dict()
-for key in list(state_dict.keys()):
-    if "lora_" not in key:
-        del state_dict[key]
-print(state_dict.keys())
-torch.save(state_dict, f"{base_gradient_dir}/initial_lora_weights.pt")
+# load initial lora parameters
+state_dict = torch.load(f"{base_gradient_dir}/initial_lora_weights.pt")
+model.load_state_dict(state_dict, strict=False)
+
+# print norm of the lora parameters
+total_norm = 0.0
+for name, param in model.named_parameters():
+    if param.requires_grad and "lora_" in name:
+        param_norm = param.data.norm(2)
+        total_norm += param_norm.item() ** 2
+total_norm = total_norm ** (1. / 2)
+print("Lora parameters norm: ", total_norm)
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 model.to(device)
-
 
 # %%
 # get data loader on the preference data
@@ -413,6 +417,191 @@ test_dataloader = DataLoader(
 )
 
 # %%
+import os
+from tqdm import tqdm
+import numpy as np
+import torch.nn.functional as F
+from sklearn.linear_model import LogisticRegression
+
+class logistic_regression_args:
+    lr_regularization_lambda = 1
+    lr_iters = 50
+    use_customized_process = True
+
+# Create directory to store gradients
+project_gradients_dim = 400  # Dimension of the projected space
+removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "embed_tokens", "norm", "word_embeddings" ]
+gradients_dim = 0
+for name, param in model.named_parameters():
+    if any([key in name for key in removing_keys]):
+        continue
+    if param.requires_grad:
+        gradients_dim += param.numel()
+
+# Concatenate gradients for each annotator and create projection matrix
+np.random.seed(42)  # For reproducibility   
+project_matrix = (2 * np.random.randint(2, size=(gradients_dim, project_gradients_dim)) - 1).astype(float)
+project_matrix *= 1 / np.sqrt(project_gradients_dim)
+
+def customize_logistic_regression(gradients, outputs=None, labels=None, l2_strength=1e3):
+    from scipy.optimize import minimize
+    from sklearn.metrics import log_loss
+
+    if outputs is not None:
+        X = np.concatenate([gradients, outputs.reshape(-1, 1)], axis=1) # f_theta^star + gX
+    else:
+        X = gradients
+
+    def logistic_loss(variable_coefs):
+        # Reinsert the fixed coefficient
+        if outputs is not None:
+            fixed_index = gradients.shape[1]; fixed_value = 1
+            full_coefs = np.insert(variable_coefs, fixed_index, fixed_value)
+        else:
+            full_coefs = variable_coefs
+        logits = X @ full_coefs.reshape(-1, 1)
+        if labels is not None:
+            probs = 1 / (1 + np.exp(-logits))
+            loss = log_loss(labels, probs).mean()
+        else:
+            loss = np.log(1 + np.exp(-logits)).mean()
+
+        # L2 penalty only on the variable coefficients
+        l2_penalty = l2_strength * np.sum(variable_coefs ** 2)
+        return loss + l2_penalty
+
+    def logistic_jac(variable_coefs):
+        if outputs is not None:
+            fixed_index = gradients.shape[1]; fixed_value = 1.0
+            coefs = np.insert(variable_coefs, fixed_index, fixed_value)
+        else:
+            fixed_index = None
+            coefs = variable_coefs
+        logits = X @ coefs.reshape(-1, 1)
+        probs = 1 / (1 + np.exp(-logits)); y = np.ones_like(probs) 
+        grad = X.T @ (probs - y) / X.shape[0]  # shape (d+1, 1)
+        grad = grad.flatten()
+        if fixed_index is not None:
+            grad = np.delete(grad, fixed_index)  # remove derivative for fixed coefficient
+        grad += 2 * l2_strength * variable_coefs  # L2 grad
+        return grad
+    
+    initial_guess = np.zeros(X.shape[1] - 1) if outputs is not None else np.zeros(X.shape[1])
+    result = minimize(logistic_loss, initial_guess, method='BFGS', options={'maxiter': logistic_regression_args.lr_iters})
+    print(result)
+
+    # evaluate the trained model
+    if labels is not None:
+        accuracy = np.mean(np.round(1 / (1 + np.exp(-X @ result.x.reshape(-1, 1)))) == labels)
+        print("Accuracy: ", accuracy)
+
+    return result.x
+
+def fit_linear_model(gradients, outputs=None, labels=None, seed=0, use_customized_process=True):
+    if use_customized_process:
+        proj_coef = customize_logistic_regression(gradients, outputs=outputs, l2_strength=logistic_regression_args.lr_regularization_lambda)
+        print("L2 norm before projection", np.linalg.norm(proj_coef))
+    else:
+        if labels is None:
+            # randomly assign labels as 0 or 1
+            labels = np.random.binomial(n=1, p=0.7, size=gradients.shape[0])
+            # reverse the gradients for the 0 labels
+            mask = np.copy(labels)
+            mask[labels == 0] = -1
+            mask = mask.reshape(-1, 1)
+            gradients = gradients*mask
+        else:
+            ref_label = labels[0]
+            origin_labels = np.copy(labels)
+            labels[origin_labels == ref_label] = 1
+            labels[origin_labels != ref_label] = -1
+
+            mask = np.copy(labels)
+            mask[labels == 0] = -1
+            mask = mask.reshape(-1, 1)
+            gradients = gradients*mask
+
+        if outputs is None:
+            # estimate parameters: train a logistic regression model
+            clf = LogisticRegression(penalty='l2',  solver='lbfgs', C=1/logistic_regression_args.lr_regularization_lambda) 
+            clf.fit(gradients, labels)
+            print("Linear regression score: ", clf.score(gradients, labels))
+            proj_coef = clf.coef_.copy().flatten().reshape(-1, 1)
+            print("L2 norm before projection", np.linalg.norm(proj_coef))
+        else:
+            # concatenate outputs
+            print("Also using outputs for linear regression")
+            outputs = outputs*mask.flatten()
+            gradients = np.concatenate([gradients, -outputs.reshape(-1, 1)], axis=1)
+            # estimate parameters: train a logistic regression model
+            clf = LogisticRegression(penalty='l2',  solver='lbfgs', C=1/logistic_regression_args.lr_regularization_lambda, fit_intercept=False) 
+            clf.fit(gradients, labels)
+            print("Linear regression score: ", clf.score(gradients, labels))
+            proj_coef = clf.coef_.copy().flatten().reshape(-1, 1)[:-1] # remove the last column corresponding to the output
+            print("L2 norm before projection", np.linalg.norm(proj_coef))
+        
+    # convert the coefficients to the original space
+    if project_matrix is not None:
+        coef = project_matrix @ proj_coef.flatten()
+    else:
+        coef = proj_coef.flatten()
+    print("L2 norm after projection", np.linalg.norm(coef))
+
+    return coef
+
+# load gradients of corresponding annotators
+def get_annotator_gradients(annotator_id):
+    tmp_gradient_dir = base_gradient_dir + f"annotator_{annotator_id}/"
+    gradient_list = []
+    for file in os.listdir(tmp_gradient_dir):
+        if file.startswith("projected_gradients_"):
+            gradient_feature = torch.load(os.path.join(tmp_gradient_dir, file))
+            gradient_list.append(gradient_feature)
+    gradient_list = np.array(gradient_list)
+    return gradient_list
+
+def load_gradients(annotator_ids):
+    all_annotator_gradients = []
+    for annotator_id in annotator_ids:
+        annotator_gradients = get_annotator_gradients(annotator_id)
+        all_annotator_gradients.append(annotator_gradients)
+    all_annotator_gradients = np.concatenate(all_annotator_gradients, axis=0)
+    return all_annotator_gradients
+
+
+def generate_state_dict(model, state_dict, coef, device="cpu", removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "embed_tokens", "norm", "word_embeddings", "quant", "absmax"]):
+    new_state_dict = {}; cur_len = 0
+    for key, param in model.named_parameters():
+        if not param.requires_grad: continue
+        param_len = param.numel()
+        if any([rkey in key for rkey in removing_keys]):
+            continue
+            # new_state_dict[key] = state_dict[key].clone()
+        else:
+            assert "lora" in key
+            new_state_dict[key] = state_dict[key].clone().to(device) + \
+                torch.Tensor(coef[cur_len:cur_len+param_len].reshape(param.shape)).to(device)
+            cur_len += param_len
+    return new_state_dict
+
+annotator_ids = [int(idx.strip()) for idx in data_args.annotator_ids.split(",") if idx.strip()]
+
+all_annotator_gradients = load_gradients(annotator_ids)
+
+# fit a linear model
+coef = fit_linear_model(all_annotator_gradients, use_customized_process=logistic_regression_args.use_customized_process)
+new_state_dict = generate_state_dict(model, state_dict, coef, device=model.device)
+pretrain_state_dict = state_dict
+finetuned_state_dict = new_state_dict
+model.load_state_dict(pretrain_state_dict, strict=False)
+model.load_state_dict(finetuned_state_dict, strict=False)
+
+# %%
+# evaluate the model after DPO training
+# write a plain evaluation loop here
+import torch
+from tqdm import tqdm
+from sklearn.metrics import accuracy_score
 from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 from trl.trainer.utils import pad_to_length
 
@@ -509,8 +698,8 @@ def _compute_sequence_logps(
     sequence_logps = masked_logps.sum(-1)
     token_counts = loss_mask.sum(-1)
 
-    # average logps per token
-    sequence_logps = sequence_logps / token_counts.clamp(min=1)
+    # average logps over non-pad tokens
+    sequence_logps = sequence_logps / token_counts.clamp_min(1)
 
     return sequence_logps, loss_mask, masked_logps, token_counts
 
@@ -623,144 +812,55 @@ def compute_loss_and_outputs(
 
     return loss, forward_dict
 
+model.eval()
+all_preds = []
+all_labels = []
 
-# def compute_label_token_gradients(
-#     model,
-#     batch,
-#     *,
-#     beta: Optional[float] = None,
-#     label_smoothing: Optional[float] = None,
-#     reference_chosen_logps: Optional[torch.FloatTensor] = None,
-#     reference_rejected_logps: Optional[torch.FloatTensor] = None,
-# ):
-#     model.train()
-#     model.zero_grad(set_to_none=True)
+# split metric by annotators
+annotator_accuracy = {annotator_id: {"preds": [], "labels": []} for annotator_id in annotator_ids}
 
-#     loss, forward_dict = compute_loss_and_outputs(
-#         model,
-#         batch,
-#         beta=beta,
-#         label_smoothing=label_smoothing,
-#         reference_chosen_logps=reference_chosen_logps,
-#         reference_rejected_logps=reference_rejected_logps,
-#     )
+model.eval()
+for step, batch in enumerate(tqdm(test_dataloader)):
+    with torch.no_grad():
+        _, forward_dict = compute_loss_and_outputs(model, batch)
+    dpo_logits = forward_dict["dpo_logits"].cpu().numpy()
+    preds = (dpo_logits > 0).astype(int).flatten()
+    all_preds.extend(preds.tolist())
+    # all labels are 1 since we have already reversed the gradients for the negative labels
+    all_labels.extend([1]*len(preds))
 
-#     concatenated_logits = forward_dict["concatenated_logits"]
-#     concatenated_logits.retain_grad()
+    # update annotator accuracy
+    for annotator_id in batch.get("annotator", []):
+        annotator_accuracy[annotator_id]["preds"].extend(preds.tolist())
+        annotator_accuracy[annotator_id]["labels"].extend([1]*len(preds))
 
-#     loss.backward()
-
-#     gradients = concatenated_logits.grad
-#     if gradients is None:
-#         raise RuntimeError("Gradients were not computed for concatenated logits.")
-
-#     mask = forward_dict["loss_mask"].to(gradients.dtype)
-#     masked_gradients = gradients[:, :-1, :] * mask.unsqueeze(-1)
-
-#     num_chosen = forward_dict["num_chosen"]
-#     chosen_grads = masked_gradients[:num_chosen].detach()
-#     rejected_grads = masked_gradients[num_chosen:].detach()
-
-#     model.zero_grad(set_to_none=True)
-
-#     return {
-#         "loss": loss.detach(),
-#         "chosen_gradients": chosen_grads,
-#         "rejected_gradients": rejected_grads,
-#         "mask": mask.detach(),
-#         "metadata": {
-#             "beta": forward_dict["beta"],
-#             "label_smoothing": forward_dict["label_smoothing"],
-#         },
-#     }
+accuracy = accuracy_score(all_labels, all_preds)
+print(f"Overall accuracy after DPO training: {accuracy}")
+for annotator_id in annotator_ids:
+    annotator_acc = accuracy_score(annotator_accuracy[annotator_id]["labels"], annotator_accuracy[annotator_id]["preds"])
+    print(f"Annotator {annotator_id} accuracy after DPO training: {annotator_acc}")
 
 # %%
-# Iterate over the training set and compute the gradients to dpo logits
-import os
-from tqdm import tqdm
-import numpy as np
-import torch.nn.functional as F
+# write the results to a csv file
+import pandas as pd
+os.makedirs("./results/dpo_qwen/", exist_ok=True)
 
-# Create directory to store gradients
-project_gradients_dim = 400  # Dimension of the projected space
-removing_keys = ["shared", "lm_head", "wte", "wpe", "ln", "embed_tokens", "norm", "word_embeddings" ]
-gradients_dim = 0
-for name, param in model.named_parameters():
-    if any([key in name for key in removing_keys]):
-        continue
-    if param.requires_grad:
-        gradients_dim += param.numel()
-
-# Concatenate gradients for each annotator and create projection matrix
-np.random.seed(42)  # For reproducibility   
-project_matrix = (2 * np.random.randint(2, size=(gradients_dim, project_gradients_dim)) - 1).astype(float)
-project_matrix *= 1 / np.sqrt(project_gradients_dim)
-
-num_annotators = 40
-counts_for_annotators = [0] * num_annotators
-
-# %%
-# Iterate over training data
-def get_model_params(model):
-    return [param for param in model.parameters() if param.requires_grad]
-
-params = get_model_params(model)
-model.eval()  # Set model to evaluation mode
-for batch_idx, batch in enumerate(tqdm(train_dataloader, desc="Computing gradients")):
-    # Get gradients for this batch
-    loss, forward_dict = compute_loss_and_outputs(
-        model,
-        batch,
-    )
-    logits = forward_dict["dpo_logits"].mean()*training_args.dpo_beta
-    
-    # Get the chosen and rejected gradients
-    grads = torch.autograd.grad(logits, params, retain_graph=False, create_graph=False)
-
-    # flatten the gradients 
-    grads = [g.flatten() for g in grads if g is not None]
-    flat_grads = torch.cat(grads).cpu().numpy()  # Convert to numpy
-
-    # Project the gradients
-    projected_grads = np.dot(flat_grads, project_matrix)
-
-    # Get annotator IDs for this batch (assuming they're in the batch)
-    annotator_ids = batch.get('annotator', ['default'] * batch['chosen_input_ids'].size(0))
-
-    # Create directory for this annotator
-    annotator_dir = os.path.join(base_gradient_dir, "annotator_" + str(annotator_ids[0]))
-    os.makedirs(annotator_dir, exist_ok=True)
-    
-    # Save the projected gradients and projection matrix
-    idx = counts_for_annotators[annotator_ids[0]]
-    counts_for_annotators[annotator_ids[0]] += 1
-    torch.save(projected_grads, os.path.join(annotator_dir, f'projected_gradients_{idx}.pt'))
-
-# # Keep track of example index across batches
-# global_idx = 0
-
-# # Iterate over training data
-# model.train()
-# for batch_idx, batch in enumerate(tqdm(train_dataloader, desc="Computing gradients")):
-#     # Get the flattened gradients for this batch
-#     batch_grads = compute_dpo_logits_gradient(model, batch, beta=training_args.dpo_beta)
-    
-#     # Project the gradients using the Rademacher matrix
-#     projected_grads = torch.matmul(rademacher_matrix, batch_grads.cpu())
-    
-#     # Get annotator IDs for this batch
-#     annotator_ids = batch.get('annotator', ['default'] * batch['chosen_input_ids'].size(0))
-    
-#     # Save projected gradients for each example in the batch
-#     for idx, annotator in enumerate(annotator_ids):
-#         # Create directory for this annotator if it doesn't exist
-#         annotator_dir = os.path.join(base_gradient_dir, str(annotator))
-#         os.makedirs(annotator_dir, exist_ok=True)
-        
-#         # Save the projected gradients
-#         torch.save(projected_grads, os.path.join(annotator_dir, f'projected_gradients_{global_idx + idx}.pt'))
-    
-#     global_idx += len(annotator_ids)
-
-# # Save the projection matrix for future reference
-# torch.save(rademacher_matrix, os.path.join(base_gradient_dir, 'projection_matrix.pt'))
+if not os.path.exists(os.path.join("./results/dpo_qwen/", "dpo_evaluation_results.csv")):
+    results = []
+    results.append({"annotator_id": "overall", "annotator_ids": data_args.annotator_ids, "accuracy": accuracy})
+    for annotator_id in annotator_ids:
+        annotator_acc = accuracy_score(annotator_accuracy[annotator_id]["labels"], annotator_accuracy[annotator_id]["preds"])
+        results.append({"annotator_id": annotator_id, "annotator_ids": data_args.annotator_ids, "accuracy": annotator_acc})
+    results = pd.DataFrame(results)
+    results.to_csv(os.path.join("./results/dpo_qwen/", "dpo_evaluation_results.csv"), index=False)
+    print(f"Results saved to {os.path.join('./results/dpo_qwen/', 'dpo_evaluation_results.csv')}")
+else:   
+    # load existing results and append new results
+    results = pd.read_csv(os.path.join("./results/dpo_qwen/", "dpo_evaluation_results.csv"))
+    new_results = []
+    for annotator_id in annotator_ids:
+        annotator_acc = accuracy_score(annotator_accuracy[annotator_id]["labels"], annotator_accuracy[annotator_id]["preds"])
+        new_results.append({"annotator_id": annotator_id, "annotator_ids": data_args.annotator_ids, "accuracy": annotator_acc})
+    new_results = pd.DataFrame(new_results)
+    results = pd.concat([results, new_results], axis=0)
+    results.to_csv(os.path.join("./results/dpo_qwen/", "dpo_evaluation_results.csv"), index=False)
