@@ -26,7 +26,7 @@ from datasets import Dataset
 from transformers import DataCollator, PreTrainedModel, PreTrainedTokenizerBase, Trainer, TrainingArguments
 from transformers.trainer_callback import TrainerCallback
 from transformers.trainer_pt_utils import nested_detach
-from transformers.trainer_utils import EvalPrediction, EvalLoopOutput
+from transformers.trainer_utils import EvalPrediction
 
 from trl.import_utils import is_peft_available
 from trl.trainer.reward_config import RewardConfig
@@ -89,7 +89,7 @@ class RewardTrainer(Trainer):
         eval_dataset: Optional[Union[Dataset, Dict[str, Dataset]]] = None,
         tokenizer: Optional[PreTrainedTokenizerBase] = None,
         model_init: Optional[Callable[[], PreTrainedModel]] = None,
-        compute_metrics: Optional[Callable[[EvalLoopOutput], Dict]] = None,
+        compute_metrics: Optional[Callable[[EvalPrediction], Dict]] = None,
         callbacks: Optional[List[TrainerCallback]] = None,
         optimizers: Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR] = (
             None,
@@ -118,7 +118,7 @@ class RewardTrainer(Trainer):
                 The tokenizer to use for training. This argument is required if you want to use the default data collator.
             model_init (`Callable[[], transformers.PreTrainedModel]`):
                 The model initializer to use for training. If None is specified, the default model initializer will be used.
-            compute_metrics (`Callable[[transformers.EvalLoopOutput], Dict]`, *optional* defaults to `compute_accuracy`):
+            compute_metrics (`Callable[[transformers.EvalPrediction], Dict]`, *optional* defaults to `compute_accuracy`):
                 The metrics to use for evaluation. If no metrics are specified, the default metric (`compute_accuracy`) will be used.
             callbacks (`List[transformers.TrainerCallback]`):
                 The callbacks to use for training.
