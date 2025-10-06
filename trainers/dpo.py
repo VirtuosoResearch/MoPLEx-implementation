@@ -21,6 +21,8 @@ import os
 import accelerate
 import gc
 import datetime
+from peft import LoraConfig, get_peft_model
+from typing import List
 import numpy as np
 import tempfile
 from tqdm import tqdm
@@ -80,6 +82,13 @@ flags.DEFINE_bool('approx_dpo', False, 'whether to use approx dpo')
 # flags for saving p_star and grad_star
 flags.DEFINE_integer('save_pstar_at_epoch', -1, 'the epoch after which to save p_star and grad_star. Set to -1 to disable.')
 flags.DEFINE_string('pstar_save_path', './pstar_grads.pt', 'the file path to save p_star and grad_star')
+
+flags.DEFINE_bool('use_lora', False, 'whether to wrap the policy with LoRA adapters')
+flags.DEFINE_integer('lora_r', 8, 'LoRA rank')
+flags.DEFINE_float('lora_alpha', 32.0, 'LoRA alpha')
+flags.DEFINE_float('lora_dropout', 0.05, 'LoRA dropout')
+flags.DEFINE_string('lora_target_modules', '', 'comma-separated module names to apply LoRA to; if empty, auto-detect by model_type')
+flags.DEFINE_bool('lora_merge_on_save', False, 'merge LoRA weights into base weights when saving checkpoints')
 
 # flags for saving p
 # tba
@@ -166,8 +175,10 @@ def main(_):
     print(len(dataset), 'train samples after downsampling')
     print(len(eval_dataset), 'eval samples after downsampling')
 
-    output_dir = f"{FLAGS.output_dir}/{FLAGS.wandb_project}/{FLAGS.run_name}"
-    model_name = f"{FLAGS.wandb_project}_{FLAGS.run_name}"
+    output_dir = f"{FLAGS.output_dir}/{FLAGS.wandb_project}/{FLAGS.run_name}" + "_lora" if FLAGS.use_lora else ""
+
+    model_name = (FLAGS.pretrained_dir).split("/")[-1]
+    # model_name = f"{FLAGS.wandb_project}_{FLAGS.run_name}"
     
     print('Output dir:', output_dir)
     print('Model name:', model_name)
@@ -299,8 +310,6 @@ def main(_):
         seed=FLAGS.seed,
     )
 
-    print(FLAGS.tokenizer_type)
-
     tokenizer = AutoTokenizer.from_pretrained(FLAGS.pretrained_dir)
     tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
     tokenizer.padding_side = "left"
@@ -318,6 +327,40 @@ def main(_):
         device_map='auto',
     )
     policy.resize_token_embeddings(len(tokenizer))
+
+    if FLAGS.use_lora:
+        model_type = getattr(policy.config, "model_type", "").lower()
+        auto_targets = []
+        if model_type in ["gpt2", "gpt_neo", "gptj", "gpt_neox", "mpt", "falcon", "pythia"]:
+            # GPT2/Neo/J/NeoX/MPT/Falcon/Pythia
+            # gpt2: c_attn, c_proj, c_fc
+            # neox/pythia: attention.query_key_value, attention.dense, mlp.dense_h_to_4h, mlp.dense_4h_to_h
+            if model_type == "gpt2":
+                auto_targets = ["c_attn", "c_proj", "c_fc"]
+            else:
+                auto_targets = [
+                    "query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h",
+                    "c_attn", "c_proj", "c_fc"
+                ]
+        elif model_type in ["llama", "mistral", "qwen2", "qwen3", "opt"]:
+            auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        else:
+            auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "c_attn", "c_proj", "c_fc", "Wqkv", "out_proj", "fc1", "fc2"]
+
+        cli_targets: List[str] = [x.strip() for x in FLAGS.lora_target_modules.split(",") if x.strip()]
+        target_modules = cli_targets if len(cli_targets) > 0 else auto_targets
+
+        lora_cfg = LoraConfig(
+            r=FLAGS.lora_r,
+            lora_alpha=FLAGS.lora_alpha,
+            lora_dropout=FLAGS.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        policy = get_peft_model(policy, lora_cfg)
+        policy.print_trainable_parameters()
+
     model = AutoModelForCausalLMWithValueHead(policy)
 
     def formatting_prompts_func(example):
@@ -376,22 +419,55 @@ def main(_):
             return func(*args, **kwargs)
         return func_wrapper
     
+    # def save_model(checkpoint_dir, epoch_num, add_prefix=True):
+    #     if add_prefix:
+    #         checkpoint_dir = os.path.join(output_dir, checkpoint_dir)
+    #         os.makedirs(checkpoint_dir, exist_ok=True)
+
+    #     if trainer.accelerator.is_main_process:
+    #         trainer.accelerator.unwrap_model(model).save_pretrained(
+    #             checkpoint_dir,
+    #             save_function=trainer.accelerator.save,
+    #             is_main_process=trainer.accelerator.is_main_process,
+    #             state_dict=trainer.accelerator.get_state_dict(model),
+    #         )
+    #         if trainer.accelerator.is_main_process:
+    #             tokenizer.save_pretrained(checkpoint_dir)
+    #         trainer.accelerator.print(f"Checkpointing Epoch {epoch_num} -> {checkpoint_dir}")
+
     def save_model(checkpoint_dir, epoch_num, add_prefix=True):
         if add_prefix:
             checkpoint_dir = os.path.join(output_dir, checkpoint_dir)
             os.makedirs(checkpoint_dir, exist_ok=True)
 
         if trainer.accelerator.is_main_process:
-            trainer.accelerator.unwrap_model(model).save_pretrained(
-                checkpoint_dir,
-                save_function=trainer.accelerator.save,
-                is_main_process=trainer.accelerator.is_main_process,
-                state_dict=trainer.accelerator.get_state_dict(model),
-            )
+            unwrapped = trainer.accelerator.unwrap_model(model)
+
+            if getattr(unwrapped, "is_peft_model", False) or getattr(unwrapped.pretrained_model, "is_peft_model", False):
+                peft_like = unwrapped if getattr(unwrapped, "is_peft_model", False) else unwrapped.pretrained_model
+
+                if FLAGS.lora_merge_on_save:
+                    merged = peft_like.merge_and_unload()
+                    merged.save_pretrained(
+                        checkpoint_dir,
+                        save_function=trainer.accelerator.save,
+                        is_main_process=trainer.accelerator.is_main_process,
+                        state_dict=trainer.accelerator.get_state_dict(merged),
+                    )
+                else:
+                    peft_like.save_pretrained(checkpoint_dir)
+            else:
+                unwrapped.save_pretrained(
+                    checkpoint_dir,
+                    save_function=trainer.accelerator.save,
+                    is_main_process=trainer.accelerator.is_main_process,
+                    state_dict=trainer.accelerator.get_state_dict(model),
+                )
+
             if trainer.accelerator.is_main_process:
                 tokenizer.save_pretrained(checkpoint_dir)
             trainer.accelerator.print(f"Checkpointing Epoch {epoch_num} -> {checkpoint_dir}")
- 
+
     pref_dataset_dataloader = torch.utils.data.DataLoader(
         pref_dataset,
         batch_size=max(batch_size_pref_data, 1),

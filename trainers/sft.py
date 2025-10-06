@@ -2,6 +2,9 @@ print('Starting imports')
 
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 import os
+from peft import LoraConfig, get_peft_model, PeftModel
+from transformers import TrainerCallback
+from typing import List
 
 os.environ["WANDB__SERVICE_WAIT"] = "600"
 os.environ["WANDB_INIT_TIMEOUT"] = "600"
@@ -35,6 +38,14 @@ flags.DEFINE_bool("mixed_precision", False, "Whether to use mixed precision")
 flags.DEFINE_integer("max_seq_length", 512, "The maximum sequence length")
 flags.DEFINE_bool("use_tpu", False, "Whether to use TPU")
 flags.DEFINE_string("sft_key", 'y_w', "The key to use for SFT")
+
+flags.DEFINE_bool('use_lora', False, 'whether to wrap the model with LoRA adapters')
+flags.DEFINE_integer('lora_r', 16, 'LoRA rank')
+flags.DEFINE_float('lora_alpha', 32.0, 'LoRA alpha')
+flags.DEFINE_float('lora_dropout', 0.05, 'LoRA dropout')
+flags.DEFINE_string('lora_target_modules', '', 'comma-separated modules; if empty, auto-detect by model_type')
+flags.DEFINE_bool('lora_merge_on_save', False, 'merge LoRA into base weights when saving')
+
 
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
@@ -138,7 +149,29 @@ def main(_):
             return example[FLAGS.sft_key]
 
     model = AutoModelForCausalLM.from_pretrained(FLAGS.pretrained_dir)
-    
+    if FLAGS.use_lora:
+        mtype = getattr(model.config, "model_type", "").lower()
+        auto_targets = []
+        if mtype in ["llama", "mistral", "qwen", "qwen2", "qwen3", "opt"]:
+            auto_targets = ["q_proj","k_proj","v_proj","o_proj","gate_proj","up_proj","down_proj"]
+        elif mtype in ["gpt2","gpt_neo","gptj","gpt_neox","mpt","falcon","pythia"]:
+            auto_targets = ["c_attn","c_proj","c_fc","query_key_value","dense","dense_h_to_4h","dense_4h_to_h"]
+        else:
+            auto_targets = ["q_proj","k_proj","v_proj","o_proj","c_attn","c_proj","c_fc","fc1","fc2"]
+
+        cli_targets: List[str] = [x.strip() for x in FLAGS.lora_target_modules.split(",") if x.strip()]
+        target_modules = cli_targets if cli_targets else auto_targets
+
+        peft_config = LoraConfig(
+            r=FLAGS.lora_r,
+            lora_alpha=FLAGS.lora_alpha,
+            lora_dropout=FLAGS.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        # model = get_peft_model(model, lora_cfg)
+
     if FLAGS.use_tpu:
         extra_kwargs = dict(
             pad_to_multiple_of=FLAGS.max_seq_length, # seems to be necessary for TPU to ensure batches are the same size 
@@ -154,7 +187,7 @@ def main(_):
     )
 
     extra_kwargs = {}
-    extra_kwargs['output_dir'] = FLAGS.output_dir
+    extra_kwargs['output_dir'] = FLAGS.output_dir + "_lora" if FLAGS.use_lora else ""
 
     training_args = TrainingArguments(
         do_predict=True,
@@ -184,6 +217,7 @@ def main(_):
         formatting_func=formatting_prompts_func,
         data_collator=collator,
         max_seq_length=FLAGS.max_seq_length,
+        peft_config = peft_config
     )
 
     trainer.train() 
