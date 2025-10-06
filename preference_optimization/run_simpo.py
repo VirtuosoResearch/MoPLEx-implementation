@@ -40,6 +40,7 @@ from simpo_config import SimPOConfig
 from dpo_trainer import DPOTrainer
 from dataclasses import dataclass, field
 from typing import Optional, Literal
+from annotator_evaluation import evaluate_model_by_annotator
 
 from data_processing.load_ultrafeedback import load_ultrafeedback_multi_preferences
 from data_processing.load_collective_alignment import load_collective_alignment
@@ -201,12 +202,18 @@ def main():
                     raise ValueError(
                         "`annotator_ids` must be a comma separated list of integers."
                     ) from exc
-            annotator_ids = [0,1]
+            
+            # Parse subset_id if provided (overrides annotator_ids)
+            subset_id = None
+            if hasattr(data_args, 'subset_id') and data_args.subset_id is not None:
+                subset_id = data_args.subset_id
+            
             raw_datasets = load_imdb_preference_with_source(
                 seed=training_args.seed,
                 test_size=data_args.test_size,
                 sources=sources,
                 annotator_ids=annotator_ids,
+                subset_id=subset_id,
             )
     else:
         raw_datasets = get_datasets(
@@ -381,10 +388,61 @@ def main():
     ##########
     if training_args.do_eval:
         logger.info("*** Evaluate ***")
-        metrics = trainer.evaluate()
-        metrics["eval_samples"] = len(raw_datasets["test"])
-        trainer.log_metrics("eval", metrics)
-        trainer.save_metrics("eval", metrics)
+        
+        # Check if we have annotator information in the dataset
+        has_annotator_column = "annotator" in raw_datasets["test"].column_names
+        has_criterion_column = "criterion" in raw_datasets["test"].column_names
+        
+        if has_annotator_column:
+            logger.info("*** Annotator-specific Evaluation ***")
+            try:
+                # Perform annotator-specific evaluation
+                annotator_results = evaluate_model_by_annotator(
+                    trainer=trainer,
+                    test_dataset=raw_datasets["test"],
+                    tokenizer=tokenizer,
+                    annotator_column="annotator",
+                    criterion_column="criterion" if has_criterion_column else None,
+                    include_overall=True,
+                    min_samples_per_annotator=1,
+                    save_results=True,
+                    results_dir=training_args.output_dir,
+                )
+                
+                # Log summary statistics
+                if "summary" in annotator_results and "statistics" in annotator_results["summary"]:
+                    stats = annotator_results["summary"]["statistics"]
+                    logger.info(f"Annotator evaluation summary:")
+                    logger.info(f"  Evaluated {annotator_results['summary']['evaluated_annotators']} annotators")
+                    logger.info(f"  Average accuracy: {stats['accuracy']['mean']:.4f} ± {stats['accuracy']['std']:.4f}")
+                    logger.info(f"  Average reward margin: {stats['reward_margin']['mean']:.4f} ± {stats['reward_margin']['std']:.4f}")
+                
+                # Use overall metrics for standard logging
+                if "overall" in annotator_results:
+                    metrics = annotator_results["overall"]["metrics"]
+                    metrics["eval_samples"] = len(raw_datasets["test"])
+                    trainer.log_metrics("eval", metrics)
+                    trainer.save_metrics("eval", metrics)
+                else:
+                    # Fallback to regular evaluation if no overall results
+                    metrics = trainer.evaluate()
+                    metrics["eval_samples"] = len(raw_datasets["test"])
+                    trainer.log_metrics("eval", metrics)
+                    trainer.save_metrics("eval", metrics)
+                    
+            except Exception as e:
+                logger.error(f"Annotator-specific evaluation failed: {e}")
+                logger.info("Falling back to standard evaluation")
+                metrics = trainer.evaluate()
+                metrics["eval_samples"] = len(raw_datasets["test"])
+                trainer.log_metrics("eval", metrics)
+                trainer.save_metrics("eval", metrics)
+        else:
+            logger.info("*** Standard Evaluation (no annotator information) ***")
+            metrics = trainer.evaluate()
+            metrics["eval_samples"] = len(raw_datasets["test"])
+            trainer.log_metrics("eval", metrics)
+            trainer.save_metrics("eval", metrics)
 
     if training_args.push_to_hub is True:
         logger.info("Pushing to hub...")
