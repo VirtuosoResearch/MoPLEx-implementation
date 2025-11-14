@@ -2,10 +2,6 @@ import os
 os.environ["WANDB__SERVICE_WAIT"] = "10000"
 os.environ["WANDB_INIT_TIMEOUT"] = "10000"
 os.environ['WANDB_START_METHOD'] = 'thread'
-os.environ["WANDB_DIR"] = "./cache"
-os.environ["WANDB_DATA_DIR"] = "./cache"
-os.environ["WANDB_CACHE_DIR"] = "./cache"
-os.environ["WANDB_TEMP"] = "./cache/tmp"
 
 import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
@@ -18,6 +14,8 @@ from trainers.dpo_trainer import DPOTrainer
 from trainers.dpo_config import DPOConfig
 from trainers.approx_dpo_trainer import ApproxDPOTrainer
 
+from datasets import Dataset, DatasetDict
+
 #from alpaca_farm.models.reward_model import RewardModel, RewardConfig
 import torch
 from absl import flags, app
@@ -25,8 +23,6 @@ import os
 import accelerate
 import gc
 import datetime
-from peft import LoraConfig, get_peft_model
-from typing import List
 import numpy as np
 import tempfile
 from tqdm import tqdm
@@ -87,80 +83,14 @@ flags.DEFINE_bool('approx_dpo', False, 'whether to use approx dpo')
 flags.DEFINE_integer('save_pstar_at_epoch', -1, 'the epoch after which to save p_star and grad_star. Set to -1 to disable.')
 flags.DEFINE_string('pstar_save_path', './pstar_grads.pt', 'the file path to save p_star and grad_star')
 
-flags.DEFINE_bool('use_lora', False, 'whether to wrap the policy with LoRA adapters')
-flags.DEFINE_integer('lora_r', 8, 'LoRA rank')
-flags.DEFINE_float('lora_alpha', 32.0, 'LoRA alpha')
-flags.DEFINE_float('lora_dropout', 0.05, 'LoRA dropout')
-flags.DEFINE_string('lora_target_modules', '', 'comma-separated module names to apply LoRA to; if empty, auto-detect by model_type')
-flags.DEFINE_bool('lora_merge_on_save', False, 'merge LoRA weights into base weights when saving checkpoints')
-
-def get_dataset(path, num_samples=-1, return_test_data=True, num_samples_test=1000):
-    assert os.path.exists(path)
-    folders = os.listdir(path)
-    regex = r"^\d+-\d+$"
-    folders = [x for x in folders if re.search(regex, x)]
-    folders.sort(key=lambda x: int(x.split("-")[0]))
-    total_samples = int(folders[-1].split("-")[-1])
-
-    assert 0 < num_samples <= total_samples - num_samples_test, f"num_samples {num_samples} must be between 0 and {total_samples} - {num_samples_test}"
-    assert 0 < num_samples_test <= total_samples, f"num_samples_test {num_samples_test} must be between 0 and {total_samples}"
-    
-    num_samples_train = num_samples if num_samples > 0 else total_samples - num_samples_test
-    test_folders = [x for x in folders if int(x.split("-")[0]) >= num_samples_train]
-    folders = [x for x in folders if int(x.split("-")[0]) < num_samples_train]
-    
-    datasets = [load_from_disk(os.path.join(path, x)) for x in folders]
-    full_data =  concatenate_datasets(datasets)
-    
-    if num_samples > 0:
-        full_data = full_data.select(range(num_samples))
-        
-    if return_test_data:
-        test_datasets = [load_from_disk(os.path.join(path, x)) for x in test_folders]
-        test_data = concatenate_datasets(test_datasets)
-        if num_samples_test > 0:
-            test_data = test_data.select(range(num_samples_test))
-        return full_data, test_data
-    
-    return full_data
-    
-
-def construct_dataset(
-    path,
-    num_samples=-1,
-    concatenate_prompt=False,
-    num_samples_test=1000,
-):
-    data, test_data = get_dataset(path, num_samples=num_samples, return_test_data=True, num_samples_test=num_samples_test)
-
-    if concatenate_prompt:
-        def map_fn(d):
-            for k in ["y_ref", "y_w", "y_l"]:
-                d[k] = d["prompt"] + d[k]
-            return d
-        
-        data = data.map(
-            map_fn,
-            num_proc=FLAGS.num_proc,
-        )
-
-    dataset_name = os.path.basename(path).split(".")[0]
-
-    ds = DatasetDict({
-            "train": data,
-            "test": test_data,
-        }
-    ) 
-    return dataset_name, ds
-
 
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
 EOS_TOKEN = '<|endoftext|>'
 
-def main(_):
+def load_train_eval_data(eos):
     print("FLAGS.dataset_path: ",FLAGS.dataset_path)
-    dataset = load_dataset(FLAGS.dataset_path, split="unlabeled")
+    dataset = load_dataset(FLAGS.dataset_path, split="unlabeled", trust_remote_code=True)
     eval_dataset = load_dataset(FLAGS.dataset_path, split="val")
 
     print(len(dataset), 'train samples')
@@ -173,10 +103,9 @@ def main(_):
         eval_dataset = eval_dataset.shuffle(seed=FLAGS.seed).select(range(int(len(eval_dataset) * downsample_ratio)))
     print(len(dataset), 'train samples after downsampling')
     print(len(eval_dataset), 'eval samples after downsampling')
-    output_dir = f"{FLAGS.output_dir}/{FLAGS.wandb_project}/{FLAGS.run_name}" + "_lora" if FLAGS.use_lora else ""
 
-    model_name = (FLAGS.pretrained_dir).split("/")[-1]
-    # model_name = f"{FLAGS.wandb_project}_{FLAGS.run_name}"
+    output_dir = f"{FLAGS.output_dir}/{FLAGS.wandb_project}/{FLAGS.run_name}"
+    model_name = f"{FLAGS.run_name}"
     
     print('Output dir:', output_dir)
     print('Model name:', model_name)
@@ -184,57 +113,10 @@ def main(_):
     batch_size_pref_data = FLAGS.batch_size
     batch_size_online_data = 0
     
-    if FLAGS.preference_dataset_path in ['tatsu-lab/alpaca_farm', 'Asap7772/alpaca_human_preference_gold', 'Asap7772/alpaca_human_preference_minlength', 'Asap7772/alpaca_human_preference_maxlength']:
-        if FLAGS.preference_dataset_path == 'tatsu-lab/alpaca_farm':
-            pref_dataset = load_dataset(FLAGS.preference_dataset_path, FLAGS.preference_dataset_subset, split="preference")
-            
-        else:
-            split='train' if 'length' in FLAGS.preference_dataset_path else FLAGS.preference_dataset_split
-
-            pref_dataset = load_dataset(FLAGS.preference_dataset_path, split=split)
-        pref_dataset = pref_dataset.train_test_split(test_size=0.1, seed=FLAGS.seed)
-        
-        def process_dataset(batch):
-            new_batch = defaultdict(list)
-            for inst, inp, out1, out2, pref in zip(batch['instruction'], batch['input'], batch['output_1'], batch['output_2'], batch['preference']):
-                if pref == 1:
-                    selected = out1
-                    rejected = out2
-                else:
-                    selected = out2
-                    rejected = out1
-                if inp:
-                    text = f"{PROMPT_TOKEN}{inst}\n{inp}{EOS_TOKEN}{ASSISTANT_TOKEN}"
-                else:
-                    text = f"{PROMPT_TOKEN}{inst}{EOS_TOKEN}{ASSISTANT_TOKEN}"
-                
-                new_batch['prompt'].append(text)
-                new_batch['y_w'].append(f"{text}{selected}{EOS_TOKEN}")
-                new_batch['y_l'].append(f"{text}{rejected}{EOS_TOKEN}")
-            return new_batch
-        
-        pref_dataset = pref_dataset.map(
-            process_dataset,
-            batched=FLAGS.batched,
-            num_proc=FLAGS.num_proc,
-        )
-
-        pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
-        remove_columns = ['instruction', 'input', 'output_1', 'output_2', 'preference', 'raw_preference', 'prompt', 'y_w', 'y_l']
-    else:
-        if FLAGS.preference_dataset_path.startswith('Asap7772'):
-            pref_dataset_name = os.path.basename(FLAGS.preference_dataset_path)
-            pref_dataset = load_dataset(FLAGS.preference_dataset_path)
-        else:
-            pref_dataset_name, pref_dataset = construct_dataset(
-                path=FLAGS.preference_dataset_path,
-                num_samples=FLAGS.preference_num_samples,
-                concatenate_prompt=False,
-            )
-        print('Loaded dataset', pref_dataset_name)
-        
-        pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
-        remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
+    pref_dataset = load_dataset(FLAGS.preference_dataset_path)
+    
+    pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
+    remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
 
     if FLAGS.downsample_ratio < '1.0':
         downsample_ratio = float(FLAGS.downsample_ratio)
@@ -243,7 +125,6 @@ def main(_):
         pref_dataset = pref_dataset.shuffle(seed=FLAGS.seed).select(range(int(len(pref_dataset) * downsample_ratio)))
         eval_pref_dataset = eval_pref_dataset.shuffle(seed=FLAGS.seed).select(range(int(len(eval_pref_dataset) * downsample_ratio)))
         
-
     def process_dataset(batch):
         new_batch = {}
         new_batch['query'] = batch['prompt']
@@ -259,7 +140,6 @@ def main(_):
             assert False, f"Shapes of all columns must be equal, but got {shapes}, {list(shapes.values())}"
         return new_batch
 
-
     pref_dataset = pref_dataset.map(
         process_dataset,
         batched=FLAGS.batched,
@@ -267,6 +147,8 @@ def main(_):
         remove_columns=remove_columns,
     )
     
+    print("len(pref_dataset): ",len(pref_dataset))
+
     eval_pref_dataset = eval_pref_dataset.map(
         process_dataset,
         batched=FLAGS.batched,
@@ -275,8 +157,7 @@ def main(_):
     )
 
     unique_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S.%f") + '-' + str(np.random.randint(100000))
-    wandb_output_dir = "./cache" + tempfile.mkdtemp()
-    # wandb_output_dir = "./cache"
+    wandb_output_dir = tempfile.mkdtemp()
     config = DPOConfig(
         model_name=FLAGS.pretrained_dir,
         gradient_accumulation_steps=FLAGS.gradient_accumulation_steps,
@@ -299,7 +180,6 @@ def main(_):
         },
         tracker_kwargs={
             "wandb": {
-                "entity": "VirtuosoResearch",
                 "name": FLAGS.run_name, 
                 "id": unique_str,
                 "dir": wandb_output_dir,
@@ -308,59 +188,6 @@ def main(_):
         log_with='wandb',
         seed=FLAGS.seed,
     )
-
-    tokenizer = AutoTokenizer.from_pretrained(FLAGS.pretrained_dir)
-    tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
-    tokenizer.padding_side = "left"
-    tokenizer.truncation_side = "left"
-    eos = tokenizer.eos_token
-    
-    print(FLAGS.pretrained_dir)
-    print(FLAGS.cache_dir)
-    
-    policy = AutoModelForCausalLM.from_pretrained(
-        FLAGS.pretrained_dir,
-        cache_dir=FLAGS.cache_dir, 
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-        device_map='auto',
-    )
-    policy.resize_token_embeddings(len(tokenizer))
-
-    if FLAGS.use_lora:
-        model_type = getattr(policy.config, "model_type", "").lower()
-        auto_targets = []
-        if model_type in ["gpt2", "gpt_neo", "gptj", "gpt_neox", "mpt", "falcon", "pythia"]:
-            # GPT2/Neo/J/NeoX/MPT/Falcon/Pythia
-            # gpt2: c_attn, c_proj, c_fc
-            # neox/pythia: attention.query_key_value, attention.dense, mlp.dense_h_to_4h, mlp.dense_4h_to_h
-            if model_type == "gpt2":
-                auto_targets = ["c_attn", "c_proj", "c_fc"]
-            else:
-                auto_targets = [
-                    "query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h",
-                    "c_attn", "c_proj", "c_fc"
-                ]
-        elif model_type in ["llama", "mistral", "qwen2", "qwen3", "opt"]:
-            auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        else:
-            auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "c_attn", "c_proj", "c_fc", "Wqkv", "out_proj", "fc1", "fc2"]
-
-        cli_targets: List[str] = [x.strip() for x in FLAGS.lora_target_modules.split(",") if x.strip()]
-        target_modules = cli_targets if len(cli_targets) > 0 else auto_targets
-
-        lora_cfg = LoraConfig(
-            r=FLAGS.lora_r,
-            lora_alpha=FLAGS.lora_alpha,
-            lora_dropout=FLAGS.lora_dropout,
-            target_modules=target_modules,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        policy = get_peft_model(policy, lora_cfg)
-        policy.print_trainable_parameters()
-
-    model = AutoModelForCausalLMWithValueHead(policy)
 
     def formatting_prompts_func(example):
         inst, inp = example['instruction'], example['input']
@@ -377,6 +204,62 @@ def main(_):
     print('Sample Train prompt:', dataset[0]['query'])
     print('Sample Eval prompt:', eval_dataset[0]['query'])
 
+    pref_dataset_dataloader = torch.utils.data.DataLoader(
+        pref_dataset,
+        batch_size=max(batch_size_pref_data, 1),
+        collate_fn=None,
+        shuffle=True,
+        drop_last=True,
+    )
+    train_as_eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
+        pref_dataset,
+        batch_size=FLAGS.mini_batch_size,
+        collate_fn=None,
+        shuffle=True,
+        drop_last=True,
+    )
+    eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
+        eval_pref_dataset,
+        batch_size=FLAGS.mini_batch_size,
+        collate_fn=None,
+        shuffle=True,
+        drop_last=True,
+    )
+    all_eval_dataloaders = {
+        "train_as_eval_pref": train_as_eval_pref_dataset_dataloader,
+        "eval_pref": eval_pref_dataset_dataloader,
+    }
+    
+    zipped_dataloaders = pref_dataset_dataloader
+    total_len = len(pref_dataset_dataloader)
+
+    return dataset, eval_dataset, config, output_dir, model_name, all_eval_dataloaders, zipped_dataloaders, total_len
+
+def main(_):
+
+    print(FLAGS.tokenizer_type)
+
+    tokenizer = AutoTokenizer.from_pretrained(FLAGS.tokenizer_type)
+    tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
+    tokenizer.padding_side = "left"
+    tokenizer.truncation_side = "left"
+    eos = tokenizer.eos_token
+    
+    print(FLAGS.pretrained_dir)
+    print(FLAGS.cache_dir)
+
+    policy = AutoModelForCausalLM.from_pretrained(
+        FLAGS.pretrained_dir,
+        cache_dir=FLAGS.cache_dir, 
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+        device_map='auto',
+        trust_remote_code=True
+    )
+    policy.resize_token_embeddings(len(tokenizer))
+    model = AutoModelForCausalLMWithValueHead(policy)
+
+    dataset, eval_dataset, config, output_dir, model_name, all_eval_dataloaders, zipped_dataloaders, total_len = load_train_eval_data(eos)
 
     TrainerClass = ApproxDPOTrainer if FLAGS.approx_dpo else DPOTrainer
 
@@ -410,72 +293,23 @@ def main(_):
             empty_cache()
             return func(*args, **kwargs)
         return func_wrapper
-
+    
     def save_model(checkpoint_dir, epoch_num, add_prefix=True):
         if add_prefix:
             checkpoint_dir = os.path.join(output_dir, checkpoint_dir)
             os.makedirs(checkpoint_dir, exist_ok=True)
 
         if trainer.accelerator.is_main_process:
-            unwrapped = trainer.accelerator.unwrap_model(model)
-
-            if getattr(unwrapped, "is_peft_model", False) or getattr(unwrapped.pretrained_model, "is_peft_model", False):
-                peft_like = unwrapped if getattr(unwrapped, "is_peft_model", False) else unwrapped.pretrained_model
-
-                if FLAGS.lora_merge_on_save:
-                    merged = peft_like.merge_and_unload()
-                    merged.save_pretrained(
-                        checkpoint_dir,
-                        save_function=trainer.accelerator.save,
-                        is_main_process=trainer.accelerator.is_main_process,
-                        state_dict=trainer.accelerator.get_state_dict(merged),
-                    )
-                else:
-                    peft_like.save_pretrained(checkpoint_dir)
-            else:
-                unwrapped.save_pretrained(
-                    checkpoint_dir,
-                    save_function=trainer.accelerator.save,
-                    is_main_process=trainer.accelerator.is_main_process,
-                    state_dict=trainer.accelerator.get_state_dict(model),
-                )
-
+            trainer.accelerator.unwrap_model(model).save_pretrained(
+                checkpoint_dir,
+                save_function=trainer.accelerator.save,
+                is_main_process=trainer.accelerator.is_main_process,
+                state_dict=trainer.accelerator.get_state_dict(model),
+            )
             if trainer.accelerator.is_main_process:
                 tokenizer.save_pretrained(checkpoint_dir)
             trainer.accelerator.print(f"Checkpointing Epoch {epoch_num} -> {checkpoint_dir}")
 
-    pref_dataset_dataloader = torch.utils.data.DataLoader(
-        pref_dataset,
-        batch_size=max(batch_size_pref_data, 1),
-        collate_fn=None,
-        shuffle=True,
-        drop_last=True,
-    )
-    
-    train_as_eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
-        pref_dataset,
-        batch_size=FLAGS.mini_batch_size,
-        collate_fn=None,
-        shuffle=True,
-        drop_last=True,
-    )
-    
-    eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
-        eval_pref_dataset,
-        batch_size=FLAGS.mini_batch_size,
-        collate_fn=None,
-        shuffle=True,
-        drop_last=True,
-    )
-    
-    all_eval_dataloaders = {
-        "train_as_eval_pref": train_as_eval_pref_dataset_dataloader,
-        "eval_pref": eval_pref_dataset_dataloader,
-    }
-
-    
-    zipped_dataloaders = pref_dataset_dataloader
-    total_len = len(pref_dataset_dataloader)
     
     @empty_cache_decorator
     @torch.no_grad()
@@ -628,10 +462,6 @@ def main(_):
             stats['epoch'] = epoch + sub_iteration/len(zipped_dataloaders)
             stats['total_iterations'] = total_iterations
             stats['gradient_steps'] = total_iterations * FLAGS.inner_iteration_steps
-
-            if stats['total_iterations'] % FLAGS.save_every_steps == 0:
-                num_batches = stats['total_iterations']
-                save_model(model_name + f"_num_batches_{num_batches}", epoch)
 
             total_iterations += 1
             trainer.log_stats(
