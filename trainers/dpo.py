@@ -16,7 +16,7 @@ import warnings
 warnings.simplefilter(action='ignore', category=FutureWarning)
 warnings.simplefilter("ignore")
 
-from datasets import concatenate_datasets, load_dataset, load_from_disk, DatasetDict
+from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM
 from trainers.network_utils import AutoModelForCausalLMWithValueHead
 from trainers.dpo_trainer import DPOTrainer
@@ -253,10 +253,8 @@ def main(args):
         gc.collect()
 
     def empty_cache_decorator(func):
-        def func_wrapper(*args, **kwargs):
-            empty_cache()
-            return func(*args, **kwargs)
-        return func_wrapper
+        empty_cache()
+        return func
 
     def save_model(checkpoint_dir, epoch_num, add_prefix=True):
         if add_prefix:
