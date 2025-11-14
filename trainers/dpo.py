@@ -2,10 +2,8 @@ import os
 # Set global temporary directory to ./cache/tmp so that all tmp files go there
 TMP_ROOT = os.path.abspath("./cache/tmp")
 os.makedirs(TMP_ROOT, exist_ok=True)
-
 for var in ["TMPDIR", "TEMP", "TMP"]:
     os.environ[var] = TMP_ROOT
-
 os.environ["WANDB__SERVICE_WAIT"] = "10000"
 os.environ["WANDB_INIT_TIMEOUT"] = "10000"
 os.environ["WANDB_START_METHOD"] = "thread"
@@ -27,7 +25,6 @@ from trainers.approx_dpo_trainer import ApproxDPOTrainer
 
 # from alpaca_farm.models.reward_model import RewardModel, RewardConfig
 import torch
-from absl import flags, app
 import accelerate
 import gc
 import datetime
@@ -42,39 +39,10 @@ from collections import defaultdict
 from functools import reduce
 from trainers.utils import (
     logprobs_from_logits,
-    entropy_from_logits,
-    get_dataset
+    entropy_from_logits
 )
 import argparse
-
-def construct_dataset(
-    args,
-    num_samples=-1,
-    concatenate_prompt=False,
-    num_samples_test=1000,
-):
-    data, test_data = get_dataset(args.path, num_samples=num_samples, return_test_data=True, num_samples_test=num_samples_test)
-
-    if concatenate_prompt:
-        def map_fn(d):
-            for k in ["y_ref", "y_w", "y_l"]:
-                d[k] = d["prompt"] + d[k]
-            return d
-
-        data = data.map(
-            map_fn,
-            num_proc=args.num_proc,
-        )
-
-    dataset_name = os.path.basename(args.path).split(".")[0]
-
-    ds = DatasetDict({
-        "train": data,
-        "test": test_data,
-    }
-    )
-    return dataset_name, ds
-
+from trainers.data_loader import get_dataset, construct_dataset
 
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
@@ -102,7 +70,6 @@ def main(args):
         output_dir += "_lora"
 
     model_name = (args.pretrained_dir).split("/")[-1]
-    # model_name = f"{FLAGS.wandb_project}_{FLAGS.run_name}"
 
     print('Output dir:', output_dir)
     print('Model name:', model_name)
@@ -110,62 +77,21 @@ def main(args):
     batch_size_pref_data = args.batch_size
     batch_size_online_data = 0
 
-    if args.preference_dataset_path in ['tatsu-lab/alpaca_farm', 'Asap7772/alpaca_human_preference_gold', 'Asap7772/alpaca_human_preference_minlength', 'Asap7772/alpaca_human_preference_maxlength']:
-        if args.preference_dataset_path == 'tatsu-lab/alpaca_farm':
-            pref_dataset = load_dataset(args.preference_dataset_path, args.preference_dataset_subset, split="preference")
-
-        else:
-            split = 'train' if 'length' in args.preference_dataset_path else args.preference_dataset_split
-
-            pref_dataset = load_dataset(args.preference_dataset_path, split=split)
-        pref_dataset = pref_dataset.train_test_split(test_size=0.1, seed=args.seed)
-
-        def process_dataset(batch):
-            new_batch = defaultdict(list)
-            for inst, inp, out1, out2, pref in zip(batch['instruction'], batch['input'], batch['output_1'], batch['output_2'], batch['preference']):
-                if pref == 1:
-                    selected = out1
-                    rejected = out2
-                else:
-                    selected = out2
-                    rejected = out1
-                if inp:
-                    text = f"{PROMPT_TOKEN}{inst}\n{inp}{EOS_TOKEN}{ASSISTANT_TOKEN}"
-                else:
-                    text = f"{PROMPT_TOKEN}{inst}{EOS_TOKEN}{ASSISTANT_TOKEN}"
-
-                new_batch['prompt'].append(text)
-                new_batch['y_w'].append(f"{text}{selected}{EOS_TOKEN}")
-                new_batch['y_l'].append(f"{text}{rejected}{EOS_TOKEN}")
-            return new_batch
-
-        pref_dataset = pref_dataset.map(
-            process_dataset,
-            batched=args.batched,
-            num_proc=args.num_proc,
-        )
-
-        pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
-        remove_columns = ['instruction', 'input', 'output_1', 'output_2', 'preference', 'raw_preference', 'prompt', 'y_w', 'y_l']
+    if args.preference_dataset_path.startswith('Asap7772'):
+        pref_dataset_name = os.path.basename(args.preference_dataset_path)
+        pref_dataset = load_dataset(args.preference_dataset_path)
     else:
-        if args.preference_dataset_path.startswith('Asap7772'):
-            pref_dataset_name = os.path.basename(args.preference_dataset_path)
-            pref_dataset = load_dataset(args.preference_dataset_path)
-        else:
-            pref_dataset_name, pref_dataset = construct_dataset(
-                args=args,
-                num_samples=args.preference_num_samples,
-                concatenate_prompt=False,
-            )
-        print('Loaded dataset', pref_dataset_name)
+        pref_dataset_name, pref_dataset = construct_dataset(
+            args=args,
+            num_samples=args.preference_num_samples,
+            concatenate_prompt=False,
+        )
+    print('Loaded dataset', pref_dataset_name)
 
-        pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
-        remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
+    pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
+    remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
 
     if args.downsample_ratio < 1.0:
-        downsample_ratio = float(args.downsample_ratio)
-        if downsample_ratio <= 0 or downsample_ratio > 1:
-            raise ValueError(f"downsample_ratio must be between 0 and 1, but got {downsample_ratio}")
         pref_dataset = pref_dataset.shuffle(seed=args.seed).select(range(int(len(pref_dataset) * downsample_ratio)))
         eval_pref_dataset = eval_pref_dataset.shuffle(seed=args.seed).select(range(int(len(eval_pref_dataset) * downsample_ratio)))
 
@@ -223,10 +149,8 @@ def main(args):
         },
         tracker_kwargs={
             "wandb": {
-                "entity": "VirtuosoResearch",
-                "name": args.run_name,
-                "id": unique_str,
-                "dir": wandb_output_dir,
+                "entity": "michaelzona", "name": args.run_name,
+                "id": unique_str, "dir": wandb_output_dir,
             }
         },
         log_with='wandb',
@@ -561,7 +485,6 @@ def main(args):
             )
 
         trainer.end_of_epoch_step(epoch)
-
         save_model(model_name + f"_epoch_{epoch}", epoch)
 
 
