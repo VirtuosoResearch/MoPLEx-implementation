@@ -56,12 +56,9 @@ def main(args):
 
     print(len(dataset), 'train samples')
     print(len(eval_dataset), 'eval samples')
-    if args.downsample_ratio < 1.0:
-        downsample_ratio = float(args.downsample_ratio)
-        if downsample_ratio <= 0 or downsample_ratio > 1:
-            raise ValueError(f"downsample_ratio must be between 0 and 1, but got {downsample_ratio}")
-        dataset = dataset.shuffle(seed=args.seed).select(range(int(len(dataset) * downsample_ratio)))
-        eval_dataset = eval_dataset.shuffle(seed=args.seed).select(range(int(len(eval_dataset) * downsample_ratio)))
+
+    dataset = dataset.shuffle(seed=args.seed).select(range(int(len(dataset) * args.downsample_ratio)))
+    eval_dataset = eval_dataset.shuffle(seed=args.seed).select(range(int(len(eval_dataset) * args.downsample_ratio)))
     print(len(dataset), 'train samples after downsampling')
     print(len(eval_dataset), 'eval samples after downsampling')
 
@@ -91,9 +88,8 @@ def main(args):
     pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
     remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
 
-    if args.downsample_ratio < 1.0:
-        pref_dataset = pref_dataset.shuffle(seed=args.seed).select(range(int(len(pref_dataset) * downsample_ratio)))
-        eval_pref_dataset = eval_pref_dataset.shuffle(seed=args.seed).select(range(int(len(eval_pref_dataset) * downsample_ratio)))
+    pref_dataset = pref_dataset.shuffle(seed=args.seed).select(range(int(len(pref_dataset) * args.downsample_ratio)))
+    eval_pref_dataset = eval_pref_dataset.shuffle(seed=args.seed).select(range(int(len(eval_pref_dataset) * args.downsample_ratio)))
 
     def process_dataset(batch):
         new_batch = {}
