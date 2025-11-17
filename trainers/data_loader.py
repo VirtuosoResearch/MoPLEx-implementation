@@ -40,6 +40,11 @@ def construct_dataset(
 ):
     data, test_data = get_dataset(args.path, num_samples=num_samples, return_test_data=True, num_samples_test=num_samples_test)
 
+    # print("##"*20)
+    # print("data[0]: ", data[0])
+    # print("test_data[0]: ", test_data[0])
+    # print("$$"*20)
+    # exit()
     if concatenate_prompt:
         def map_fn(d):
             for k in ["y_ref", "y_w", "y_l"]:

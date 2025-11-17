@@ -290,7 +290,7 @@ class DPOTrainer():
         # compute dpo loss
         pi_logratios = logprobs_w - logprobs_l
         ref_logratios = old_logprobs_w - old_logprobs_l
-        dpo_logit = self.config.temperature * (pi_logratios - ref_logratios)
+        dpo_logit = self.config.temperature * (pi_logratios - ref_logratios) # temperature is the beta in formula
 
         if self.config.ipo_loss:
             dpo_loss = (dpo_logit - 1/(2 *self.config.temperature))**2

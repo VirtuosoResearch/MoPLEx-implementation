@@ -77,6 +77,38 @@ def main(args):
     if args.preference_dataset_path.startswith('Asap7772'):
         pref_dataset_name = os.path.basename(args.preference_dataset_path)
         pref_dataset = load_dataset(args.preference_dataset_path)
+    if "imdb" in args.preference_dataset_path:
+        pref_dataset_name = os.path.basename(args.preference_dataset_path)
+        pref_dataset = load_dataset(args.preference_dataset_path)
+
+        def make_imdb_pref(batch):
+            prompts = batch["prompt"]
+            all_responses = batch["responses"]
+            chosens = batch["chosen"]
+
+            y_w_list = []
+            y_l_list = []
+
+            for resp_list, c in zip(all_responses, chosens):
+                win = resp_list[c]
+                lose = resp_list[1 - c]
+
+                y_w_list.append(f"{ASSISTANT_TOKEN} {win}")
+                y_l_list.append(f"{ASSISTANT_TOKEN} {lose}")
+
+            return {
+                "prompt": prompts,
+                "y_w": y_w_list,
+                "y_l": y_l_list,
+            }
+
+        for split in pref_dataset.keys():
+            pref_dataset[split] = pref_dataset[split].map(
+                make_imdb_pref,
+                batched=True,
+                num_proc=args.num_proc,
+            )
+
     else:
         pref_dataset_name, pref_dataset = construct_dataset(
             args=args,
@@ -110,16 +142,17 @@ def main(args):
         process_dataset,
         batched=args.batched,
         num_proc=args.num_proc,
-        remove_columns=remove_columns,
+        remove_columns=remove_columns if "alpacafarm" in args.preference_dataset_path else None,
     )
 
     eval_pref_dataset = eval_pref_dataset.map(
         process_dataset,
         batched=args.batched,
         num_proc=args.num_proc,
-        remove_columns=remove_columns,
+        remove_columns=remove_columns if "alpacafarm" in args.preference_dataset_path else None,
     )
-
+    print("#"*20)
+    print(pref_dataset[0].keys())
     unique_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S.%f") + '-' + str(np.random.randint(100000))
     wandb_output_dir = tempfile.mkdtemp(dir=args.cache_dir)
     
