@@ -354,43 +354,41 @@ def main(args):
     @empty_cache_decorator
     @torch.no_grad()
     def process_batch_dpo(batch):
-        if batch is not None:
-            # Construct query tensors
-            query_tensors = tokenizer(batch["query"], padding='max_length' if args.use_tpu else True, truncation=True, max_length=128, return_tensors='pt')
-            query_tensors = accelerate.utils.send_to_device(query_tensors, trainer.accelerator.device)
+        # Construct query tensors
+        query_tensors = tokenizer(batch["query"], padding='max_length' if args.use_tpu else True, truncation=True, max_length=128, return_tensors='pt')
+        query_tensors = accelerate.utils.send_to_device(query_tensors, trainer.accelerator.device)
 
-            # Get generations from SFTModel (including prompt)
-            all_generation_tokens = []
-            for _ in range(args.num_actions_per_prompt):  # generate multiple completions per prompt
-                if query_tensors.input_ids.shape[0] > args.max_gen_batch_size:
-                    generation_tokens = []
-                    for i in tqdm(range(0, query_tensors.input_ids.shape[0], args.max_gen_batch_size), desc=f"Generating for epoch {epoch}"):
-                        generation_tokens.append(trainer.accelerator.unwrap_model(trainer.model).generate(**query_tensors[i:i + args.max_gen_batch_size], **generation_kwargs))
-                        torch.cuda.empty_cache()
-                    generation_tokens = torch.cat(generation_tokens, dim=0)
-                else:
-                    generation_tokens = trainer.accelerator.unwrap_model(trainer.model).generate(**query_tensors, **generation_kwargs)
-                all_generation_tokens.append(generation_tokens)
-            all_generation_tokens = torch.cat(all_generation_tokens, dim=0)
+        # Get generations from SFTModel (including prompt)
+        all_generation_tokens = []
+        for _ in range(args.num_actions_per_prompt):  # generate multiple completions per prompt
+            if query_tensors.input_ids.shape[0] > args.max_gen_batch_size:
+                generation_tokens = []
+                for i in tqdm(range(0, query_tensors.input_ids.shape[0], args.max_gen_batch_size), desc=f"Generating for epoch {epoch}"):
+                    generation_tokens.append(trainer.accelerator.unwrap_model(trainer.model).generate(**query_tensors[i:i + args.max_gen_batch_size], **generation_kwargs))
+                    torch.cuda.empty_cache()
+                generation_tokens = torch.cat(generation_tokens, dim=0)
+            else:
+                generation_tokens = trainer.accelerator.unwrap_model(trainer.model).generate(**query_tensors, **generation_kwargs)
+            all_generation_tokens.append(generation_tokens)
+        all_generation_tokens = torch.cat(all_generation_tokens, dim=0)
 
-            logprobs, old_logprobs, entropy, logits = process_input_ids(all_generation_tokens)
+        logprobs, old_logprobs, entropy, logits = process_input_ids(all_generation_tokens)
 
-            texts = tokenizer.batch_decode(all_generation_tokens, skip_special_tokens=True)
+        texts = tokenizer.batch_decode(all_generation_tokens, skip_special_tokens=True)
 
-            # Update batch with response
-            batch["response"] = [x.split(ASSISTANT_TOKEN)[-1] for x in texts]
-            response_tensors = tokenizer(batch["response"], padding='max_length' if args.use_tpu else True, truncation=True, max_length=generation_kwargs['max_new_tokens'], return_tensors='pt').input_ids
-            response_tensors = accelerate.utils.send_to_device(response_tensors, trainer.accelerator.device)
+        # Update batch with response
+        batch["response"] = [x.split(ASSISTANT_TOKEN)[-1] for x in texts]
 
-            # Reprocess query tensors
-            query_tensors = query_tensors.input_ids
-            # Ensure query and response tensors are same length
-            query_tensors = query_tensors.repeat(args.num_actions_per_prompt, 0)
-            assert query_tensors.shape[0] == response_tensors.shape[0], f"query_tensors.shape[0] = {query_tensors.shape[0]} != response_tensors.shape[0] = {response_tensors.shape[0]}"
-            batch["query"] = batch["query"] * args.num_actions_per_prompt
-        else:
-            query_tensors, response_tensors = None, None
-            logprobs, old_logprobs, entropy, logits = None, None, None, None
+        response_tensors = tokenizer(batch["response"], padding='max_length' if args.use_tpu else True, truncation=True, max_length=generation_kwargs['max_new_tokens'], return_tensors='pt').input_ids
+        response_tensors = accelerate.utils.send_to_device(response_tensors, trainer.accelerator.device)
+
+        # Reprocess query tensors
+        query_tensors = query_tensors.input_ids
+        # Ensure query and response tensors are same length
+        query_tensors = query_tensors.repeat(args.num_actions_per_prompt, 0)
+        assert query_tensors.shape[0] == response_tensors.shape[0], f"query_tensors.shape[0] = {query_tensors.shape[0]} != response_tensors.shape[0] = {response_tensors.shape[0]}"
+        batch["query"] = batch["query"] * args.num_actions_per_prompt
+
         return batch, query_tensors, response_tensors, logprobs, old_logprobs, entropy, logits
 
     print("Starting training")
