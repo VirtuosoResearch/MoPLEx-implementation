@@ -5,6 +5,15 @@ PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
 EOS_TOKEN = '<|endoftext|>'
 
+generation_kwargs = {
+    "top_k": 0.0,  # no top-k sampling
+    "top_p": 1.0,  # no nucleus sampling
+    "do_sample": True,  # yes, we want to sample
+    "max_new_tokens": 256,  # specify how many tokens you want to generate at most
+    "temperature": 1.0,  # control the temperature of the softmax
+    "use_cache": True,  # whether the model should use past key/values attentions
+}
+
 def get_dataset(path, num_samples=-1, return_test_data=True, num_samples_test=1000):
     assert os.path.exists(path)
     folders = os.listdir(path)
@@ -96,3 +105,39 @@ def load_imdb_dataset(args):
         )
 
     return pref_dataset
+
+def data_process(pref_dataset, args):
+    pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
+    remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
+
+    pref_dataset = pref_dataset.shuffle(seed=args.seed).select(range(int(len(pref_dataset) * args.downsample_ratio)))
+    eval_pref_dataset = eval_pref_dataset.shuffle(seed=args.seed).select(range(int(len(eval_pref_dataset) * args.downsample_ratio)))
+
+    def process_dataset(batch):
+        new_batch = {}
+        new_batch['query'] = batch['prompt']
+        new_batch['text_w'] = batch['y_w']
+        new_batch['text_l'] = batch['y_l']
+        new_batch['response_w'] = [x.split(ASSISTANT_TOKEN)[-1] for x in batch['y_w']]
+        new_batch['response_l'] = [x.split(ASSISTANT_TOKEN)[-1] for x in batch['y_l']]
+
+        shapes = {}
+        for k, v in new_batch.items():
+            shapes[k] = len(v)
+        return new_batch
+
+    pref_dataset = pref_dataset.map(
+        process_dataset,
+        batched=args.batched,
+        num_proc=args.num_proc,
+        remove_columns=remove_columns if "alpacafarm" in args.preference_dataset_path else None,
+    )
+
+    eval_pref_dataset = eval_pref_dataset.map(
+        process_dataset,
+        batched=args.batched,
+        num_proc=args.num_proc,
+        remove_columns=remove_columns if "alpacafarm" in args.preference_dataset_path else None,
+    )
+
+    return pref_dataset, eval_pref_dataset

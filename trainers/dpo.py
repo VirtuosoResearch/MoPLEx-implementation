@@ -41,7 +41,7 @@ from trainers.utils import (
     entropy_from_logits
 )
 import argparse
-from trainers.data_loader import get_dataset, construct_dataset, load_imdb_dataset
+from trainers.data_loader import get_dataset, construct_dataset, load_imdb_dataset, data_process, generation_kwargs
 
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
@@ -54,7 +54,6 @@ def main(args):
     model_name = (args.pretrained_dir).split("/")[-1]
     print('Output dir:', output_dir, '\nModel name:', model_name)
 
-    batch_size_pref_data = args.batch_size
     batch_size_online_data = 0
 
     if args.preference_dataset_path.startswith('Asap7772'):
@@ -71,40 +70,8 @@ def main(args):
         )
     print('Loaded dataset', pref_dataset_name)
 
-    pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
-    remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
+    pref_dataset_dataloader, train_as_eval_pref_dataset_dataloader, train_as_eval_pref_dataset_dataloader, all_eval_dataloaders = data_process(pref_dataset, args)
 
-    pref_dataset = pref_dataset.shuffle(seed=args.seed).select(range(int(len(pref_dataset) * args.downsample_ratio)))
-    eval_pref_dataset = eval_pref_dataset.shuffle(seed=args.seed).select(range(int(len(eval_pref_dataset) * args.downsample_ratio)))
-
-    def process_dataset(batch):
-        new_batch = {}
-        new_batch['query'] = batch['prompt']
-        new_batch['text_w'] = batch['y_w']
-        new_batch['text_l'] = batch['y_l']
-        new_batch['response_w'] = [x.split(ASSISTANT_TOKEN)[-1] for x in batch['y_w']]
-        new_batch['response_l'] = [x.split(ASSISTANT_TOKEN)[-1] for x in batch['y_l']]
-
-        shapes = {}
-        for k, v in new_batch.items():
-            shapes[k] = len(v)
-        return new_batch
-
-    pref_dataset = pref_dataset.map(
-        process_dataset,
-        batched=args.batched,
-        num_proc=args.num_proc,
-        remove_columns=remove_columns if "alpacafarm" in args.preference_dataset_path else None,
-    )
-
-    eval_pref_dataset = eval_pref_dataset.map(
-        process_dataset,
-        batched=args.batched,
-        num_proc=args.num_proc,
-        remove_columns=remove_columns if "alpacafarm" in args.preference_dataset_path else None,
-    )
-    print("#"*20)
-    print(pref_dataset[0].keys())
     unique_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S.%f") + '-' + str(np.random.randint(100000))
     wandb_output_dir = tempfile.mkdtemp(dir=args.cache_dir)
     
@@ -142,7 +109,7 @@ def main(args):
     tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "left"
-    eos = tokenizer.eos_token
+    generation_kwargs["pad_token_id"]=tokenizer.eos_token_id
 
     print(args.pretrained_dir)
     print(args.cache_dir)
@@ -171,10 +138,8 @@ def main(args):
             auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
         else:
             auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "c_attn", "c_proj", "c_fc", "Wqkv", "out_proj", "fc1", "fc2"]
-
         cli_targets: List[str] = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
         target_modules = cli_targets if len(cli_targets) > 0 else auto_targets
-
         lora_cfg = LoraConfig(
             r=args.lora_r,
             lora_alpha=args.lora_alpha,
@@ -188,17 +153,7 @@ def main(args):
 
     model = AutoModelForCausalLMWithValueHead(policy)
 
-    def formatting_prompts_func(example):
-        inst, inp = example['instruction'], example['input']
-        if inp:
-            query = f"{PROMPT_TOKEN}{inst}\n{inp}{eos}{ASSISTANT_TOKEN}"
-        else:
-            query = f"{PROMPT_TOKEN}{inst}{eos}{ASSISTANT_TOKEN}"
-        example['query'] = query
-        return example
-
     TrainerClass = ApproxDPOTrainer if args.approx_dpo else DPOTrainer
-
     trainer = TrainerClass(
         model=model,
         config=config,
@@ -206,15 +161,6 @@ def main(args):
         additional_config_kwargs=vars(args),
     )
 
-    generation_kwargs = {
-        "top_k": 0.0,  # no top-k sampling
-        "top_p": 1.0,  # no nucleus sampling
-        "do_sample": True,  # yes, we want to sample
-        "pad_token_id": tokenizer.eos_token_id,  # most decoder models do not have a padding token, use EOS token instead
-        "max_new_tokens": 256,  # specify how many tokens you want to generate at most
-        "temperature": 1.0,  # control the temperature of the softmax
-        "use_cache": True,  # whether the model should use past key/values attentions
-    }
 
     def empty_cache():
         gc.collect()
@@ -259,31 +205,6 @@ def main(args):
                 tokenizer.save_pretrained(checkpoint_dir)
             trainer.accelerator.print(f"Checkpointing Epoch {epoch_num} -> {checkpoint_dir}")
 
-    pref_dataset_dataloader = torch.utils.data.DataLoader(
-        pref_dataset,
-        batch_size=max(batch_size_pref_data, 1),
-        collate_fn=None,
-        shuffle=True,
-        drop_last=True,
-    )
-    train_as_eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
-        pref_dataset,
-        batch_size=args.mini_batch_size,
-        collate_fn=None,
-        shuffle=True,
-        drop_last=True,
-    )
-    eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
-        eval_pref_dataset,
-        batch_size=args.mini_batch_size,
-        collate_fn=None,
-        shuffle=True,
-        drop_last=True,
-    )
-    all_eval_dataloaders = {
-        "train_as_eval_pref": train_as_eval_pref_dataset_dataloader,
-        "eval_pref": eval_pref_dataset_dataloader,
-    }
 
     @empty_cache_decorator
     @torch.no_grad()
@@ -426,7 +347,6 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-
     parser.add_argument('--wandb_project', type=str, default='reweighted_bc', help='the wandb project name')
     parser.add_argument('--run_name', type=str, default='reweighted_bc', help='the wandb run name')
     parser.add_argument('--output_dir', type=str, default=None, help='the output directory')
@@ -447,7 +367,6 @@ if __name__ == "__main__":
     parser.add_argument('--mini_batch_size', type=int, default=8, help='the chunk size')
     parser.add_argument('--seed', type=int, default=42, help='the random seed')
     parser.add_argument('--gradient_accumulation_steps', type=int, default=1, help='the gradient accumulation steps')
-
     parser.add_argument('--use_score_scaling', type=bool, default=False, help='whether to use score scaling')
     parser.add_argument('--use_score_norm', type=bool, default=False, help='whether to use score normalization')
     parser.add_argument('--temperature', type=float, default=1.0, help='the temperature for reweighting')
