@@ -321,10 +321,6 @@ class DPOTrainer():
             responses_l_ = responses_l[i : i + sub_bs]
             preference_mask_ = preference_mask[i : i + sub_bs] if preference_mask is not None else None
 
-            # print("queries: ",self.tokenizer.decode(queries_[0]),"\n\n")
-            # print("response_w: ",self.tokenizer.decode(responses_w_[0]),"\n\n")
-            # print("response_l: ",self.tokenizer.decode(responses_l_[0]),"\n\n")
-
             loss, stats = self._step(
                 queries=queries_,
                 responses_w=responses_w_,

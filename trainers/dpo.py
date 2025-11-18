@@ -18,7 +18,6 @@ warnings.simplefilter("ignore")
 
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoModelForCausalLM
-from trainers.network_utils import AutoModelForCausalLMWithValueHead
 from trainers.dpo_trainer import DPOTrainer
 from trainers.dpo_config import DPOConfig
 from trainers.approx_dpo_trainer import ApproxDPOTrainer
@@ -27,21 +26,16 @@ import torch
 import accelerate
 import gc
 import datetime
-from peft import LoraConfig, get_peft_model
-from typing import List
 import numpy as np
 import tempfile
 from tqdm import tqdm
 import wandb
-import re
-from collections import defaultdict
-from functools import reduce
 from trainers.utils import (
     logprobs_from_logits,
     entropy_from_logits
 )
 import argparse
-from trainers.data_loader import get_dataset, construct_dataset, load_imdb_dataset, data_process, generation_kwargs
+from trainers.data_loader import get_dataset, construct_dataset, load_imdb_dataset, data_process, generation_kwargs, load_model
 
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
@@ -70,7 +64,7 @@ def main(args):
         )
     print('Loaded dataset', pref_dataset_name)
 
-    pref_dataset_dataloader, train_as_eval_pref_dataset_dataloader, train_as_eval_pref_dataset_dataloader, all_eval_dataloaders = data_process(pref_dataset, args)
+    pref_dataset_dataloader, all_eval_dataloaders = data_process(pref_dataset, args)
 
     unique_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S.%f") + '-' + str(np.random.randint(100000))
     wandb_output_dir = tempfile.mkdtemp(dir=args.cache_dir)
@@ -110,48 +104,8 @@ def main(args):
     tokenizer.padding_side = "left"
     tokenizer.truncation_side = "left"
     generation_kwargs["pad_token_id"]=tokenizer.eos_token_id
-
+    model = load_model(tokenizer, args)
     print(args.pretrained_dir)
-    print(args.cache_dir)
-
-    policy = AutoModelForCausalLM.from_pretrained(
-        args.pretrained_dir,
-        cache_dir=args.cache_dir,
-        torch_dtype=torch.float32,
-        low_cpu_mem_usage=True,
-        device_map='auto',
-    )
-    policy.resize_token_embeddings(len(tokenizer))
-
-    if args.use_lora:
-        model_type = getattr(policy.config, "model_type", "").lower()
-        auto_targets = []
-        if model_type in ["gpt2", "gpt_neo", "gptj", "gpt_neox", "mpt", "falcon", "pythia"]:
-            if model_type == "gpt2":
-                auto_targets = ["c_attn", "c_proj", "c_fc"]
-            else:
-                auto_targets = [
-                    "query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h",
-                    "c_attn", "c_proj", "c_fc"
-                ]
-        elif model_type in ["llama", "mistral", "qwen2", "qwen3", "opt"]:
-            auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
-        else:
-            auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "c_attn", "c_proj", "c_fc", "Wqkv", "out_proj", "fc1", "fc2"]
-        cli_targets: List[str] = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
-        target_modules = cli_targets if len(cli_targets) > 0 else auto_targets
-        lora_cfg = LoraConfig(
-            r=args.lora_r,
-            lora_alpha=args.lora_alpha,
-            lora_dropout=args.lora_dropout,
-            target_modules=target_modules,
-            bias="none",
-            task_type="CAUSAL_LM",
-        )
-        policy = get_peft_model(policy, lora_cfg)
-        policy.print_trainable_parameters()
-
-    model = AutoModelForCausalLMWithValueHead(policy)
 
     TrainerClass = ApproxDPOTrainer if args.approx_dpo else DPOTrainer
     trainer = TrainerClass(
@@ -161,14 +115,12 @@ def main(args):
         additional_config_kwargs=vars(args),
     )
 
-
     def empty_cache():
         gc.collect()
         if args.use_tpu:
             return
         torch.cuda.empty_cache()
         gc.collect()
-
     def empty_cache_decorator(func):
         empty_cache()
         return func
@@ -219,7 +171,6 @@ def main(args):
 
         pref_response_w_tensors = tokenized[:len(pref_batch["response_w"])]
         pref_response_w_tensors = accelerate.utils.send_to_device(pref_response_w_tensors, trainer.accelerator.device)
-
         pref_response_l_tensors = tokenized[len(pref_batch["response_w"]):]
         pref_response_l_tensors = accelerate.utils.send_to_device(pref_response_l_tensors, trainer.accelerator.device)
 
@@ -242,7 +193,6 @@ def main(args):
     @empty_cache_decorator
     @torch.no_grad()
     def process_batch_dpo(batch):
-        # Construct query tensors
         query_tensors = tokenizer(batch["query"], padding='max_length' if args.use_tpu else True, truncation=True, max_length=128, return_tensors='pt')
         query_tensors = accelerate.utils.send_to_device(query_tensors, trainer.accelerator.device)
 
@@ -261,10 +211,7 @@ def main(args):
         all_generation_tokens = torch.cat(all_generation_tokens, dim=0)
 
         logprobs, old_logprobs, entropy, logits = process_input_ids(all_generation_tokens)
-
         texts = tokenizer.batch_decode(all_generation_tokens, skip_special_tokens=True)
-
-        # Update batch with response
         batch["response"] = [x.split(ASSISTANT_TOKEN)[-1] for x in texts]
 
         response_tensors = tokenizer(batch["response"], padding='max_length' if args.use_tpu else True, truncation=True, max_length=generation_kwargs['max_new_tokens'], return_tensors='pt').input_ids
@@ -307,7 +254,6 @@ def main(args):
                     stats[f"{eval_name}/policykl"] = (logprobs - old_logprobs).mean().item()
                     stats[f"{eval_name}/sequence_approxkl"] = (0.5 * ((logprobs - old_logprobs) ** 2)).sum(-1).mean().item()
                     stats[f"{eval_name}/sequence_policykl"] = (logprobs - old_logprobs).sum(-1).mean().item()
-
                     # log table of completions
                     table_rows = list(r for r in zip(*[all_to_log[col] for col in columns_to_log_eval]))
                     stats[f"{eval_name}/table"] = wandb.Table(columns=[*columns_to_log_eval], rows=table_rows)

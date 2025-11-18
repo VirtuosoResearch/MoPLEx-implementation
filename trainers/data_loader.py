@@ -1,6 +1,10 @@
 import os
 from datasets import concatenate_datasets, load_from_disk, DatasetDict, load_dataset
-
+import torch
+from transformers import AutoModelForCausalLM
+from trainers.network_utils import AutoModelForCausalLMWithValueHead
+from peft import get_peft_model, LoraConfig
+import re
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
 EOS_TOKEN = '<|endoftext|>'
@@ -53,11 +57,6 @@ def construct_dataset(
 ):
     data, test_data = get_dataset(args.path, num_samples=num_samples, return_test_data=True, num_samples_test=num_samples_test)
 
-    # print("##"*20)
-    # print("data[0]: ", data[0])
-    # print("test_data[0]: ", test_data[0])
-    # print("$$"*20)
-    # exit()
     if concatenate_prompt:
         def map_fn(d):
             for k in ["y_ref", "y_w", "y_l"]:
@@ -132,6 +131,8 @@ def data_process(pref_dataset, args):
         num_proc=args.num_proc,
         remove_columns=remove_columns if "alpacafarm" in args.preference_dataset_path else None,
     )
+    print("#"*20)
+    print(pref_dataset[0].keys())
 
     eval_pref_dataset = eval_pref_dataset.map(
         process_dataset,
@@ -140,4 +141,71 @@ def data_process(pref_dataset, args):
         remove_columns=remove_columns if "alpacafarm" in args.preference_dataset_path else None,
     )
 
-    return pref_dataset, eval_pref_dataset
+    pref_dataset_dataloader = torch.utils.data.DataLoader(
+        pref_dataset,
+        batch_size=max(args.batch_size, 1),
+        collate_fn=None,
+        shuffle=True,
+        drop_last=True,
+    )
+    train_as_eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
+        pref_dataset,
+        batch_size=args.mini_batch_size,
+        collate_fn=None,
+        shuffle=True,
+        drop_last=True,
+    )
+    eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
+        eval_pref_dataset,
+        batch_size=args.mini_batch_size,
+        collate_fn=None,
+        shuffle=True,
+        drop_last=True,
+    )
+    all_eval_dataloaders = {
+        "train_as_eval_pref": train_as_eval_pref_dataset_dataloader,
+        "eval_pref": eval_pref_dataset_dataloader,
+    }
+
+    return pref_dataset_dataloader, all_eval_dataloaders
+
+def load_model(tokenizer, args):
+    policy = AutoModelForCausalLM.from_pretrained(
+        args.pretrained_dir,
+        cache_dir=args.cache_dir,
+        torch_dtype=torch.float32,
+        low_cpu_mem_usage=True,
+        device_map='auto',
+    )
+    policy.resize_token_embeddings(len(tokenizer))
+
+    if args.use_lora:
+        model_type = getattr(policy.config, "model_type", "").lower()
+        auto_targets = []
+        if model_type in ["gpt2", "gpt_neo", "gptj", "gpt_neox", "mpt", "falcon", "pythia"]:
+            if model_type == "gpt2":
+                auto_targets = ["c_attn", "c_proj", "c_fc"]
+            else:
+                auto_targets = [
+                    "query_key_value", "dense", "dense_h_to_4h", "dense_4h_to_h",
+                    "c_attn", "c_proj", "c_fc"
+                ]
+        elif model_type in ["llama", "mistral", "qwen2", "qwen3", "opt"]:
+            auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+        else:
+            auto_targets = ["q_proj", "k_proj", "v_proj", "o_proj", "c_attn", "c_proj", "c_fc", "Wqkv", "out_proj", "fc1", "fc2"]
+        cli_targets = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
+        target_modules = cli_targets if len(cli_targets) > 0 else auto_targets
+        lora_cfg = LoraConfig(
+            r=args.lora_r,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=target_modules,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
+        policy = get_peft_model(policy, lora_cfg)
+        policy.print_trainable_parameters()
+
+    model = AutoModelForCausalLMWithValueHead(policy)
+    return model
