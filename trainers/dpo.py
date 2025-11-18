@@ -23,7 +23,6 @@ from trainers.dpo_trainer import DPOTrainer
 from trainers.dpo_config import DPOConfig
 from trainers.approx_dpo_trainer import ApproxDPOTrainer
 
-# from alpaca_farm.models.reward_model import RewardModel, RewardConfig
 import torch
 import accelerate
 import gc
@@ -59,17 +58,12 @@ def main(args):
 
     dataset = dataset.shuffle(seed=args.seed).select(range(int(len(dataset) * args.downsample_ratio)))
     eval_dataset = eval_dataset.shuffle(seed=args.seed).select(range(int(len(eval_dataset) * args.downsample_ratio)))
-    print(len(dataset), 'train samples after downsampling')
-    print(len(eval_dataset), 'eval samples after downsampling')
+    print(len(dataset), 'train samples after downsampling\n', len(eval_dataset), 'eval samples after downsampling')
 
     output_dir = os.path.join(args.output_dir, args.wandb_project, args.run_name)
-    if args.use_lora:
-        output_dir += "_lora"
-
+    if args.use_lora: output_dir += "_lora"
     model_name = (args.pretrained_dir).split("/")[-1]
-
-    print('Output dir:', output_dir)
-    print('Model name:', model_name)
+    print('Output dir:', output_dir, '\nModel name:', model_name)
 
     batch_size_pref_data = args.batch_size
     batch_size_online_data = 0
@@ -85,17 +79,13 @@ def main(args):
             prompts = batch["prompt"]
             all_responses = batch["responses"]
             chosens = batch["chosen"]
-
             y_w_list = []
             y_l_list = []
-
             for resp_list, c in zip(all_responses, chosens):
                 win = resp_list[c]
                 lose = resp_list[1 - c]
-
                 y_w_list.append(f"{ASSISTANT_TOKEN} {win}")
                 y_l_list.append(f"{ASSISTANT_TOKEN} {lose}")
-
             return {
                 "prompt": prompts,
                 "y_w": y_w_list,
@@ -134,8 +124,6 @@ def main(args):
         shapes = {}
         for k, v in new_batch.items():
             shapes[k] = len(v)
-        if reduce(lambda x, y: x if x == y else -1, list(shapes.values())) == -1:
-            assert False, f"Shapes of all columns must be equal, but got {shapes}, {list(shapes.values())}"
         return new_batch
 
     pref_dataset = pref_dataset.map(
@@ -208,9 +196,6 @@ def main(args):
         model_type = getattr(policy.config, "model_type", "").lower()
         auto_targets = []
         if model_type in ["gpt2", "gpt_neo", "gptj", "gpt_neox", "mpt", "falcon", "pythia"]:
-            # GPT2/Neo/J/NeoX/MPT/Falcon/Pythia
-            # gpt2: c_attn, c_proj, c_fc
-            # neox/pythia: attention.query_key_value, attention.dense, mlp.dense_h_to_4h, mlp.dense_4h_to_h
             if model_type == "gpt2":
                 auto_targets = ["c_attn", "c_proj", "c_fc"]
             else:
@@ -304,8 +289,7 @@ def main(args):
                         is_main_process=trainer.accelerator.is_main_process,
                         state_dict=trainer.accelerator.get_state_dict(merged),
                     )
-                else:
-                    peft_like.save_pretrained(checkpoint_dir)
+                else: peft_like.save_pretrained(checkpoint_dir)
             else:
                 unwrapped.save_pretrained(
                     checkpoint_dir,
@@ -325,7 +309,6 @@ def main(args):
         shuffle=True,
         drop_last=True,
     )
-
     train_as_eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
         pref_dataset,
         batch_size=args.mini_batch_size,
@@ -333,7 +316,6 @@ def main(args):
         shuffle=True,
         drop_last=True,
     )
-
     eval_pref_dataset_dataloader = torch.utils.data.DataLoader(
         eval_pref_dataset,
         batch_size=args.mini_batch_size,
@@ -341,14 +323,10 @@ def main(args):
         shuffle=True,
         drop_last=True,
     )
-
     all_eval_dataloaders = {
         "train_as_eval_pref": train_as_eval_pref_dataset_dataloader,
         "eval_pref": eval_pref_dataset_dataloader,
     }
-
-    zipped_dataloaders = pref_dataset_dataloader
-    total_len = len(pref_dataset_dataloader)
 
     @empty_cache_decorator
     @torch.no_grad()
@@ -365,7 +343,6 @@ def main(args):
         pref_response_w_tensors = accelerate.utils.send_to_device(pref_response_w_tensors, trainer.accelerator.device)
 
         pref_response_l_tensors = tokenized[len(pref_batch["response_w"]):]
-        assert pref_response_l_tensors.shape[0] == len(pref_batch["response_l"])
         pref_response_l_tensors = accelerate.utils.send_to_device(pref_response_l_tensors, trainer.accelerator.device)
 
         return pref_batch, pref_query_tensors, pref_response_w_tensors, pref_response_l_tensors
@@ -426,11 +403,11 @@ def main(args):
 
     print("Starting training")
     total_iterations = 0
-    columns_to_log: list[str] = ["query", "response_w", "response_l"]
-    columns_to_log_eval: list[str] = ["query", "response"]
+    columns_to_log = ["query", "response_w", "response_l"]
+    columns_to_log_eval = ["query", "response"]
 
     for epoch in tqdm(range(args.num_train_epochs), desc="Epochs"):
-        for sub_iteration, pref_batch in tqdm(enumerate(zipped_dataloaders), desc="Batches", total=total_len):
+        for sub_iteration, pref_batch in tqdm(enumerate(pref_dataset_dataloader), desc="Batches", total=len(pref_dataset_dataloader)):
             empty_cache()
 
             stats = {}
@@ -446,31 +423,9 @@ def main(args):
                     del eval_batch, query_tensors, response_tensors
                     empty_cache()
 
-                    # log lengths
-                    char_lengths = np.array([len(x) for x in all_to_log['response']])
-                    stats[f"{eval_name}/char_lengths"] = char_lengths
-                    stats[f"{eval_name}/char_lengths_mean"] = char_lengths.mean()
-                    stats[f"{eval_name}/char_lengths_std"] = char_lengths.std()
-                    stats[f"{eval_name}/char_lengths_max"] = char_lengths.max()
-                    stats[f"{eval_name}/char_lengths_min"] = char_lengths.min()
-
-                    token_lengths = np.array([len(tokenizer(x).input_ids) for x in all_to_log['response']])
-                    stats[f"{eval_name}/token_lengths"] = token_lengths
-                    stats[f"{eval_name}/token_lengths_mean"] = token_lengths.mean()
-                    stats[f"{eval_name}/token_lengths_std"] = token_lengths.std()
-                    stats[f"{eval_name}/token_lengths_max"] = token_lengths.max()
-                    stats[f"{eval_name}/token_lengths_min"] = token_lengths.min()
-
-                    word_lengths = np.array([len(re.findall("[a-zA-Z_]+", x)) for x in all_to_log['response']])
-                    stats[f"{eval_name}/word_lengths"] = word_lengths
-                    stats[f"{eval_name}/word_lengths_mean"] = word_lengths.mean()
-                    stats[f"{eval_name}/word_lengths_std"] = word_lengths.std()
-                    stats[f"{eval_name}/word_lengths_max"] = word_lengths.max()
-                    stats[f"{eval_name}/word_lengths_min"] = word_lengths.min()
-
                     stats[f"{eval_name}/entropy"] = entropy.mean().item()
-                    stats[f"{eval_name}/logprobs"] = logprobs.mean().item()
-                    stats[f"{eval_name}/old_logprobs"] = old_logprobs.mean().item()
+                    stats[f"{eval_name}/logprobs"] = logprobs.mean().item() # policy model
+                    stats[f"{eval_name}/old_logprobs"] = old_logprobs.mean().item() # reference model
                     stats[f"{eval_name}/approxkl"] = (0.5 * ((logprobs - old_logprobs) ** 2).mean()).item()
                     stats[f"{eval_name}/policykl"] = (logprobs - old_logprobs).mean().item()
                     stats[f"{eval_name}/sequence_approxkl"] = (0.5 * ((logprobs - old_logprobs) ** 2)).sum(-1).mean().item()
@@ -493,7 +448,7 @@ def main(args):
             rewards = torch.zeros(pref_query_tensors.shape[0], dtype=torch.float32)
             rewards = accelerate.utils.send_to_device(rewards, trainer.accelerator.device)
 
-            stats['epoch'] = epoch + sub_iteration / len(zipped_dataloaders)
+            stats['epoch'] = epoch + sub_iteration / len(pref_dataset_dataloader)
             stats['total_iterations'] = total_iterations
             stats['gradient_steps'] = total_iterations * args.inner_iteration_steps
 
