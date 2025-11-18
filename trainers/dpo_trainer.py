@@ -93,21 +93,7 @@ class DPOTrainer():
         self.is_using_text_environment = getattr(config, "use_text_environment", False)
         self.tokenizer = tokenizer
         
-        self.dataset = dataset
         self._signature_columns = None
-        if self.dataset is not None:
-            self.dataloader = self.prepare_dataloader(self.dataset, data_collator)
-        elif self.dataset is None and self.accelerator.num_processes > 1:
-            warnings.warn(
-                "No dataset is provided. In a multi-GPU setting, this will lead to an error. You should"
-                " prepare your dataloader yourself with `dataloader = ppo_trainer.accelerator.prepare(dataloader)`"
-                " and using `torch.utils.data.DataLoader`, or pass a dataset to the `PPOTrainer`. Please "
-                " refer to the documentation for more details.",
-                UserWarning,
-            )
-            self.dataloader = None
-        else:
-            self.dataloader = None
 
         # Step 3: Initialize optimizer and data collator
         self.data_collator = DataCollatorForLanguageModeling(self.tokenizer, mlm=False)
@@ -146,17 +132,14 @@ class DPOTrainer():
             self.model,
             self.optimizer,
             self.data_collator,
-            self.dataloader,
             self.lr_scheduler,
         ) = self.accelerator.prepare(
             self.model,
             self.optimizer,
             self.data_collator,
-            self.dataloader,
             self.lr_scheduler,
         )
         if is_deepspeed_used:
-            # Quantized models are already set on the correct device
             if not self.is_peft_model and not (
                 getattr(self.ref_model.pretrained_model, "is_loaded_in_8bit", False)
                 or getattr(self.ref_model.pretrained_model, "is_loaded_in_4bit", False)
@@ -164,16 +147,11 @@ class DPOTrainer():
                 self.ref_model = self._prepare_deepspeed(self.ref_model)
         else:
             self.ref_model = self.accelerator.prepare(self.ref_model)
-
-        # In a distributed setup, only logging needs to be performed on the main process
-        # check: https://pytorch.org/docs/stable/generated/torch.nn.parallel.DistributedDataParallel.html
-        # or: https://discuss.pytorch.org/t/use-distributed-data-parallel-correctly/82500/11
+            
         self.is_distributed = self.accelerator.distributed_type == "MULTI_GPU"
 
-        # init the current step
         self.current_step = 0
 
-        # init variables for pushing model to hub
         if config.push_to_hub_if_best_kwargs:
             if "repo_id" not in config.push_to_hub_if_best_kwargs:
                 raise ValueError("You have to specify repo_id in order to push the model to the hub!")
@@ -181,7 +159,6 @@ class DPOTrainer():
             self.compare_step = 0
             self.highest_reward = torch.tensor(-float("inf"))
 
-        # post process for PP
         self.current_device = self.accelerator.device
         self.running = RunningMoments(self.accelerator)
         self.save_pstar_at_epoch = getattr(self.config, "save_pstar_at_epoch", -1)
@@ -191,42 +168,14 @@ class DPOTrainer():
         self.save_p_at_epoch = getattr(self.config, "save_p_at_epoch", -1)
         self.p_save_path = getattr(self.config, "p_save_path", "./p.pt")
         self.has_saved_p = False
-        
-    def prepare_dataloader(self, dataset: Union[torch.utils.data.Dataset, Dataset], data_collator=None):
-        """
-        Prepare the dataloader for training.
 
-        Args:
-            dataset (Union[`torch.utils.data.Dataset`, `datasets.Dataset`]):
-                PyTorch dataset or Hugging Face dataset. If a Hugging Face dataset is passed, the dataset
-                will be preprocessed by removing the columns that are not used by the model.
-            data_collator (Optional[function]):
-                Data collator function.
-
-        Returns:
-            `torch.utils.data.DataLoader`: PyTorch dataloader
-        """
-        if isinstance(dataset, Dataset):
-            dataset = self._remove_unused_columns(dataset)
-        dataloader = torch.utils.data.DataLoader(
-            dataset,
-            batch_size=self.config.dataloader_batch_size or self.config.batch_size,
-            collate_fn=data_collator,
-            shuffle=True,
-            drop_last=True,
-        )
-        return dataloader
     
-        # Adapted from transformers.Trainer._set_signature_columns_if_needed
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
-            # Inspect model forward signature to keep only the arguments it accepts.
             signature = inspect.signature(self.model.forward)
             self._signature_columns = list(signature.parameters.keys())
-            # label => sentiment | we need query and response for logging purpose
             self._signature_columns += ["label", "query", "response"]
 
-    # Adapted from transformers.Trainer._remove_unused_columns
     def _remove_unused_columns(self, dataset: "Dataset"):
         if not self.config.remove_unused_columns:
             return dataset
@@ -348,7 +297,6 @@ class DPOTrainer():
                     classifier_accuracy = torch.mean((reward_margin > 0).float()).detach()
                 )
             )
-
             return dpo_loss, flatten_dict(stats)
         else:
             return dpo_loss
