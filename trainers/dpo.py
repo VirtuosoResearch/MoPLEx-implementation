@@ -41,7 +41,7 @@ from trainers.utils import (
     entropy_from_logits
 )
 import argparse
-from trainers.data_loader import get_dataset, construct_dataset
+from trainers.data_loader import get_dataset, construct_dataset, load_imdb_dataset
 
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
@@ -49,17 +49,6 @@ EOS_TOKEN = '<|endoftext|>'
 
 
 def main(args):
-    print("args.dataset_path: ", args.dataset_path)
-    dataset = load_dataset(args.dataset_path, split="unlabeled")
-    eval_dataset = load_dataset(args.dataset_path, split="val")
-
-    print(len(dataset), 'train samples')
-    print(len(eval_dataset), 'eval samples')
-
-    dataset = dataset.shuffle(seed=args.seed).select(range(int(len(dataset) * args.downsample_ratio)))
-    eval_dataset = eval_dataset.shuffle(seed=args.seed).select(range(int(len(eval_dataset) * args.downsample_ratio)))
-    print(len(dataset), 'train samples after downsampling\n', len(eval_dataset), 'eval samples after downsampling')
-
     output_dir = os.path.join(args.output_dir, args.wandb_project, args.run_name)
     if args.use_lora: output_dir += "_lora"
     model_name = (args.pretrained_dir).split("/")[-1]
@@ -71,34 +60,9 @@ def main(args):
     if args.preference_dataset_path.startswith('Asap7772'):
         pref_dataset_name = os.path.basename(args.preference_dataset_path)
         pref_dataset = load_dataset(args.preference_dataset_path)
-    if "imdb" in args.preference_dataset_path:
+    if "imdb" in args.preference_dataset_path.lower():
         pref_dataset_name = os.path.basename(args.preference_dataset_path)
-        pref_dataset = load_dataset(args.preference_dataset_path)
-
-        def make_imdb_pref(batch):
-            prompts = batch["prompt"]
-            all_responses = batch["responses"]
-            chosens = batch["chosen"]
-            y_w_list = []
-            y_l_list = []
-            for resp_list, c in zip(all_responses, chosens):
-                win = resp_list[c]
-                lose = resp_list[1 - c]
-                y_w_list.append(f"{ASSISTANT_TOKEN} {win}")
-                y_l_list.append(f"{ASSISTANT_TOKEN} {lose}")
-            return {
-                "prompt": prompts,
-                "y_w": y_w_list,
-                "y_l": y_l_list,
-            }
-
-        for split in pref_dataset.keys():
-            pref_dataset[split] = pref_dataset[split].map(
-                make_imdb_pref,
-                batched=True,
-                num_proc=args.num_proc,
-            )
-
+        pref_dataset = load_imdb_dataset(args)
     else:
         pref_dataset_name, pref_dataset = construct_dataset(
             args=args,
@@ -233,18 +197,11 @@ def main(args):
         example['query'] = query
         return example
 
-    dataset = dataset.map(formatting_prompts_func, batched=False)
-    eval_dataset = eval_dataset.map(formatting_prompts_func, batched=False)
-
-    print('Sample Train prompt:', dataset[0]['query'])
-    print('Sample Eval prompt:', eval_dataset[0]['query'])
-
     TrainerClass = ApproxDPOTrainer if args.approx_dpo else DPOTrainer
 
     trainer = TrainerClass(
         model=model,
         config=config,
-        dataset=dataset,
         tokenizer=tokenizer,
         additional_config_kwargs=vars(args),
     )
@@ -392,7 +349,6 @@ def main(args):
         response_tensors = tokenizer(batch["response"], padding='max_length' if args.use_tpu else True, truncation=True, max_length=generation_kwargs['max_new_tokens'], return_tensors='pt').input_ids
         response_tensors = accelerate.utils.send_to_device(response_tensors, trainer.accelerator.device)
 
-        # Reprocess query tensors
         query_tensors = query_tensors.input_ids
         # Ensure query and response tensors are same length
         query_tensors = query_tensors.repeat(args.num_actions_per_prompt, 0)
@@ -474,7 +430,6 @@ if __name__ == "__main__":
     parser.add_argument('--wandb_project', type=str, default='reweighted_bc', help='the wandb project name')
     parser.add_argument('--run_name', type=str, default='reweighted_bc', help='the wandb run name')
     parser.add_argument('--output_dir', type=str, default=None, help='the output directory')
-    parser.add_argument('--dataset_path', type=str, default="tatsu-lab/alpaca_farm", help='the path to the dataset')
     parser.add_argument('--tokenizer_type', type=str, default="EleutherAI/pythia-1.4b', help='the model name")
     parser.add_argument('--pretrained_dir', type=str, default="", help='the path to the pretrained model')
     parser.add_argument('--learning_rate', type=float, default=1.0e-6, help='the learning rate')

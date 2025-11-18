@@ -1,5 +1,9 @@
 import os
-from datasets import concatenate_datasets, load_from_disk, DatasetDict
+from datasets import concatenate_datasets, load_from_disk, DatasetDict, load_dataset
+
+PROMPT_TOKEN = '<|prompter|>'
+ASSISTANT_TOKEN = '<|assistant|>'
+EOS_TOKEN = '<|endoftext|>'
 
 def get_dataset(path, num_samples=-1, return_test_data=True, num_samples_test=1000):
     assert os.path.exists(path)
@@ -63,3 +67,32 @@ def construct_dataset(
         "test": test_data,
     })
     return dataset_name, ds
+
+def load_imdb_dataset(args):
+    pref_dataset = load_dataset(args.preference_dataset_path)
+
+    def make_imdb_pref(batch):
+        prompts = batch["prompt"]
+        all_responses = batch["responses"]
+        chosens = batch["chosen"]
+        y_w_list = []
+        y_l_list = []
+        for resp_list, c in zip(all_responses, chosens):
+            win = resp_list[c]
+            lose = resp_list[1 - c]
+            y_w_list.append(f"{ASSISTANT_TOKEN} {win}")
+            y_l_list.append(f"{ASSISTANT_TOKEN} {lose}")
+        return {
+            "prompt": prompts,
+            "y_w": y_w_list,
+            "y_l": y_l_list,
+        }
+
+    for split in pref_dataset.keys():
+        pref_dataset[split] = pref_dataset[split].map(
+            make_imdb_pref,
+            batched=True,
+            num_proc=args.num_proc,
+        )
+
+    return pref_dataset
