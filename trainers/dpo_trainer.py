@@ -315,7 +315,7 @@ class DPOTrainer():
         assert bs % sub_bs == 0
         
         first = True
-        for i in tqdm.tqdm(range(0, bs, sub_bs), desc="Training with Minibatches", leave=False):
+        for i in range(0, bs, sub_bs):
             queries_ = queries[i : i + sub_bs]
             responses_w_ = responses_w[i : i + sub_bs]
             responses_l_ = responses_l[i : i + sub_bs]
@@ -435,3 +435,39 @@ class DPOTrainer():
                     logs,
                     step=self.current_step if self.config.log_with == "tensorboard" else None,
                 )
+    
+    @torch.no_grad()
+    def eval_win_loss_accuracy(self, eval_dataloader):
+        """
+        Evaluate how often loss(win) < loss(lose) on the eval_pref_dataset.
+        """
+        self.model.eval()
+        total = 0
+        correct = 0
+
+        for batch in eval_dataloader:
+            queries = batch["query"]
+            responses_w = batch["response_w"]
+            responses_l = batch["response_l"]
+
+            q = self.tokenizer(queries, padding=True, truncation=True, return_tensors="pt").input_ids.to(self.current_device)
+            w = self.tokenizer(responses_w, padding=True, truncation=True, return_tensors="pt").input_ids.to(self.current_device)
+            l = self.tokenizer(responses_l, padding=True, truncation=True, return_tensors="pt").input_ids.to(self.current_device)
+
+            input_ids_w = torch.cat((q, w), dim=1)
+            input_ids_l = torch.cat((q, l), dim=1)
+
+            def get_loss(input_ids):
+                logits, _, _ = self.model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
+                logprobs = logprobs_from_logits(logits[:, :-1], input_ids[:, 1:])
+                loss = -logprobs.mean(dim=-1)
+                return loss
+
+            loss_w = get_loss(input_ids_w)
+            loss_l = get_loss(input_ids_l)
+
+            correct += (loss_w < loss_l).sum().item()
+            total += loss_w.shape[0]
+
+        acc = correct / total
+        return acc, total

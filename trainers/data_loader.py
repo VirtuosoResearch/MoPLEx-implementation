@@ -126,6 +126,8 @@ def load_data(args):
     pref_dataset = pref_dataset.shuffle(seed=args.seed).select(range(int(len(pref_dataset) * args.downsample_ratio)))
     eval_pref_dataset = eval_pref_dataset.shuffle(seed=args.seed).select(range(int(len(eval_pref_dataset) * args.downsample_ratio)))
 
+    print(f"len(training set): {len(pref_dataset)}\nlen(test set): {len(eval_pref_dataset)}")
+
     def process_dataset(batch):
         new_batch = {}
         new_batch['query'] = batch['prompt']

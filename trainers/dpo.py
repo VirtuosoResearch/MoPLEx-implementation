@@ -239,7 +239,16 @@ def main(args):
             )
 
         trainer.end_of_epoch_step(epoch)
-        save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{num_batches}", epoch, args)
+        acc, total = trainer.eval_win_loss_accuracy(all_eval_dataloaders["eval_pref"])
+        print(f"[Eval] win-loss accuracy = {acc:.4f}, total={total}")
+        trainer.log_stats(
+            stats={"eval_pref/win_loss_accuracy": acc},
+            batch={"query": [], "response_w": [], "response_l": []},
+            rewards=torch.zeros(1),
+            columns_to_log=["query", "response_w", "response_l"],
+        )
+        if epoch % 5==0:
+            save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{num_batches}", epoch, args)
 
 
 if __name__ == "__main__":
