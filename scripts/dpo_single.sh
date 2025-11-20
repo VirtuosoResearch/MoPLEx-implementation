@@ -18,13 +18,12 @@ dryrun=false
 debug=false
 lr=1e-7
 beta=0.05
-gradient_accumulation_steps=4
-batch_size=4
+gradient_accumulation_steps=2
+batch_size=2
 mini_batch_size=1
 downsample_ratio=0.01
-epoch=10
+epoch=500
 
-data_min='Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength'
 ipo_loss=false
 
 if [[ $debug = true ]]; then
@@ -32,9 +31,9 @@ if [[ $debug = true ]]; then
     export WANDB_MODE="dryrun"
 fi
 
-preference_dataset_path=$data_min
+# 'Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength'
+preference_dataset_path="ZHZisZZ/imdb_preference"
 
-dataset_basename=$(basename -- $preference_dataset_path)
 run_name="dpo_${model_name}_bs${batch_size}"
 echo "Running experiment $run_name"
 
