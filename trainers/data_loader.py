@@ -105,7 +105,21 @@ def load_imdb_dataset(args):
 
     return pref_dataset
 
-def data_process(pref_dataset, args):
+def load_data(args):
+    if args.preference_dataset_path.startswith('Asap7772'):
+        pref_dataset_name = os.path.basename(args.preference_dataset_path)
+        pref_dataset = load_dataset(args.preference_dataset_path)
+    if "imdb" in args.preference_dataset_path.lower():
+        pref_dataset_name = os.path.basename(args.preference_dataset_path)
+        pref_dataset = load_imdb_dataset(args)
+    else:
+        pref_dataset_name, pref_dataset = construct_dataset(
+            args=args,
+            num_samples=args.preference_num_samples,
+            concatenate_prompt=False,
+        )
+    print('Loaded dataset', pref_dataset_name)
+
     pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
     remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
 

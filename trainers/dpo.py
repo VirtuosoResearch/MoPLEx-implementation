@@ -32,10 +32,11 @@ from tqdm import tqdm
 import wandb
 from trainers.utils import (
     logprobs_from_logits,
-    entropy_from_logits
+    entropy_from_logits,
+    save_model
 )
 import argparse
-from trainers.data_loader import get_dataset, construct_dataset, load_imdb_dataset, data_process, generation_kwargs, load_model
+from trainers.data_loader import get_dataset, load_data, generation_kwargs, load_model
 
 PROMPT_TOKEN = '<|prompter|>'
 ASSISTANT_TOKEN = '<|assistant|>'
@@ -50,21 +51,7 @@ def main(args):
 
     batch_size_online_data = 0
 
-    if args.preference_dataset_path.startswith('Asap7772'):
-        pref_dataset_name = os.path.basename(args.preference_dataset_path)
-        pref_dataset = load_dataset(args.preference_dataset_path)
-    if "imdb" in args.preference_dataset_path.lower():
-        pref_dataset_name = os.path.basename(args.preference_dataset_path)
-        pref_dataset = load_imdb_dataset(args)
-    else:
-        pref_dataset_name, pref_dataset = construct_dataset(
-            args=args,
-            num_samples=args.preference_num_samples,
-            concatenate_prompt=False,
-        )
-    print('Loaded dataset', pref_dataset_name)
-
-    pref_dataset_dataloader, all_eval_dataloaders = data_process(pref_dataset, args)
+    pref_dataset_dataloader, all_eval_dataloaders = load_data(args)
 
     unique_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S.%f") + '-' + str(np.random.randint(100000))
     wandb_output_dir = tempfile.mkdtemp(dir=args.cache_dir)
@@ -125,39 +112,6 @@ def main(args):
         empty_cache()
         return func
 
-    def save_model(checkpoint_dir, epoch_num, add_prefix=True):
-        if add_prefix:
-            checkpoint_dir = os.path.join(output_dir, checkpoint_dir)
-            os.makedirs(checkpoint_dir, exist_ok=True)
-
-        if trainer.accelerator.is_main_process:
-            unwrapped = trainer.accelerator.unwrap_model(model)
-
-            if getattr(unwrapped, "is_peft_model", False) or getattr(unwrapped.pretrained_model, "is_peft_model", False):
-                peft_like = unwrapped if getattr(unwrapped, "is_peft_model", False) else unwrapped.pretrained_model
-
-                if args.lora_merge_on_save:
-                    merged = peft_like.merge_and_unload()
-                    merged.save_pretrained(
-                        checkpoint_dir,
-                        save_function=trainer.accelerator.save,
-                        is_main_process=trainer.accelerator.is_main_process,
-                        state_dict=trainer.accelerator.get_state_dict(merged),
-                    )
-                else: peft_like.save_pretrained(checkpoint_dir)
-            else:
-                unwrapped.save_pretrained(
-                    checkpoint_dir,
-                    save_function=trainer.accelerator.save,
-                    is_main_process=trainer.accelerator.is_main_process,
-                    state_dict=trainer.accelerator.get_state_dict(model),
-                )
-
-            if trainer.accelerator.is_main_process:
-                tokenizer.save_pretrained(checkpoint_dir)
-            trainer.accelerator.print(f"Checkpointing Epoch {epoch_num} -> {checkpoint_dir}")
-
-
     @empty_cache_decorator
     @torch.no_grad()
     def process_pref_batch(pref_batch):
@@ -181,10 +135,8 @@ def main(args):
     def process_input_ids(input_ids):
         input_data = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
         logits, _, _ = trainer.model(**input_data)
-
         old_logits, _, _ = trainer.ref_model(**input_data)
         old_logprobs = logprobs_from_logits(old_logits[:, :-1, :], input_ids[:, 1:])
-
         logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
         entropy = entropy_from_logits(logits)
 
@@ -246,7 +198,6 @@ def main(args):
                         all_to_log[k] = (all_to_log.get(k, []) + [x.cpu().numpy().item() if isinstance(x, torch.Tensor) else x for x in eval_batch[k]])
                     del eval_batch, query_tensors, response_tensors
                     empty_cache()
-
                     stats[f"{eval_name}/entropy"] = entropy.mean().item()
                     stats[f"{eval_name}/logprobs"] = logprobs.mean().item() # policy model
                     stats[f"{eval_name}/old_logprobs"] = old_logprobs.mean().item() # reference model
@@ -277,7 +228,7 @@ def main(args):
 
             if stats['total_iterations'] % args.save_every_steps == 0:
                 num_batches = stats['total_iterations']
-                save_model(model_name + f"_num_batches_{num_batches}", epoch)
+                save_model(trainer, output_dir, model, tokenizer, model_name + f"_num_batches_{num_batches}", epoch, args)
 
             total_iterations += 1
             trainer.log_stats(
@@ -288,7 +239,7 @@ def main(args):
             )
 
         trainer.end_of_epoch_step(epoch)
-        save_model(model_name + f"_epoch_{epoch}", epoch)
+        save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{num_batches}", epoch, args)
 
 
 if __name__ == "__main__":

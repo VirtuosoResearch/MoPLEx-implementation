@@ -27,6 +27,38 @@ LAYER_PATTERNS = [
     "model.layers.{layer}",
 ]
 
+def save_model(trainer, output_dir, model, tokenizer, checkpoint_dir, epoch_num, args, add_prefix=True):
+    if add_prefix:
+        checkpoint_dir = os.path.join(output_dir, checkpoint_dir)
+        os.makedirs(checkpoint_dir, exist_ok=True)
+
+    if trainer.accelerator.is_main_process:
+        unwrapped = trainer.accelerator.unwrap_model(model)
+
+        if getattr(unwrapped, "is_peft_model", False) or getattr(unwrapped.pretrained_model, "is_peft_model", False):
+            peft_like = unwrapped if getattr(unwrapped, "is_peft_model", False) else unwrapped.pretrained_model
+
+            if args.lora_merge_on_save:
+                merged = peft_like.merge_and_unload()
+                merged.save_pretrained(
+                    checkpoint_dir,
+                    save_function=trainer.accelerator.save,
+                    is_main_process=trainer.accelerator.is_main_process,
+                    state_dict=trainer.accelerator.get_state_dict(merged),
+                )
+            else: peft_like.save_pretrained(checkpoint_dir)
+        else:
+            unwrapped.save_pretrained(
+                checkpoint_dir,
+                save_function=trainer.accelerator.save,
+                is_main_process=trainer.accelerator.is_main_process,
+                state_dict=trainer.accelerator.get_state_dict(model),
+            )
+
+        if trainer.accelerator.is_main_process:
+            tokenizer.save_pretrained(checkpoint_dir)
+        trainer.accelerator.print(f"Checkpointing Epoch {epoch_num} -> {checkpoint_dir}")
+
 
 def create_reference_model(
     model: PreTrainedModelWrapper, num_shared_layers: int = None, pattern: str = None
