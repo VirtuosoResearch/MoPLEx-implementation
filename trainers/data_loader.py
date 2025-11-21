@@ -109,7 +109,7 @@ def load_data(args):
     if args.preference_dataset_path.startswith('Asap7772'):
         pref_dataset_name = os.path.basename(args.preference_dataset_path)
         pref_dataset = load_dataset(args.preference_dataset_path)
-    if "imdb" in args.preference_dataset_path.lower():
+    elif "imdb" in args.preference_dataset_path.lower():
         pref_dataset_name = os.path.basename(args.preference_dataset_path)
         pref_dataset = load_imdb_dataset(args)
     else:

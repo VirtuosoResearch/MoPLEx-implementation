@@ -195,111 +195,95 @@ class DPOTrainer():
             return dataset
         else:
             return dataset.remove_columns(ignored_columns)
-
+        
     def _step(
         self,
         queries: torch.LongTensor,
         responses_w: torch.LongTensor,
         responses_l: torch.LongTensor,
-        return_stats: bool = False,
-        preference_mask: Optional[torch.BoolTensor] = None, # (bs,)
-    ):  
-        input_ids_w = torch.cat((queries, responses_w), dim=1)
-        input_ids_l = torch.cat((queries, responses_l), dim=1)
+        preference_mask: Optional[torch.BoolTensor] = None,  # (bs,)
+    ):
 
-        # mask out query tokens, keep response tokens. Remove last token from response tokens.
-        mask_w = torch.cat((torch.zeros_like(queries), torch.ones_like(responses_w)), dim=1)[:,:-1]
-        mask_l = torch.cat((torch.zeros_like(queries), torch.ones_like(responses_l)), dim=1)[:,:-1]
-        assert mask_w.shape == mask_l.shape, f"mask_w and mask_l should have the same shape, {mask_w.shape}, {mask_l.shape}."
-        mask = mask_w
-        
-        # handle preference mask
-        if preference_mask is not None:
-            preference_mask = preference_mask.unsqueeze(1).repeat(1, mask.shape[1])
-            preference_mask = preference_mask.to(mask.dtype)
-            preference_mask = preference_mask.to(mask.device)
-            assert preference_mask.shape == mask.shape, f"preference_mask and mask should have the same shape, {preference_mask.shape}, {mask.shape}."
-            mask = mask * preference_mask
-        
+        input_ids_w = torch.cat((queries, responses_w), dim=1)  # [B, Lq+Lw]
+        input_ids_l = torch.cat((queries, responses_l), dim=1)  # [B, Lq+Ll]
+        pad_id = self.tokenizer.pad_token_id
+
         def process_input_ids(input_ids):
-            
-            input_data = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
+            # attention_mask: pad=0, others=1
+            attention_mask = (input_ids != pad_id).long()  # [B, L]
+            input_data = {"input_ids": input_ids, "attention_mask": attention_mask}
+
             logits, _, _ = self.model(**input_data)
             with torch.no_grad():
                 old_logits, _, _ = self.ref_model(**input_data)
-                old_logprobs = logprobs_from_logits(old_logits[:, :-1, :], input_ids[:, 1:])
+                old_logprobs = logprobs_from_logits(old_logits[:, :-1, :], input_ids[:, 1:])  # [B, L-1]
+            logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])  # [B, L-1]
+            attn_mask_shifted = attention_mask[:, 1:]  # [B, L-1]
 
-            logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
-            entropy = entropy_from_logits(logits)
-            return logprobs, old_logprobs, entropy, logits
-    
-        logprobs_w, old_logprobs_w, entropy_w, logits_w = process_input_ids(input_ids_w)
-        logprobs_l, old_logprobs_l, entropy_l, logits_l = process_input_ids(input_ids_l)
-        
-        # compute dpo loss
-        pi_logratios = logprobs_w - logprobs_l
-        ref_logratios = old_logprobs_w - old_logprobs_l
-        dpo_logit = self.config.temperature * (pi_logratios - ref_logratios) # temperature is the beta in formula
+            return logprobs, old_logprobs, attn_mask_shifted
+
+        logprobs_w, old_logprobs_w, attn_shift_w = process_input_ids(input_ids_w)
+        logprobs_l, old_logprobs_l, attn_shift_l = process_input_ids(input_ids_l)
+
+        q_len = queries.size(1)
+        mask_w = attn_shift_w.clone()  # [B, L-1]
+        mask_l = attn_shift_l.clone()
+        if q_len > 1:
+            mask_w[:, :q_len - 1] = 0
+            mask_l[:, :q_len - 1] = 0
+
+        if preference_mask is not None:
+            sample_mask = preference_mask.to(logprobs_w.device).float()  # [B]
+        else:
+            sample_mask = torch.ones(logprobs_w.size(0), device=logprobs_w.device)
+
+        seq_logprob_w = (logprobs_w * mask_w).sum(dim=1)          # [B]
+        seq_logprob_l = (logprobs_l * mask_l).sum(dim=1)          # [B]
+        seq_old_logprob_w = (old_logprobs_w * mask_w).sum(dim=1)  # [B]
+        seq_old_logprob_l = (old_logprobs_l * mask_l).sum(dim=1)  # [B]
+
+        pi_logratios_seq = seq_logprob_w - seq_logprob_l               # [B]
+        ref_logratios_seq = seq_old_logprob_w - seq_old_logprob_l      # [B]
+
+        dpo_logit_seq = self.config.temperature * (pi_logratios_seq - ref_logratios_seq)  # [B]
 
         if self.config.ipo_loss:
-            dpo_loss = (dpo_logit - 1/(2 *self.config.temperature))**2
-            dpo_loss = masked_mean(dpo_loss, mask)
+            dpo_loss_vec = (dpo_logit_seq - 1.0 / (2 * self.config.temperature)) ** 2  # [B]
         else:
-            dpo_loss = -F.logsigmoid(dpo_logit)
-            dpo_loss = masked_mean(dpo_loss, mask)
-        
-        logprobs=torch.cat((logprobs_w, logprobs_l), dim=0)
-        old_logprobs=torch.cat((old_logprobs_w, old_logprobs_l), dim=0)
-        
-        rewards = self.config.temperature * (logprobs - old_logprobs).detach()
-        rewards_chosen = self.config.temperature * (logprobs_w - old_logprobs_w).detach()
-        rewards_rejected = self.config.temperature * (logprobs_l - old_logprobs_l).detach()
+            dpo_loss_vec = -F.logsigmoid(dpo_logit_seq)  # [B]
+
+        denom = sample_mask.sum()
+        if denom.item() == 0:
+            dpo_loss = dpo_loss_vec.mean()
+        else:
+            dpo_loss = (dpo_loss_vec * sample_mask).sum() / denom
+
+        delta_w = seq_logprob_w - seq_old_logprob_w  # [B]
+        delta_l = seq_logprob_l - seq_old_logprob_l  # [B]
+
+        rewards_chosen = self.config.temperature * delta_w.detach()
+        rewards_rejected = self.config.temperature * delta_l.detach()
         reward_margin = rewards_chosen - rewards_rejected
 
-        logits=torch.cat((logits_w, logits_l), dim=0)
-        entropy=entropy_from_logits(logits)
-        
-        cat_mask = torch.cat((mask, mask), dim=0)
-        approxkl = 0.5 * masked_mean((logprobs - old_logprobs) ** 2, cat_mask)
-        policykl = masked_mean(logprobs - old_logprobs, cat_mask)
-        
-        sequence_approxkl = 0.5 * masked_mean_sum((logprobs - old_logprobs) ** 2, cat_mask)
-        sequence_policykl = masked_mean_sum(logprobs - old_logprobs, cat_mask)
-        
-        if return_stats:
-            stats = dict(
-                loss=dict(
-                    dpo_loss=dpo_loss.detach(),
-                ),
-                policy=dict(
-                    entropy=entropy.detach(),
-                    entropy_w=entropy_w.detach(),
-                    entropy_l=entropy_l.detach(),
-                    approxkl=approxkl.detach(),
-                    policykl=policykl.detach(),
-                    sequence_approxkl=sequence_approxkl.detach(),
-                    sequence_policykl=sequence_policykl.detach(),
-                    rewards_mean=torch.mean(rewards).detach(),
-                    rewards_std=torch.std(rewards).detach(),
-                    rewards_dist=rewards.detach(),
-                    rewards_chosen=torch.mean(rewards_chosen).detach(),
-                    rewards_rejected=torch.mean(rewards_rejected).detach(),
-                    reward_margin=torch.mean(reward_margin).detach(),
-                    logprobs_w=torch.mean(logprobs_w).detach(),
-                    logprobs_l=torch.mean(logprobs_l).detach(),
-                    old_logprobs_w=torch.mean(old_logprobs_w).detach(),
-                    old_logprobs_l=torch.mean(old_logprobs_l).detach(),
-                    pi_logratios=torch.mean(pi_logratios).detach(),
-                    ref_logratios=torch.mean(ref_logratios).detach(),
-                    dpo_logit_mean=torch.mean(dpo_logit).detach(),
-                    dpo_logit_std=torch.std(dpo_logit).detach(),
-                    dpo_logit_dist=dpo_logit.detach(),
-                    classifier_accuracy = torch.mean((reward_margin > 0).float()).detach()
-                )
-            )
-            return dpo_loss, flatten_dict(stats)
-        else:
-            return dpo_loss
+        stats = dict(
+            loss=dict(
+                dpo_loss=dpo_loss.detach(),
+            ),
+            policy=dict(
+                rewards_chosen=rewards_chosen.mean().detach(),
+                rewards_rejected=rewards_rejected.mean().detach(),
+                reward_margin=reward_margin.mean().detach(),
+                logprobs_w=seq_logprob_w.mean().detach(),
+                logprobs_l=seq_logprob_l.mean().detach(),
+                old_logprobs_w=seq_old_logprob_w.mean().detach(),
+                old_logprobs_l=seq_old_logprob_l.mean().detach(),
+                # pi_logratios=pi_logratios_seq.mean().detach(),
+                # ref_logratios=ref_logratios_seq.mean().detach(),
+                dpo_logit_mean=dpo_logit_seq.mean().detach(),
+                classifier_accuracy=(reward_margin > 0).float().mean().detach(),
+            ),
+        )
+        return dpo_loss, flatten_dict(stats)
     
     def step(
         self,
@@ -314,7 +298,6 @@ class DPOTrainer():
         sub_bs = self.config.mini_batch_size
         assert bs % sub_bs == 0
         
-        first = True
         for i in range(0, bs, sub_bs):
             queries_ = queries[i : i + sub_bs]
             responses_w_ = responses_w[i : i + sub_bs]
@@ -325,7 +308,6 @@ class DPOTrainer():
                 queries=queries_,
                 responses_w=responses_w_,
                 responses_l=responses_l_,
-                return_stats=True,
                 preference_mask=preference_mask_,
             )
             
@@ -426,10 +408,6 @@ class DPOTrainer():
                 for k, v in logs.items():
                     if isinstance(v, torch.Tensor) and v.dtype == torch.bfloat16:
                         logs[k] = v.float()
-
-                logs["dataset/reward_mean"] = torch.mean(rewards).cpu().numpy().item()
-                logs["dataset/reward_std"] = torch.std(rewards).cpu().numpy().item()
-                logs["dataset/reward_dist"] = rewards.cpu().numpy()
 
                 self.accelerator.log(
                     logs,

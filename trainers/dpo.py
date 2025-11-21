@@ -250,7 +250,6 @@ def main(args):
         if epoch % 5==0:
             save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{num_batches}", epoch, args)
 
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--wandb_project', type=str, default='reweighted_bc', help='the wandb project name')
