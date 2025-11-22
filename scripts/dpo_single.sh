@@ -1,6 +1,6 @@
 cache_dir="cache"
-wandb_project="dpo"
-model_name="Qwen/Qwen3-0.6B"
+wandb_project="dpo_motivation"
+model_name="Qwen/Qwen3-4B"
 output_dir='outputs'
 
 export WANDB_PROJECT=$wandb_project
@@ -19,10 +19,10 @@ debug=false
 lr=1e-7
 beta=0.05
 gradient_accumulation_steps=2
-batch_size=2
+batch_size=4
 mini_batch_size=1
 downsample_ratio=0.01
-epoch=500
+num_train_epochs=100
 
 ipo_loss=false
 
@@ -31,8 +31,9 @@ if [[ $debug = true ]]; then
     export WANDB_MODE="dryrun"
 fi
 
+# "ZHZisZZ/imdb_preference"
 # 'Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength'
-preference_dataset_path="ZHZisZZ/imdb_preference"
+preference_dataset_path='Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength'
 
 run_name="dpo_${model_name}_bs${batch_size}"
 echo "Running experiment $run_name"
@@ -50,7 +51,8 @@ command="python -m trainers.dpo \
     --learning_rate $lr \
     --output_dir $output_dir \
     --downsample_ratio $downsample_ratio \
-    --num_train_epochs $epoch \
+    --num_train_epochs $num_train_epochs \
+    --use_lora True
 "
 
 if [[ $ipo_loss = true ]]; then
