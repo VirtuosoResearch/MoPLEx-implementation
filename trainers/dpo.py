@@ -152,9 +152,7 @@ def main(args):
             empty_cache()
 
             stats = {}
-
             pref_batch, pref_query_tensors, pref_response_w_tensors, pref_response_l_tensors = process_pref_batch(pref_batch)
-
             output_batch = {k: pref_batch[k] for k in columns_to_log}
             # Trainer step
             train_stats = trainer.step(queries=pref_query_tensors, responses_w=pref_response_w_tensors, responses_l=pref_response_l_tensors)
@@ -182,6 +180,7 @@ def main(args):
 
         trainer.end_of_epoch_step(epoch)
         
+        # Evaluation step
         eval_metrics = trainer.evaluate(all_eval_dataloaders["eval_pref"])
         print(f"[Eval] evaluation : {eval_metrics}")
         trainer.log_stats(
@@ -191,7 +190,7 @@ def main(args):
             columns_to_log=["query", "response_w", "response_l"],
         )
         if epoch % 5==4:
-            save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{num_batches}", epoch, args)
+            save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{epoch}", epoch, args)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

@@ -1,6 +1,6 @@
 cache_dir="cache"
 wandb_project="dpo"
-model_name="Qwen/Qwen3-0.6B"
+model_name="Qwen/Qwen3-4B"
 output_dir='outputs'
 
 export WANDB_PROJECT=$wandb_project
@@ -12,6 +12,7 @@ export WANDB_DATA_DIR="./cache"
 export WANDB_CACHE_DIR="./cache"
 export WANDB_TEMP="./cache/tmp"
 export HF_DATASETS_CACHE=$cache_dir
+export CUDA_VISIBLE_DEVICES=0,1
 
 which_exp=${1:--1}
 dryrun=false
