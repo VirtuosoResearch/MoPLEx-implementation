@@ -150,10 +150,10 @@ def main(args):
     for epoch in tqdm(range(args.num_train_epochs), desc="Epochs"):
         for sub_iteration, pref_batch in tqdm(enumerate(pref_dataset_dataloader), desc="Batches", total=len(pref_dataset_dataloader)):
             empty_cache()
-
             stats = {}
             pref_batch, pref_query_tensors, pref_response_w_tensors, pref_response_l_tensors = process_pref_batch(pref_batch)
             output_batch = {k: pref_batch[k] for k in columns_to_log}
+
             # Trainer step
             train_stats = trainer.step(queries=pref_query_tensors, responses_w=pref_response_w_tensors, responses_l=pref_response_l_tensors)
             for key in train_stats:
@@ -166,10 +166,6 @@ def main(args):
             stats['total_iterations'] = total_iterations
             stats['gradient_steps'] = total_iterations * args.inner_iteration_steps
 
-            if stats['total_iterations'] % args.save_every_steps == 0:
-                num_batches = stats['total_iterations']
-                save_model(trainer, output_dir, model, tokenizer, model_name + f"_num_batches_{num_batches}", epoch, args)
-
             total_iterations += 1
             trainer.log_stats(
                 stats=stats,
@@ -177,7 +173,6 @@ def main(args):
                 rewards=rewards,
                 columns_to_log=columns_to_log
             )
-
         trainer.end_of_epoch_step(epoch)
         
         # Evaluation step
@@ -189,7 +184,7 @@ def main(args):
             rewards=torch.zeros(1),
             columns_to_log=["query", "response_w", "response_l"],
         )
-        if epoch % 5==4:
+        if epoch % 5==0:
             save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{epoch}", epoch, args)
 
 if __name__ == "__main__":
