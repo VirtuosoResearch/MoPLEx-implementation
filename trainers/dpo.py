@@ -142,74 +142,16 @@ def main(args):
 
         return logprobs, old_logprobs, entropy, logits
 
-    @empty_cache_decorator
-    @torch.no_grad()
-    def process_batch_dpo(batch):
-        query_tensors = tokenizer(batch["query"], padding='max_length' if args.use_tpu else True, truncation=True, max_length=128, return_tensors='pt')
-        query_tensors = accelerate.utils.send_to_device(query_tensors, trainer.accelerator.device)
-
-        # Get generations from SFTModel (including prompt)
-        all_generation_tokens = []
-        for _ in range(args.num_actions_per_prompt):  # generate multiple completions per prompt
-            if query_tensors.input_ids.shape[0] > args.max_gen_batch_size:
-                generation_tokens = []
-                for i in tqdm(range(0, query_tensors.input_ids.shape[0], args.max_gen_batch_size), desc=f"Generating for epoch {epoch}"):
-                    generation_tokens.append(trainer.accelerator.unwrap_model(trainer.model).generate(**query_tensors[i:i + args.max_gen_batch_size], **generation_kwargs))
-                    torch.cuda.empty_cache()
-                generation_tokens = torch.cat(generation_tokens, dim=0)
-            else:
-                generation_tokens = trainer.accelerator.unwrap_model(trainer.model).generate(**query_tensors, **generation_kwargs)
-            all_generation_tokens.append(generation_tokens)
-        all_generation_tokens = torch.cat(all_generation_tokens, dim=0)
-
-        logprobs, old_logprobs, entropy, logits = process_input_ids(all_generation_tokens)
-        texts = tokenizer.batch_decode(all_generation_tokens, skip_special_tokens=True)
-        batch["response"] = [x.split(ASSISTANT_TOKEN)[-1] for x in texts]
-
-        response_tensors = tokenizer(batch["response"], padding='max_length' if args.use_tpu else True, truncation=True, max_length=generation_kwargs['max_new_tokens'], return_tensors='pt').input_ids
-        response_tensors = accelerate.utils.send_to_device(response_tensors, trainer.accelerator.device)
-
-        query_tensors = query_tensors.input_ids
-        # Ensure query and response tensors are same length
-        query_tensors = query_tensors.repeat(args.num_actions_per_prompt, 0)
-        assert query_tensors.shape[0] == response_tensors.shape[0], f"query_tensors.shape[0] = {query_tensors.shape[0]} != response_tensors.shape[0] = {response_tensors.shape[0]}"
-        batch["query"] = batch["query"] * args.num_actions_per_prompt
-
-        return batch, query_tensors, response_tensors, logprobs, old_logprobs, entropy, logits
 
     print("Starting training")
     total_iterations = 0
     columns_to_log = ["query", "response_w", "response_l"]
-    columns_to_log_eval = ["query", "response"]
 
     for epoch in tqdm(range(args.num_train_epochs), desc="Epochs"):
         for sub_iteration, pref_batch in tqdm(enumerate(pref_dataset_dataloader), desc="Batches", total=len(pref_dataset_dataloader)):
             empty_cache()
 
             stats = {}
-            if total_iterations % args.eval_every_steps == 0:
-                # Eval
-                for eval_name, eval_dataloader in all_eval_dataloaders.items():
-                    print(f"Running evaluation on {eval_name}")
-                    eval_batch = next(iter(eval_dataloader))
-                    eval_batch, query_tensors, response_tensors, logprobs, old_logprobs, entropy, logits = process_batch_dpo(eval_batch)
-                    all_to_log = {}
-                    for k in columns_to_log_eval:
-                        all_to_log[k] = (all_to_log.get(k, []) + [x.cpu().numpy().item() if isinstance(x, torch.Tensor) else x for x in eval_batch[k]])
-                    del eval_batch, query_tensors, response_tensors
-                    empty_cache()
-                    stats[f"{eval_name}/entropy"] = entropy.mean().item()
-                    stats[f"{eval_name}/logprobs"] = logprobs.mean().item() # policy model
-                    stats[f"{eval_name}/old_logprobs"] = old_logprobs.mean().item() # reference model
-                    stats[f"{eval_name}/approxkl"] = (0.5 * ((logprobs - old_logprobs) ** 2).mean()).item()
-                    stats[f"{eval_name}/policykl"] = (logprobs - old_logprobs).mean().item()
-                    stats[f"{eval_name}/sequence_approxkl"] = (0.5 * ((logprobs - old_logprobs) ** 2)).sum(-1).mean().item()
-                    stats[f"{eval_name}/sequence_policykl"] = (logprobs - old_logprobs).sum(-1).mean().item()
-                    # log table of completions
-                    table_rows = list(r for r in zip(*[all_to_log[col] for col in columns_to_log_eval]))
-                    stats[f"{eval_name}/table"] = wandb.Table(columns=[*columns_to_log_eval], rows=table_rows)
-
-                empty_cache()
 
             pref_batch, pref_query_tensors, pref_response_w_tensors, pref_response_l_tensors = process_pref_batch(pref_batch)
 
@@ -239,15 +181,16 @@ def main(args):
             )
 
         trainer.end_of_epoch_step(epoch)
-        acc, total = trainer.eval_win_loss_accuracy(all_eval_dataloaders["eval_pref"])
-        print(f"[Eval] win-loss accuracy = {acc:.4f}, total={total}")
+        
+        eval_metrics = trainer.evaluate(all_eval_dataloaders["eval_pref"])
+        print(f"[Eval] evaluation : {eval_metrics}")
         trainer.log_stats(
-            stats={"eval_pref/win_loss_accuracy": acc},
+            stats=eval_metrics,
             batch={"query": [], "response_w": [], "response_l": []},
             rewards=torch.zeros(1),
             columns_to_log=["query", "response_w", "response_l"],
         )
-        if epoch % 5==0:
+        if epoch % 5==4:
             save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{num_batches}", epoch, args)
 
 if __name__ == "__main__":

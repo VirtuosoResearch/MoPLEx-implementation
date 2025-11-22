@@ -275,10 +275,6 @@ class DPOTrainer():
                 reward_margin=reward_margin.mean().detach(),
                 logprobs_w=seq_logprob_w.mean().detach(),
                 logprobs_l=seq_logprob_l.mean().detach(),
-                old_logprobs_w=seq_old_logprob_w.mean().detach(),
-                old_logprobs_l=seq_old_logprob_l.mean().detach(),
-                # pi_logratios=pi_logratios_seq.mean().detach(),
-                # ref_logratios=ref_logratios_seq.mean().detach(),
                 dpo_logit_mean=dpo_logit_seq.mean().detach(),
                 classifier_accuracy=(reward_margin > 0).float().mean().detach(),
             ),
@@ -415,37 +411,71 @@ class DPOTrainer():
                 )
     
     @torch.no_grad()
-    def eval_win_loss_accuracy(self, eval_dataloader):
-        """
-        Evaluate how often loss(win) < loss(lose) on the eval_pref_dataset.
-        """
+    def evaluate(self, eval_dataloader):
         self.model.eval()
-        total = 0
-        correct = 0
+        self.ref_model.eval()
+
+        total_loss = 0.0
+        total_acc = 0.0
+        total_examples = 0
 
         for batch in eval_dataloader:
-            queries = batch["query"]
-            responses_w = batch["response_w"]
-            responses_l = batch["response_l"]
+            preference_mask = batch.get("preference_mask", None)
 
-            q = self.tokenizer(queries, padding=True, truncation=True, return_tensors="pt").input_ids.to(self.current_device)
-            w = self.tokenizer(responses_w, padding=True, truncation=True, return_tensors="pt").input_ids.to(self.current_device)
-            l = self.tokenizer(responses_l, padding=True, truncation=True, return_tensors="pt").input_ids.to(self.current_device)
+            if isinstance(batch["query"], list) or isinstance(batch["query"], tuple):
+                queries = self.tokenizer(
+                    batch["query"],
+                    padding=True,
+                    truncation=True,
+                    max_length=128,
+                    return_tensors="pt",
+                ).input_ids.to(self.current_device)
 
-            input_ids_w = torch.cat((q, w), dim=1)
-            input_ids_l = torch.cat((q, l), dim=1)
+                all_pref = batch["response_w"] + batch["response_l"]
+                tokenized = self.tokenizer(
+                    all_pref,
+                    padding=True,
+                    truncation=True,
+                    max_length=256,
+                    return_tensors="pt",
+                ).input_ids.to(self.current_device)
 
-            def get_loss(input_ids):
-                logits, _, _ = self.model(input_ids=input_ids, attention_mask=torch.ones_like(input_ids))
-                logprobs = logprobs_from_logits(logits[:, :-1], input_ids[:, 1:])
-                loss = -logprobs.mean(dim=-1)
-                return loss
+                n_w = len(batch["response_w"])
+                responses_w = tokenized[:n_w]
+                responses_l = tokenized[n_w:]
 
-            loss_w = get_loss(input_ids_w)
-            loss_l = get_loss(input_ids_l)
+                if preference_mask is not None:
+                    preference_mask = torch.as_tensor(preference_mask, device=self.current_device)
+            else:
+                queries = batch["query"].to(self.current_device)
+                responses_w = batch["response_w"].to(self.current_device)
+                responses_l = batch["response_l"].to(self.current_device)
+                if preference_mask is not None:
+                    preference_mask = preference_mask.to(self.current_device)
 
-            correct += (loss_w < loss_l).sum().item()
-            total += loss_w.shape[0]
+            loss, stats = self._step(
+                queries=queries,
+                responses_w=responses_w,
+                responses_l=responses_l,
+                preference_mask=preference_mask,
+            )
 
-        acc = correct / total
-        return acc, total
+            batch_size = queries.size(0)
+            total_examples += batch_size
+
+            total_loss += loss.item() * batch_size
+            batch_acc = stats["policy/classifier_accuracy"].item()
+            total_acc += batch_acc * batch_size
+
+        if total_examples == 0:
+            mean_loss = 0.0
+            mean_acc = 0.0
+        else:
+            mean_loss = total_loss / total_examples
+            mean_acc = total_acc / total_examples
+
+        metrics = {
+            "eval/dpo_loss": mean_loss,
+            "eval/classification_accuracy": mean_acc,
+        }
+        return metrics
