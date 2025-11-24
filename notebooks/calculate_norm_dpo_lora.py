@@ -3,8 +3,8 @@ import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 
-model_name = "Qwen/Qwen3-0.6B"
-ckpt_root = "/home/michael/project/Preference-tuning-and-evaluation/outputs/dpo/dpo_Qwen/Qwen3-0.6B_bs4_lora"
+model_name = "meta-llama/Llama-3.2-3B"
+ckpt_root = "/home/michael/project/Preference-tuning-and-evaluation/outputs/dpo_motivation/dpo_meta-llama/Llama-3.2-3B_bs4_lora"
 
 tokenizer = AutoTokenizer.from_pretrained(model_name)
 tokenizer.add_special_tokens({"pad_token": "<|padding|>"})
@@ -43,8 +43,8 @@ raw_policy = build_base()
 raw_norm = l2_params(raw_policy)
 print("raw_policy (||θ_base||):", raw_norm)
 
-for i in range(0, 9):
-    ckpt = os.path.join(ckpt_root, f"Qwen3-0.6B_epoch_{i}")
+for i in range(0, 15, 5):
+    ckpt = os.path.join(ckpt_root, f"{model_name.split('/')[-1]}_epoch_{i}")
     if not os.path.isdir(ckpt):
         print(f"[skip] {ckpt}")
         continue
