@@ -12,6 +12,7 @@ export WANDB_DATA_DIR="./cache"
 export WANDB_CACHE_DIR="./cache"
 export WANDB_TEMP="./cache/tmp"
 export HF_DATASETS_CACHE=$cache_dir
+export CUDA_VISIBLE_DEVICES=0,1
 
 which_exp=${1:--1}
 dryrun=false
