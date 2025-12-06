@@ -1,6 +1,6 @@
 cache_dir="cache"
 wandb_project="dpo_motivation"
-model_name="Qwen/Qwen3-4B"
+model_name="meta-llama/Llama-3.2-3B"
 output_dir='outputs'
 
 export WANDB_PROJECT=$wandb_project
