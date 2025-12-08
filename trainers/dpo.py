@@ -130,18 +130,6 @@ def main(args):
 
         return pref_batch, pref_query_tensors, pref_response_w_tensors, pref_response_l_tensors
 
-    @empty_cache_decorator
-    @torch.no_grad()
-    def process_input_ids(input_ids):
-        input_data = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
-        logits, _, _ = trainer.model(**input_data)
-        old_logits, _, _ = trainer.ref_model(**input_data)
-        old_logprobs = logprobs_from_logits(old_logits[:, :-1, :], input_ids[:, 1:])
-        logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
-        entropy = entropy_from_logits(logits)
-
-        return logprobs, old_logprobs, entropy, logits
-
 
     print("Starting training")
     total_iterations = 0

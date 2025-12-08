@@ -122,6 +122,32 @@ class ApproxDPOTrainer():
         self.current_device = self.accelerator.device
         self.running = RunningMoments(self.accelerator)
 
+    def _set_signature_columns_if_needed(self):
+        if self._signature_columns is None:
+            signature = inspect.signature(self.model.forward)
+            self._signature_columns = list(signature.parameters.keys())
+            self._signature_columns += ["label", "query", "response"]
+
+    def _remove_unused_columns(self, dataset: "Dataset"):
+        if not self.config.remove_unused_columns:
+            return dataset
+        self._set_signature_columns_if_needed()
+        signature_columns = self._signature_columns
+
+        ignored_columns = list(set(dataset.column_names) - set(signature_columns))
+
+        columns = [k for k in signature_columns if k in dataset.column_names]
+
+        if version.parse(datasets.__version__) < version.parse("1.4.0"):
+            dataset.set_format(
+                type=dataset.format["type"],
+                columns=columns,
+                format_kwargs=dataset.format["format_kwargs"],
+            )
+            return dataset
+        else:
+            return dataset.remove_columns(ignored_columns)
+
     def prepare_dataloader(self, dataset: Union[torch.utils.data.Dataset, Dataset], data_collator=None):
         if isinstance(dataset, Dataset):
             dataset = self._remove_unused_columns(dataset)
@@ -142,49 +168,64 @@ class ApproxDPOTrainer():
         return_stats: bool = False,
         preference_mask: Optional[torch.BoolTensor] = None,
     ):  
-        input_ids_w = torch.cat((queries, responses_w), dim=1)
-        input_ids_l = torch.cat((queries, responses_l), dim=1)
-        mask_w = torch.cat((torch.zeros_like(queries), torch.ones_like(responses_w)), dim=1)[:, :-1]
-        mask_l = torch.cat((torch.zeros_like(queries), torch.ones_like(responses_l)), dim=1)[:, :-1]
-        mask = torch.cat((mask_w, mask_l), dim=0)
-        if preference_mask is not None:
-            preference_mask = preference_mask.unsqueeze(1).repeat(1, mask.shape[1])
-            mask = mask * preference_mask.to(mask.dtype).to(mask.device)
+        input_ids_w = torch.cat((queries, responses_w), dim=1)  # [B, Lq+Lw]
+        input_ids_l = torch.cat((queries, responses_l), dim=1)  # [B, Lq+Ll]
+        pad_id = self.tokenizer.pad_token_id
 
         def process_input_ids(input_ids):
-            input_data = {"input_ids": input_ids, "attention_mask": torch.ones_like(input_ids)}
+            # attention_mask: pad=0, others=1
+            attention_mask = (input_ids != pad_id).long()  # [B, L]
+            input_data = {"input_ids": input_ids, "attention_mask": attention_mask}
+
             logits, _, _ = self.model(**input_data)
             with torch.no_grad():
                 old_logits, _, _ = self.ref_model(**input_data)
-                old_logprobs = logprobs_from_logits(old_logits[:, :-1, :], input_ids[:, 1:])
-            logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
+                old_logprobs = logprobs_from_logits(old_logits[:, :-1, :], input_ids[:, 1:])  # [B, L-1]
+            logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])  # [B, L-1]
+            attn_mask_shifted = attention_mask[:, 1:]  # [B, L-1]
             entropy = entropy_from_logits(logits)
-            return logprobs, old_logprobs, entropy, logits
 
-        # Compute logprobs and logits for winners and losers
-        logprobs_w, old_logprobs_w, entropy_w, logits_w = process_input_ids(input_ids_w)
-        logprobs_l, old_logprobs_l, entropy_l, logits_l = process_input_ids(input_ids_l)
+            return logprobs, old_logprobs, attn_mask_shifted, entropy
 
-        # Compute pi_logratios and ref_logratios
-        # TO DO: Save ref_logpratioss for later use
-        pi_logratios = logprobs_w - logprobs_l
-        ref_logratios = old_logprobs_w - old_logprobs_l
+        logprobs_w, old_logprobs_w, attn_shift_w, entropy_w = process_input_ids(input_ids_w)
+        logprobs_l, old_logprobs_l, attn_shift_l, entropy_l = process_input_ids(input_ids_l)
+
+        q_len = queries.size(1)
+        mask_w = attn_shift_w.clone()  # [B, L-1]
+        mask_l = attn_shift_l.clone()
+        if q_len > 1:
+            mask_w[:, :q_len - 1] = 0
+            mask_l[:, :q_len - 1] = 0
+
+        if preference_mask is not None:
+            sample_mask = preference_mask.to(logprobs_w.device).float()  # [B]
+        else:
+            sample_mask = torch.ones(logprobs_w.size(0), device=logprobs_w.device)
+
+        # Compute sequence-level logprobs
+        seq_logprob_w = (logprobs_w * mask_w).sum(dim=1)          # [B]
+        seq_logprob_l = (logprobs_l * mask_l).sum(dim=1)          # [B]
+        seq_old_logprob_w = (old_logprobs_w * mask_w).sum(dim=1)  # [B]
+        seq_old_logprob_l = (old_logprobs_l * mask_l).sum(dim=1)  # [B]
+
+        # Compute sequence-level logratios
+        pi_logratios_seq = seq_logprob_w - seq_logprob_l               # [B]
+        ref_logratios_seq = seq_old_logprob_w - seq_old_logprob_l      # [B]
 
         # Compute r_hat (score difference at theta*)
-        r_hat_diff = self.config.temperature * (pi_logratios.detach() - ref_logratios.detach())
+        r_hat_diff = self.config.temperature * (pi_logratios_seq.detach() - ref_logratios_seq.detach())  # [B]
 
-        # Compute gradients of log_probs w.r.t model parameters
+        # Compute gradients of sequence-level log_probs w.r.t model parameters
         grads_w = torch.autograd.grad(
-            outputs=(logprobs_w * mask_w).sum(),  # Mask winner responses
+            outputs=seq_logprob_w.sum(),  # Sum over batch for gradient computation
             inputs=self.model.parameters(),
             create_graph=True, retain_graph=True, allow_unused=True
         )
         grads_l = torch.autograd.grad(
-            outputs=(logprobs_l * mask_l).sum(),  # Mask loser responses
+            outputs=seq_logprob_l.sum(),  # Sum over batch for gradient computation
             inputs=self.model.parameters(),
             create_graph=True, retain_graph=True, allow_unused=True
         )
-
 
         # Compute theta - theta_star and grad_diff dot product in batches
         first_order_term = torch.tensor(0.0, device=self.current_device)
@@ -198,21 +239,43 @@ class ApproxDPOTrainer():
                 # Incrementally accumulate dot product
                 first_order_term += torch.dot(grad_diff_flat, theta_diff_flat)
 
+        # Final approximated logits for DPO loss (sequence-level)
+        # Use beta if available in config, otherwise use 1.0
+        beta = getattr(self.config, 'beta', 1.0)
+        approx_logits = r_hat_diff + beta * first_order_term  # [B]
 
-        # Final approximated logits for DPO loss
-        approx_logits = r_hat_diff + self.config.beta * first_order_term
+        if self.config.ipo_loss:
+            dpo_loss_vec = (approx_logits - 1.0 / (2 * self.config.temperature)) ** 2  # [B]
+        else:
+            dpo_loss_vec = -F.logsigmoid(approx_logits)  # [B]
 
-        dpo_loss = -F.logsigmoid(approx_logits)
-        dpo_loss = masked_mean(dpo_loss, mask[:approx_logits.size(0)]) 
-
+        # Apply preference_mask for weighted average
+        denom = sample_mask.sum()
+        if denom.item() == 0:
+            dpo_loss = dpo_loss_vec.mean()
+        else:
+            dpo_loss = (dpo_loss_vec * sample_mask).sum() / denom
 
         if return_stats:
+            delta_w = seq_logprob_w - seq_old_logprob_w  # [B]
+            delta_l = seq_logprob_l - seq_old_logprob_l  # [B]
+            rewards_chosen = self.config.temperature * delta_w.detach()
+            rewards_rejected = self.config.temperature * delta_l.detach()
+            reward_margin = rewards_chosen - rewards_rejected
+
             stats = dict(
                 loss=dict(dpo_loss=dpo_loss.detach()),
                 policy=dict(
                     entropy=torch.cat((entropy_w, entropy_l), dim=0).detach(),
-                    pi_logratios=torch.mean(pi_logratios).detach(),
-                    ref_logratios=torch.mean(ref_logratios).detach(),
+                    rewards_chosen=rewards_chosen.mean().detach(),
+                    rewards_rejected=rewards_rejected.mean().detach(),
+                    reward_margin=reward_margin.mean().detach(),
+                    logprobs_w=seq_logprob_w.mean().detach(),
+                    logprobs_l=seq_logprob_l.mean().detach(),
+                    pi_logratios=pi_logratios_seq.mean().detach(),
+                    ref_logratios=ref_logratios_seq.mean().detach(),
+                    dpo_logit_mean=approx_logits.mean().detach(),
+                    classifier_accuracy=(reward_margin > 0).float().mean().detach(),
                 )
             )
             return dpo_loss, flatten_dict(stats)

@@ -349,7 +349,6 @@ class DPOTrainer():
         print(f"Saved p* to {self.pstar_save_path}")
         self.model.train()
 
-
     def save_p(self):
         self.model.eval()
         device = next(self.model.parameters()).device
@@ -358,7 +357,6 @@ class DPOTrainer():
         torch.save({"params": params_vector}, self.p_save_path)
         print(f"Saved p to {self.p_save_path}")
         self.model.train()
-
 
 
     def log_stats(
