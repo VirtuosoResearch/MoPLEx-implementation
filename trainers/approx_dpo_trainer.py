@@ -220,48 +220,69 @@ class ApproxDPOTrainer():
         batch_size = seq_logprob_w.size(0)
         
         if compute_first_order:
-            # Compute first-order term using batch-averaged gradients
-            # This is a memory-efficient approximation: we use the average gradient across the batch
-            # instead of computing per-sample gradients (which would require retain_graph=True in a loop)
-            
-            # Compute gradients of batch-averaged logprobs
-            # Note: We don't use create_graph=True to avoid second-order derivatives
-            # The first-order term is computed as an approximation and doesn't need gradients
-            grads_w = torch.autograd.grad(
-                outputs=seq_logprob_w.sum(),  # Sum over batch
-                inputs=self.model.parameters(),
-                create_graph=False,  # Don't create graph to avoid second-order derivatives
-                retain_graph=True,
-                allow_unused=True
-            )
-            grads_l = torch.autograd.grad(
-                outputs=seq_logprob_l.sum(),  # Sum over batch
-                inputs=self.model.parameters(),
-                create_graph=False,  # Don't create graph to avoid second-order derivatives
-                retain_graph=True,
-                allow_unused=True
-            )
-            
-            # Compute first-order term using batch-averaged gradients
-            # This gives a single scalar that we'll use for all samples (approximation)
-            # The first-order term is: (θ - θ*) · (∇_θ log π_θ(y_w) - ∇_θ log π_θ(y_l))
-            # - theta_diff needs gradients (it's part of the approximation)
-            # - grad_diff should be detached (it's the gradient value at current θ, not a function of θ)
-            first_order_term_scalar = torch.tensor(0.0, device=self.current_device)
-            for (p, p_star, gw, gl) in zip(self.model.parameters(), self.ref_model.parameters(), grads_w, grads_l):
-                if p.requires_grad and gw is not None and gl is not None:
-                    theta_diff = (p - p_star)  # Keep gradients for theta_diff
-                    grad_diff = (gw - gl).detach()  # Detach to avoid second-order derivatives
-                    # Reshape to vectors
-                    theta_diff_flat = theta_diff.view(-1)
-                    grad_diff_flat = grad_diff.view(-1)
-                    # Accumulate dot product: (θ - θ*) · (∇_θ log π_θ(y_w) - ∇_θ log π_θ(y_l))
-                    # The gradient of this term w.r.t. θ comes from theta_diff, with grad_diff as the coefficient
-                    first_order_term_scalar += torch.dot(grad_diff_flat, theta_diff_flat)
-            
-            # Use the same first-order term for all samples (approximation)
-            # This is a memory-efficient approximation of per-sample first-order terms
-            first_order_terms = first_order_term_scalar.expand(batch_size)  # [B]
+            # Ensure seq_logprob_w and seq_logprob_l have gradients
+            if not seq_logprob_w.requires_grad or not seq_logprob_l.requires_grad:
+                # If they don't have gradients, skip first-order term computation
+                first_order_terms = torch.zeros(batch_size, device=self.current_device)
+            else:
+                # Compute first-order term using batch-averaged gradients
+                # This is a memory-efficient approximation: we use the average gradient across the batch
+                # instead of computing per-sample gradients (which would require retain_graph=True in a loop)
+                
+                # Compute gradients of batch-averaged logprobs
+                # Note: We don't use create_graph=True to avoid second-order derivatives
+                # The first-order term is computed as an approximation and doesn't need gradients
+                # Filter parameters to only include those that require gradients (important for LoRA)
+                model_params = [p for p in self.model.parameters() if p.requires_grad]
+                
+                if len(model_params) == 0:
+                    # If no parameters require grad, skip first-order term computation
+                    first_order_terms = torch.zeros(batch_size, device=self.current_device)
+                else:
+                    grads_w = torch.autograd.grad(
+                        outputs=seq_logprob_w.sum(),  # Sum over batch
+                        inputs=model_params,
+                        create_graph=False,  # Don't create graph to avoid second-order derivatives
+                        retain_graph=True,
+                        allow_unused=True
+                    )
+                    grads_l = torch.autograd.grad(
+                        outputs=seq_logprob_l.sum(),  # Sum over batch
+                        inputs=model_params,
+                        create_graph=False,  # Don't create graph to avoid second-order derivatives
+                        retain_graph=True,
+                        allow_unused=True
+                    )
+                    
+                    # Get corresponding reference model parameters (only those that require grad)
+                    ref_model_params = []
+                    model_param_iter = iter(self.model.parameters())
+                    ref_model_param_iter = iter(self.ref_model.parameters())
+                    for p in model_param_iter:
+                        p_ref = next(ref_model_param_iter)
+                        if p.requires_grad:
+                            ref_model_params.append(p_ref)
+                    
+                    # Compute first-order term using batch-averaged gradients
+                    # This gives a single scalar that we'll use for all samples (approximation)
+                    # The first-order term is: (θ - θ*) · (∇_θ log π_θ(y_w) - ∇_θ log π_θ(y_l))
+                    # - theta_diff needs gradients (it's part of the approximation)
+                    # - grad_diff should be detached (it's the gradient value at current θ, not a function of θ)
+                    first_order_term_scalar = torch.tensor(0.0, device=self.current_device)
+                    for (p, p_star, gw, gl) in zip(model_params, ref_model_params, grads_w, grads_l):
+                        if gw is not None and gl is not None:
+                            theta_diff = (p - p_star)  # Keep gradients for theta_diff
+                            grad_diff = (gw - gl).detach()  # Detach to avoid second-order derivatives
+                            # Reshape to vectors
+                            theta_diff_flat = theta_diff.view(-1)
+                            grad_diff_flat = grad_diff.view(-1)
+                            # Accumulate dot product: (θ - θ*) · (∇_θ log π_θ(y_w) - ∇_θ log π_θ(y_l))
+                            # The gradient of this term w.r.t. θ comes from theta_diff, with grad_diff as the coefficient
+                            first_order_term_scalar += torch.dot(grad_diff_flat, theta_diff_flat)
+                    
+                    # Use the same first-order term for all samples (approximation)
+                    # This is a memory-efficient approximation of per-sample first-order terms
+                    first_order_terms = first_order_term_scalar.expand(batch_size)  # [B]
 
             # Final approximated logits for DPO loss (sequence-level)
             # Use beta if available in config, otherwise use 1.0
