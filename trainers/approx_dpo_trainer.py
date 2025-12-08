@@ -167,6 +167,7 @@ class ApproxDPOTrainer():
         responses_l: torch.LongTensor,
         return_stats: bool = False,
         preference_mask: Optional[torch.BoolTensor] = None,
+        compute_first_order: bool = True,
     ):  
         input_ids_w = torch.cat((queries, responses_w), dim=1)  # [B, Lq+Lw]
         input_ids_l = torch.cat((queries, responses_l), dim=1)  # [B, Lq+Ll]
@@ -213,36 +214,63 @@ class ApproxDPOTrainer():
         ref_logratios_seq = seq_old_logprob_w - seq_old_logprob_l      # [B]
 
         # Compute r_hat (score difference at theta*)
+        # Note: In approximate DPO, r_hat should be computed at theta*, but we use current theta as approximation
         r_hat_diff = self.config.temperature * (pi_logratios_seq.detach() - ref_logratios_seq.detach())  # [B]
 
-        # Compute gradients of sequence-level log_probs w.r.t model parameters
-        grads_w = torch.autograd.grad(
-            outputs=seq_logprob_w.sum(),  # Sum over batch for gradient computation
-            inputs=self.model.parameters(),
-            create_graph=True, retain_graph=True, allow_unused=True
-        )
-        grads_l = torch.autograd.grad(
-            outputs=seq_logprob_l.sum(),  # Sum over batch for gradient computation
-            inputs=self.model.parameters(),
-            create_graph=True, retain_graph=True, allow_unused=True
-        )
+        batch_size = seq_logprob_w.size(0)
+        
+        if compute_first_order:
+            # Compute first-order term using batch-averaged gradients
+            # This is a memory-efficient approximation: we use the average gradient across the batch
+            # instead of computing per-sample gradients (which would require retain_graph=True in a loop)
+            
+            # Compute gradients of batch-averaged logprobs
+            # Note: We don't use create_graph=True to avoid second-order derivatives
+            # The first-order term is computed as an approximation and doesn't need gradients
+            grads_w = torch.autograd.grad(
+                outputs=seq_logprob_w.sum(),  # Sum over batch
+                inputs=self.model.parameters(),
+                create_graph=False,  # Don't create graph to avoid second-order derivatives
+                retain_graph=True,
+                allow_unused=True
+            )
+            grads_l = torch.autograd.grad(
+                outputs=seq_logprob_l.sum(),  # Sum over batch
+                inputs=self.model.parameters(),
+                create_graph=False,  # Don't create graph to avoid second-order derivatives
+                retain_graph=True,
+                allow_unused=True
+            )
+            
+            # Compute first-order term using batch-averaged gradients
+            # This gives a single scalar that we'll use for all samples (approximation)
+            # The first-order term is: (θ - θ*) · (∇_θ log π_θ(y_w) - ∇_θ log π_θ(y_l))
+            # - theta_diff needs gradients (it's part of the approximation)
+            # - grad_diff should be detached (it's the gradient value at current θ, not a function of θ)
+            first_order_term_scalar = torch.tensor(0.0, device=self.current_device)
+            for (p, p_star, gw, gl) in zip(self.model.parameters(), self.ref_model.parameters(), grads_w, grads_l):
+                if p.requires_grad and gw is not None and gl is not None:
+                    theta_diff = (p - p_star)  # Keep gradients for theta_diff
+                    grad_diff = (gw - gl).detach()  # Detach to avoid second-order derivatives
+                    # Reshape to vectors
+                    theta_diff_flat = theta_diff.view(-1)
+                    grad_diff_flat = grad_diff.view(-1)
+                    # Accumulate dot product: (θ - θ*) · (∇_θ log π_θ(y_w) - ∇_θ log π_θ(y_l))
+                    # The gradient of this term w.r.t. θ comes from theta_diff, with grad_diff as the coefficient
+                    first_order_term_scalar += torch.dot(grad_diff_flat, theta_diff_flat)
+            
+            # Use the same first-order term for all samples (approximation)
+            # This is a memory-efficient approximation of per-sample first-order terms
+            first_order_terms = first_order_term_scalar.expand(batch_size)  # [B]
 
-        # Compute theta - theta_star and grad_diff dot product in batches
-        first_order_term = torch.tensor(0.0, device=self.current_device)
-        for (p, p_star, gw, gl) in zip(self.model.parameters(), self.ref_model.parameters(), grads_w, grads_l):
-            if p.requires_grad and gw is not None and gl is not None:
-                theta_diff = (p - p_star).detach()
-                grad_diff = (gw - gl)
-                # Reshape to vectors
-                theta_diff_flat = theta_diff.view(-1)
-                grad_diff_flat = grad_diff.view(-1)
-                # Incrementally accumulate dot product
-                first_order_term += torch.dot(grad_diff_flat, theta_diff_flat)
-
-        # Final approximated logits for DPO loss (sequence-level)
-        # Use beta if available in config, otherwise use 1.0
-        beta = getattr(self.config, 'beta', 1.0)
-        approx_logits = r_hat_diff + beta * first_order_term  # [B]
+            # Final approximated logits for DPO loss (sequence-level)
+            # Use beta if available in config, otherwise use 1.0
+            beta = getattr(self.config, 'beta', 1.0)
+            approx_logits = r_hat_diff + beta * first_order_terms  # [B]
+        else:
+            # In evaluation mode, skip first-order term computation
+            # Just use r_hat_diff as the logits (simplified DPO)
+            approx_logits = r_hat_diff  # [B]
 
         if self.config.ipo_loss:
             dpo_loss_vec = (approx_logits - 1.0 / (2 * self.config.temperature)) ** 2  # [B]
@@ -312,3 +340,170 @@ class ApproxDPOTrainer():
             self.optimizer.step()
             self.current_step += 1
         return stats
+
+    def log_stats(
+            self,
+            stats: dict,
+            batch: dict,
+            rewards: List[torch.FloatTensor],
+            columns_to_log: List[str] = ["query", "response"],
+        ):
+            """
+            A function that logs all the training stats. Call it at the end of each epoch.
+
+            Args:
+                stats (dict[str, Any]):
+                    A dictionary of training stats.
+                batch (dict[str, Any]):
+                    A dictionary of batch data, this contains the queries and responses.
+                rewards (`List[torch.FloatTensor]`):
+                    A tensor of rewards.
+            """
+            # Log only if we are in the main process
+            if self.accelerator.is_main_process:
+                logs = {}
+
+                # Log stats
+                if not isinstance(rewards, torch.Tensor):
+                    rewards = torch.tensor(rewards).to(self.current_device)
+
+                if self.config.log_with == "wandb":
+                    import wandb
+
+                    if any([column_to_log not in batch.keys() for column_to_log in columns_to_log]):
+                        raise ValueError(f"Columns to log {columns_to_log} are not present in the batch {batch.keys()}.")
+
+                    batch_list = [batch[column_to_log] for column_to_log in columns_to_log]
+
+                    table_rows = [list(r) for r in zip(*batch_list, rewards.cpu().tolist())]
+                    logs.update({"game_log": wandb.Table(columns=[*columns_to_log, "reward"], rows=table_rows)})
+
+                logs.update(stats)
+
+                # manually cast in fp32 for bf16 torch tensors
+                for k, v in logs.items():
+                    if isinstance(v, torch.Tensor) and v.dtype == torch.bfloat16:
+                        logs[k] = v.float()
+
+                self.accelerator.log(
+                    logs,
+                    step=self.current_step if self.config.log_with == "tensorboard" else None,
+                )
+    
+    @torch.no_grad()
+    def evaluate(self, eval_dataloader):
+        self.model.eval()
+        self.ref_model.eval()
+
+        total_loss = 0.0
+        total_acc = 0.0
+        total_examples = 0
+
+        for batch in eval_dataloader:
+            preference_mask = batch.get("preference_mask", None)
+
+            if isinstance(batch["query"], list) or isinstance(batch["query"], tuple):
+                queries = self.tokenizer(
+                    batch["query"],
+                    padding=True,
+                    truncation=True,
+                    max_length=128,
+                    return_tensors="pt",
+                ).input_ids.to(self.current_device)
+
+                all_pref = batch["response_w"] + batch["response_l"]
+                tokenized = self.tokenizer(
+                    all_pref,
+                    padding=True,
+                    truncation=True,
+                    max_length=256,
+                    return_tensors="pt",
+                ).input_ids.to(self.current_device)
+
+                n_w = len(batch["response_w"])
+                responses_w = tokenized[:n_w]
+                responses_l = tokenized[n_w:]
+
+                if preference_mask is not None:
+                    preference_mask = torch.as_tensor(preference_mask, device=self.current_device)
+            else:
+                queries = batch["query"].to(self.current_device)
+                responses_w = batch["response_w"].to(self.current_device)
+                responses_l = batch["response_l"].to(self.current_device)
+                if preference_mask is not None:
+                    preference_mask = preference_mask.to(self.current_device)
+
+            loss, stats = self._step(
+                queries=queries,
+                responses_w=responses_w,
+                responses_l=responses_l,
+                preference_mask=preference_mask,
+                return_stats=True,
+                compute_first_order=False,  # Skip first-order term in evaluation mode
+            )
+
+            batch_size = queries.size(0)
+            total_examples += batch_size
+
+            total_loss += loss.item() * batch_size
+            batch_acc = stats["policy/classifier_accuracy"].item()
+            total_acc += batch_acc * batch_size
+
+        if total_examples == 0:
+            mean_loss = 0.0
+            mean_acc = 0.0
+        else:
+            mean_loss = total_loss / total_examples
+            mean_acc = total_acc / total_examples
+
+        metrics = {
+            "eval/dpo_loss": mean_loss,
+            "eval/classification_accuracy": mean_acc,
+        }
+        return metrics
+
+    def end_of_epoch_step(self, epoch: int):
+        """Performs tasks at the end of an epoch, like saving models."""
+        print(f"Executing end-of-epoch tasks for epoch: {epoch}")
+
+        # save p* (params + grads) for ApproxDPO
+        if (
+            hasattr(self.config, 'save_pstar_at_epoch') and
+            self.config.save_pstar_at_epoch >= 0 and
+            epoch == self.config.save_pstar_at_epoch and
+            not getattr(self, 'has_saved_pstar', False) and
+            self.accelerator.is_main_process
+        ):
+            self.has_saved_pstar = True
+            print(f"Saving p* (params + grads) at epoch {epoch} to {self.config.pstar_save_path} ...")
+            self.save_pstar()
+
+        # save p (params only)
+        if (
+            hasattr(self.config, 'save_p_at_epoch') and
+            self.config.save_p_at_epoch >= 0 and
+            epoch == self.config.save_p_at_epoch and
+            not getattr(self, 'has_saved_p', False) and
+            self.accelerator.is_main_process
+        ):
+            self.has_saved_p = True
+            print(f"Saving p (params only) at epoch {epoch} to {self.config.p_save_path} ...")
+            self.save_p()
+
+    def save_pstar(self):
+        self.model.eval()
+        device = next(self.model.parameters()).device
+        with torch.no_grad():
+            params_vector = torch.cat([p.detach().to(device).flatten() for p in self.model.parameters()])
+        torch.save({"params": params_vector}, self.config.pstar_save_path)
+        print(f"Saved p* to {self.config.pstar_save_path}")
+        self.model.train()
+
+    def save_p(self):
+        self.model.eval()
+        device = next(self.model.parameters()).device
+        with torch.no_grad():
+            params_vector = torch.cat([p.detach().to(device).flatten() for p in self.model.parameters()])
+        torch.save({"params": params_vector}, self.config.p_save_path)
+        print(f"Saved p to {self.config.p_save_path}")
+        self.model.train()
