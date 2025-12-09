@@ -121,6 +121,11 @@ class ApproxDPOTrainer():
         self.current_step = 0
         self.current_device = self.accelerator.device
         self.running = RunningMoments(self.accelerator)
+        
+        # Storage for precomputed gradients and b values at reference model (θ0)
+        # According to paper A.1: g = ∇_θ h_θ0, b = -h_θ0
+        self.precomputed_gradients = None  # List of gradient vectors for each sample
+        self.precomputed_b_values = None   # List of b values for each sample
 
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
@@ -160,6 +165,156 @@ class ApproxDPOTrainer():
         )
         return dataloader
 
+    def precompute_gradients_and_b(
+        self,
+        queries: torch.LongTensor,
+        responses_w: torch.LongTensor,
+        responses_l: torch.LongTensor,
+        sample_indices: Optional[torch.LongTensor] = None,
+    ):
+        """
+        Precompute gradients g and b values at reference model (θ0) for each sample.
+        According to paper A.1:
+        - g = ∇_θ h_θ0(x, y1, y2) = β(∇_θ log π_θ0(y_w|x) - ∇_θ log π_θ0(y_l|x))
+        - b = -h_θ0(x, y1, y2) = -β(log π_θ0(y_w|x) - log π_θ0(y_l|x) - log π_ref(y_w|x) + log π_ref(y_l|x))
+        
+        Args:
+            queries: Query tensors [B, Lq]
+            responses_w: Winner response tensors [B, Lw]
+            responses_l: Loser response tensors [B, Ll]
+            sample_indices: Optional indices to map samples to storage positions
+            
+        Returns:
+            gradients: List of gradient vectors [B, num_params]
+            b_values: List of b values [B]
+        """
+        # Temporarily set model to reference model state for gradient computation
+        original_state = {name: param.clone() for name, param in self.model.named_parameters()}
+        
+        # Save reference model state
+        ref_state_dict = {name: param.clone() for name, param in self.ref_model.named_parameters()}
+        
+        # Set model to reference model state (θ0)
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if name in ref_state_dict:
+                    param.data.copy_(ref_state_dict[name].data)
+        
+        input_ids_w = torch.cat((queries, responses_w), dim=1)
+        input_ids_l = torch.cat((queries, responses_l), dim=1)
+        pad_id = self.tokenizer.pad_token_id
+        
+        batch_size = queries.size(0)
+        beta = self.config.temperature
+        
+        # Compute logprobs at θ0
+        def process_at_theta0(input_ids):
+            attention_mask = (input_ids != pad_id).long()
+            input_data = {"input_ids": input_ids, "attention_mask": attention_mask}
+            logits, _, _ = self.model(**input_data)
+            logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
+            attn_mask_shifted = attention_mask[:, 1:]
+            return logprobs, attn_mask_shifted
+        
+        logprobs_w_theta0, attn_shift_w = process_at_theta0(input_ids_w)
+        logprobs_l_theta0, attn_shift_l = process_at_theta0(input_ids_l)
+        
+        # Also compute at ref_model for b calculation
+        with torch.no_grad():
+            old_logits_w, _, _ = self.ref_model(**{"input_ids": input_ids_w, "attention_mask": (input_ids_w != pad_id).long()})
+            old_logits_l, _, _ = self.ref_model(**{"input_ids": input_ids_l, "attention_mask": (input_ids_l != pad_id).long()})
+            old_logprobs_w = logprobs_from_logits(old_logits_w[:, :-1, :], input_ids_w[:, 1:])
+            old_logprobs_l = logprobs_from_logits(old_logits_l[:, :-1, :], input_ids_l[:, 1:])
+        
+        q_len = queries.size(1)
+        mask_w = attn_shift_w.clone()
+        mask_l = attn_shift_l.clone()
+        if q_len > 1:
+            mask_w[:, :q_len - 1] = 0
+            mask_l[:, :q_len - 1] = 0
+        
+        # Compute sequence-level logprobs at θ0
+        seq_logprob_w_theta0 = (logprobs_w_theta0 * mask_w).sum(dim=1)  # [B]
+        seq_logprob_l_theta0 = (logprobs_l_theta0 * mask_l).sum(dim=1)  # [B]
+        seq_old_logprob_w = (old_logprobs_w * mask_w).sum(dim=1)  # [B]
+        seq_old_logprob_l = (old_logprobs_l * mask_l).sum(dim=1)  # [B]
+        
+        # Compute h_θ0 and b
+        # h_θ0 = β(log π_θ0(y_w|x) - log π_θ0(y_l|x)) - β(log π_ref(y_w|x) - log π_ref(y_l|x))
+        # Since model is set to θ0 (ref_model), and ref_model is also θ0:
+        # h_θ0 = β(log π_θ0(y_w|x) - log π_θ0(y_l|x)) - β(log π_θ0(y_w|x) - log π_θ0(y_l|x)) = 0
+        # So b = -h_θ0 = 0
+        # However, we compute it explicitly for correctness
+        h_theta0 = beta * ((seq_logprob_w_theta0 - seq_logprob_l_theta0) - (seq_old_logprob_w - seq_old_logprob_l))  # [B]
+        b_values = -h_theta0.detach().cpu().numpy()  # [B]
+        
+        # Compute gradients g = β(∇_θ log π_θ0(y_w|x) - ∇_θ log π_θ0(y_l|x))
+        model_params = [p for p in self.model.parameters() if p.requires_grad]
+        gradients_list = []
+        
+        for i in range(batch_size):
+            # Compute gradient for sample i
+            grads_w_i = torch.autograd.grad(
+                outputs=seq_logprob_w_theta0[i],
+                inputs=model_params,
+                create_graph=False,
+                retain_graph=True,
+                allow_unused=True
+            )
+            grads_l_i = torch.autograd.grad(
+                outputs=seq_logprob_l_theta0[i],
+                inputs=model_params,
+                create_graph=False,
+                retain_graph=True,
+                allow_unused=True
+            )
+            
+            # Flatten and concatenate gradients
+            grad_diff = []
+            for gw, gl in zip(grads_w_i, grads_l_i):
+                if gw is not None and gl is not None:
+                    grad_diff.append((gw - gl).detach().cpu().flatten())
+            
+            if grad_diff:
+                g_i = beta * torch.cat(grad_diff).numpy()  # [num_params]
+            else:
+                g_i = np.array([])
+            
+            gradients_list.append(g_i)
+        
+        # Restore original model state
+        with torch.no_grad():
+            for name, param in self.model.named_parameters():
+                if name in original_state:
+                    param.data.copy_(original_state[name].data)
+        
+        return gradients_list, b_values
+
+    def save_precomputed_gradients_and_b(self, save_path: str):
+        """Save precomputed gradients and b values to disk."""
+        if self.precomputed_gradients is None or self.precomputed_b_values is None:
+            raise ValueError("No precomputed gradients and b values to save. Call precompute_gradients_and_b first.")
+        
+        data = {
+            'gradients': self.precomputed_gradients,
+            'b_values': self.precomputed_b_values,
+        }
+        torch.save(data, save_path, _use_new_zipfile_serialization=False)
+        print(f"Saved precomputed gradients and b values to {save_path}")
+
+    def load_precomputed_gradients_and_b(self, load_path: str):
+        """Load precomputed gradients and b values from disk."""
+        # Use weights_only=False to allow loading numpy arrays (PyTorch 2.6+ compatibility)
+        data = torch.load(load_path, map_location='cpu', weights_only=False)
+        self.precomputed_gradients = data['gradients']
+        self.precomputed_b_values = data['b_values']
+        
+        print(f"Loaded precomputed gradients and b values from {load_path}")
+        print(f"  Number of samples: {len(self.precomputed_gradients)}")
+        if len(self.precomputed_gradients) > 0:
+            grad_dim = len(self.precomputed_gradients[0])
+            print(f"  Gradient dimension: {grad_dim}")
+
     def _step(
         self,
         queries: torch.LongTensor,
@@ -168,6 +323,7 @@ class ApproxDPOTrainer():
         return_stats: bool = False,
         preference_mask: Optional[torch.BoolTensor] = None,
         compute_first_order: bool = True,
+        sample_indices: Optional[torch.LongTensor] = None,
     ):  
         input_ids_w = torch.cat((queries, responses_w), dim=1)  # [B, Lq+Lw]
         input_ids_l = torch.cat((queries, responses_l), dim=1)  # [B, Lq+Ll]
@@ -213,90 +369,92 @@ class ApproxDPOTrainer():
         pi_logratios_seq = seq_logprob_w - seq_logprob_l               # [B]
         ref_logratios_seq = seq_old_logprob_w - seq_old_logprob_l      # [B]
 
-        # Compute r_hat (score difference at theta*)
-        # Note: In approximate DPO, r_hat should be computed at theta*, but we use current theta as approximation
-        r_hat_diff = self.config.temperature * (pi_logratios_seq.detach() - ref_logratios_seq.detach())  # [B]
-
-        batch_size = seq_logprob_w.size(0)
+        # According to paper A.1, we approximate h_θ(x, y1, y2) using logistic regression:
+        # l_hat(x, y1, y2, z) = log(1 + exp(b - z * g^T (θ - θ0)))
+        # where:
+        # - g = ∇_θ h_θ0(x, y1, y2) = β(∇_θ log π_θ0(y_w|x) - ∇_θ log π_θ0(y_l|x)) [precomputed]
+        # - b = -h_θ0(x, y1, y2) [precomputed]
+        # - z = +1 for y_w preferred, -1 for y_l preferred
         
+        batch_size = seq_logprob_w.size(0)
+        beta = self.config.temperature  # β in the paper
+        
+        # MUST use precomputed gradients - no online computation allowed
+        if self.precomputed_gradients is None or self.precomputed_b_values is None:
+            raise ValueError(
+                "ApproxDPOTrainer requires precomputed gradients and b values. "
+                "Please call load_precomputed_gradients_and_b() or precompute_gradients_and_b() first."
+            )
+        if len(self.precomputed_gradients) == 0:
+            raise ValueError("Precomputed gradients list is empty. Cannot proceed without precomputed gradients.")
+        
+        # Use precomputed gradients and b values for logistic regression
         if compute_first_order:
-            # Ensure seq_logprob_w and seq_logprob_l have gradients
-            if not seq_logprob_w.requires_grad or not seq_logprob_l.requires_grad:
-                # If they don't have gradients, skip first-order term computation
-                first_order_terms = torch.zeros(batch_size, device=self.current_device)
+            # Use precomputed gradients and b values for logistic regression
+            # l_hat(x, y1, y2, z) = log(1 + exp(b - z * g^T (θ - θ0)))
+            # For DPO, z = +1 (y_w is preferred), so: l_hat = log(1 + exp(b - g^T (θ - θ0)))
+            
+            model_params = [p for p in self.model.parameters() if p.requires_grad]
+            ref_model_params = []
+            model_param_iter = iter(self.model.parameters())
+            ref_model_param_iter = iter(self.ref_model.parameters())
+            for p in model_param_iter:
+                p_ref = next(ref_model_param_iter)
+                if p.requires_grad:
+                    ref_model_params.append(p_ref)
+            
+            # Compute (θ - θ0) for all parameters
+            theta_diff_flat_list = []
+            for p, p_theta0 in zip(model_params, ref_model_params):
+                theta_diff_flat_list.append((p - p_theta0).detach().cpu().flatten())
+            theta_diff_flat = torch.cat(theta_diff_flat_list).numpy()  # [num_params]
+            
+            # Compute logistic regression loss for each sample
+            # According to paper A.1: l_hat(x, y1, y2, z) = log(1 + exp(b - z * g^T (θ - θ0)))
+            # For DPO, z = +1 (y_w is preferred), so: l_hat = log(1 + exp(b - g^T (θ - θ0)))
+            loss_vec = []
+            for i in range(batch_size):
+                # Use sample index if provided, otherwise use batch index
+                sample_idx = sample_indices[i].item() if sample_indices is not None and i < len(sample_indices) else i
+                
+                if sample_idx >= len(self.precomputed_gradients) or sample_idx >= len(self.precomputed_b_values):
+                    raise ValueError(
+                        f"Sample index {sample_idx} out of range. "
+                        f"Precomputed gradients has {len(self.precomputed_gradients)} samples, "
+                        f"b_values has {len(self.precomputed_b_values)} samples."
+                    )
+                
+                g_i = self.precomputed_gradients[sample_idx]  # [num_params]
+                b_i = self.precomputed_b_values[sample_idx]    # scalar
+                
+                # Ensure dimensions match
+                if len(g_i) != len(theta_diff_flat):
+                    raise ValueError(
+                        f"Gradient dimension mismatch: precomputed gradient has {len(g_i)} dimensions, "
+                        f"but model parameters have {len(theta_diff_flat)} dimensions. "
+                        f"Make sure the precomputed gradients match the current model architecture."
+                    )
+                
+                # Compute g^T (θ - θ0)
+                g_dot_theta_diff = np.dot(g_i, theta_diff_flat)  # scalar
+                
+                # l_hat = log(1 + exp(b - g^T (θ - θ0)))
+                # This is the approximate DPO loss according to paper A.1
+                loss_i = np.log(1 + np.exp(b_i - g_dot_theta_diff))
+                loss_vec.append(loss_i)
+            
+            # Convert to tensor - these are already loss values from logistic regression
+            dpo_loss_vec = torch.tensor(loss_vec, device=self.current_device, dtype=torch.float32)
+        else:
+            # When compute_first_order=False (e.g., in evaluation mode), still use precomputed gradients
+            # but compute standard DPO loss for evaluation
+            # Use standard DPO: h_θ = β(log π_θ(y_w|x) - log π_θ(y_l|x)) - β(log π_ref(y_w|x) - log π_ref(y_l|x))
+            approx_logits = beta * (pi_logratios_seq - ref_logratios_seq)  # [B]
+
+            if self.config.ipo_loss:
+                dpo_loss_vec = (approx_logits - 1.0 / (2 * self.config.temperature)) ** 2  # [B]
             else:
-                # Compute first-order term using batch-averaged gradients
-                # This is a memory-efficient approximation: we use the average gradient across the batch
-                # instead of computing per-sample gradients (which would require retain_graph=True in a loop)
-                
-                # Compute gradients of batch-averaged logprobs
-                # Note: We don't use create_graph=True to avoid second-order derivatives
-                # The first-order term is computed as an approximation and doesn't need gradients
-                # Filter parameters to only include those that require gradients (important for LoRA)
-                model_params = [p for p in self.model.parameters() if p.requires_grad]
-                
-                if len(model_params) == 0:
-                    # If no parameters require grad, skip first-order term computation
-                    first_order_terms = torch.zeros(batch_size, device=self.current_device)
-                else:
-                    grads_w = torch.autograd.grad(
-                        outputs=seq_logprob_w.sum(),  # Sum over batch
-                        inputs=model_params,
-                        create_graph=False,  # Don't create graph to avoid second-order derivatives
-                        retain_graph=True,
-                        allow_unused=True
-                    )
-                    grads_l = torch.autograd.grad(
-                        outputs=seq_logprob_l.sum(),  # Sum over batch
-                        inputs=model_params,
-                        create_graph=False,  # Don't create graph to avoid second-order derivatives
-                        retain_graph=True,
-                        allow_unused=True
-                    )
-                    
-                    # Get corresponding reference model parameters (only those that require grad)
-                    ref_model_params = []
-                    model_param_iter = iter(self.model.parameters())
-                    ref_model_param_iter = iter(self.ref_model.parameters())
-                    for p in model_param_iter:
-                        p_ref = next(ref_model_param_iter)
-                        if p.requires_grad:
-                            ref_model_params.append(p_ref)
-                    
-                    # Compute first-order term using batch-averaged gradients
-                    # This gives a single scalar that we'll use for all samples (approximation)
-                    # The first-order term is: (θ - θ*) · (∇_θ log π_θ(y_w) - ∇_θ log π_θ(y_l))
-                    # - theta_diff needs gradients (it's part of the approximation)
-                    # - grad_diff should be detached (it's the gradient value at current θ, not a function of θ)
-                    first_order_term_scalar = torch.tensor(0.0, device=self.current_device)
-                    for (p, p_star, gw, gl) in zip(model_params, ref_model_params, grads_w, grads_l):
-                        if gw is not None and gl is not None:
-                            theta_diff = (p - p_star)  # Keep gradients for theta_diff
-                            grad_diff = (gw - gl).detach()  # Detach to avoid second-order derivatives
-                            # Reshape to vectors
-                            theta_diff_flat = theta_diff.view(-1)
-                            grad_diff_flat = grad_diff.view(-1)
-                            # Accumulate dot product: (θ - θ*) · (∇_θ log π_θ(y_w) - ∇_θ log π_θ(y_l))
-                            # The gradient of this term w.r.t. θ comes from theta_diff, with grad_diff as the coefficient
-                            first_order_term_scalar += torch.dot(grad_diff_flat, theta_diff_flat)
-                    
-                    # Use the same first-order term for all samples (approximation)
-                    # This is a memory-efficient approximation of per-sample first-order terms
-                    first_order_terms = first_order_term_scalar.expand(batch_size)  # [B]
-
-            # Final approximated logits for DPO loss (sequence-level)
-            # Use beta if available in config, otherwise use 1.0
-            beta = getattr(self.config, 'beta', 1.0)
-            approx_logits = r_hat_diff + beta * first_order_terms  # [B]
-        else:
-            # In evaluation mode, skip first-order term computation
-            # Just use r_hat_diff as the logits (simplified DPO)
-            approx_logits = r_hat_diff  # [B]
-
-        if self.config.ipo_loss:
-            dpo_loss_vec = (approx_logits - 1.0 / (2 * self.config.temperature)) ** 2  # [B]
-        else:
-            dpo_loss_vec = -F.logsigmoid(approx_logits)  # [B]
+                dpo_loss_vec = -F.logsigmoid(approx_logits)  # [B]
 
         # Apply preference_mask for weighted average
         denom = sample_mask.sum()
@@ -337,6 +495,7 @@ class ApproxDPOTrainer():
         responses_w: torch.LongTensor,
         responses_l: torch.LongTensor,
         preference_mask: Optional[torch.BoolTensor] = None,
+        sample_indices: Optional[torch.LongTensor] = None,
     ):
         self.model.train()
         bs = self.config.batch_size
@@ -347,6 +506,7 @@ class ApproxDPOTrainer():
             responses_w_ = responses_w[i:i + sub_bs]
             responses_l_ = responses_l[i:i + sub_bs]
             preference_mask_ = preference_mask[i:i + sub_bs] if preference_mask is not None else None
+            sample_indices_ = sample_indices[i:i + sub_bs] if sample_indices is not None else None
 
             loss, stats = self._step(
                 queries=queries_,
@@ -354,6 +514,7 @@ class ApproxDPOTrainer():
                 responses_l=responses_l_,
                 return_stats=True,
                 preference_mask=preference_mask_,
+                sample_indices=sample_indices_,
             )
 
             self.optimizer.zero_grad()

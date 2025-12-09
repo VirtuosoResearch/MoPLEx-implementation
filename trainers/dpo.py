@@ -101,6 +101,12 @@ def main(args):
         tokenizer=tokenizer,
         additional_config_kwargs=vars(args),
     )
+    
+    # Load precomputed gradients and b values if provided (for ApproxDPO with logistic regression)
+    if args.approx_dpo and hasattr(args, 'precomputed_gradients_path') and args.precomputed_gradients_path:
+        print(f"Loading precomputed gradients and b values from {args.precomputed_gradients_path}")
+        trainer.load_precomputed_gradients_and_b(args.precomputed_gradients_path)
+        print("Precomputed values loaded. Training will use logistic regression approximation.")
 
     def empty_cache():
         gc.collect()
@@ -218,6 +224,7 @@ if __name__ == "__main__":
 
     parser.add_argument('--save_pstar_at_epoch', type=int, default=-1, help='the epoch after which to save p_star and grad_star. Set to -1 to disable.')
     parser.add_argument('--pstar_save_path', type=str, default='./pstar_grads.pt', help='the file path to save p_star and grad_star')
+    parser.add_argument('--precomputed_gradients_path', type=str, default=None, help='Path to precomputed gradients and b values for ApproxDPO logistic regression training')
 
     parser.add_argument('--use_lora', type=bool, default=False, help='whether to wrap the policy with LoRA adapters')
     parser.add_argument('--lora_r', type=int, default=8, help='LoRA rank')
