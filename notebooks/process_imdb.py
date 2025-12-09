@@ -1,4 +1,5 @@
 import os
+import re
 from typing import Dict, Any, Tuple, List
 
 import numpy as np
@@ -56,9 +57,11 @@ def compute_rewards_for_batch(
     device: str = "cuda",
 ) -> Dict[str, Any]:
     """
-    Compute two rewards:
+    Compute four rewards:
       - sentiment_reward: probability of positive sentiment
       - conciseness_reward: negative token length
+      - lexical_richness: type-token ratio based on simple word tokens
+      - semantic_intensity: absolute distance of positive probability from 0.5
     """
     # Tokenize for model forward
     enc = tokenizer(
@@ -93,11 +96,29 @@ def compute_rewards_for_batch(
     lengths = np.array([len(ids) for ids in enc_no_pad["input_ids"]], dtype=np.float32)
     conciseness_reward = -lengths
 
+    # Lexical richness based on simple word-level tokens
+    # lexical_richness = number of unique words / total number of words
+    lexical_richness_list: List[float] = []
+    for text in texts:
+        # Extract alphanumeric word tokens
+        words = re.findall(r"\w+", text.lower())
+        if len(words) == 0:
+            lexical_richness_list.append(0.0)
+        else:
+            unique_words = set(words)
+            lexical_richness_list.append(len(unique_words) / float(len(words)))
+    lexical_richness = np.array(lexical_richness_list, dtype=np.float32)
+
+    # Semantic intensity as distance from 0.5
+    semantic_intensity = np.abs(sentiment_reward - 0.5).astype(np.float32)
+
     return {
         "sentiment_reward": sentiment_reward,
         "sentiment_label_from_rm": sentiment_label,
         "token_length": lengths,
         "conciseness_reward": conciseness_reward,
+        "lexical_richness": lexical_richness,
+        "semantic_intensity": semantic_intensity,
     }
 
 
@@ -122,6 +143,8 @@ def build_imdb_preference_table(
       - rm_sentiment_label_0/1
       - token_length_0/1
       - conciseness_reward_0/1
+      - lexical_richness_0/1
+      - semantic_intensity_0/1
     """
     # Load data
     ds = load_imdb_preference(split)
@@ -161,6 +184,8 @@ def build_imdb_preference_table(
         sl = rewards["sentiment_label_from_rm"].reshape(n, 2)
         tl = rewards["token_length"].reshape(n, 2)
         cr = rewards["conciseness_reward"].reshape(n, 2)
+        lr = rewards["lexical_richness"].reshape(n, 2)
+        si = rewards["semantic_intensity"].reshape(n, 2)
 
         for i in range(n):
             row = {
@@ -178,6 +203,10 @@ def build_imdb_preference_table(
                 "token_length_1": int(tl[i, 1]),
                 "conciseness_reward_0": float(cr[i, 0]),
                 "conciseness_reward_1": float(cr[i, 1]),
+                "lexical_richness_0": float(lr[i, 0]),
+                "lexical_richness_1": float(lr[i, 1]),
+                "semantic_intensity_0": float(si[i, 0]),
+                "semantic_intensity_1": float(si[i, 1]),
             }
             all_rows.append(row)
 
@@ -199,6 +228,6 @@ if __name__ == "__main__":
             batch_size=128,
             device=device,
         )
-        out_path = f"data_out/imdb_preference_{split}_with_two_preferences.csv"
+        out_path = f"data_out/imdb_preference_{split}.csv"
         df.to_csv(out_path, index=False)
         print("saved to", out_path)
