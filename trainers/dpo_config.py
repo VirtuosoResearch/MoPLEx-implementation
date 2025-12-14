@@ -178,6 +178,12 @@ class DPOConfig:
     p_save_path: str = f"./params/p_epoch{save_p_at_epoch}.pt"
     """File path to save the model weights p (without gradients)."""
 
+    # Random projection for gradient dimension reduction (Johnson-Lindenstrauss)
+    projection_dim: Optional[int] = None
+    """Dimension of the projected space for gradients. If None, no projection is applied."""
+    projection_matrix_path: Optional[str] = None
+    """Path to save/load the projection matrix. If None, will be saved/loaded with gradients."""
+
 
 
 

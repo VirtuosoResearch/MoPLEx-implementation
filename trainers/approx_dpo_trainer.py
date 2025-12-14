@@ -126,6 +126,10 @@ class ApproxDPOTrainer():
         # According to paper A.1: g = ∇_θ h_θ0, b = -h_θ0
         self.precomputed_gradients = None  # List of gradient vectors for each sample
         self.precomputed_b_values = None   # List of b values for each sample
+        
+        # Random projection matrix for dimension reduction (Johnson-Lindenstrauss)
+        self.projection_matrix = None  # [num_params, projection_dim] if projection_dim is not None
+        self.projection_dim = config.projection_dim if hasattr(config, 'projection_dim') else None
 
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
@@ -164,6 +168,47 @@ class ApproxDPOTrainer():
             drop_last=True,
         )
         return dataloader
+
+    def _generate_projection_matrix(self, num_params: int, projection_dim: int, seed: Optional[int] = None):
+        """
+        Generate a random projection matrix for Johnson-Lindenstrauss dimension reduction.
+        
+        Args:
+            num_params: Original dimension (number of model parameters)
+            projection_dim: Target dimension after projection
+            seed: Random seed for reproducibility
+            
+        Returns:
+            projection_matrix: [num_params, projection_dim] numpy array
+        """
+        if seed is not None:
+            np.random.seed(seed)
+        # Generate ±1 random matrix and normalize
+        # This is the standard Johnson-Lindenstrauss projection
+        projection_matrix = (2 * np.random.randint(2, size=(num_params, projection_dim)) - 1).astype(np.float32)
+        projection_matrix *= 1.0 / np.sqrt(projection_dim)
+        return projection_matrix
+    
+    def _ensure_projection_matrix(self):
+        """
+        Ensure projection matrix is generated if projection is enabled.
+        Should be called after model is set up.
+        """
+        if self.projection_dim is None:
+            return
+        
+        if self.projection_matrix is None:
+            # Count number of trainable parameters
+            model_params = [p for p in self.model.parameters() if p.requires_grad]
+            num_params = sum(p.numel() for p in model_params)
+            
+            print(f"Generating random projection matrix: {num_params} -> {self.projection_dim}")
+            self.projection_matrix = self._generate_projection_matrix(
+                num_params=num_params,
+                projection_dim=self.projection_dim,
+                seed=self.config.seed
+            )
+            print(f"Projection matrix shape: {self.projection_matrix.shape}")
 
     def precompute_gradients_and_b(
         self,
@@ -291,6 +336,14 @@ class ApproxDPOTrainer():
             else:
                 g_i = np.array([])
             
+            # Apply random projection if enabled
+            if self.projection_dim is not None:
+                if self.projection_matrix is None:
+                    self._ensure_projection_matrix()
+                if len(g_i) > 0:
+                    # Project: g_projected = projection_matrix^T @ g
+                    g_i = self.projection_matrix.T @ g_i  # [projection_dim]
+            
             gradients_list.append(g_i)
         
         # Restore original model state
@@ -310,8 +363,16 @@ class ApproxDPOTrainer():
             'gradients': self.precomputed_gradients,
             'b_values': self.precomputed_b_values,
         }
+        
+        # Save projection matrix if it exists
+        if self.projection_matrix is not None:
+            data['projection_matrix'] = self.projection_matrix
+            data['projection_dim'] = self.projection_dim
+        
         torch.save(data, save_path, _use_new_zipfile_serialization=False)
         print(f"Saved precomputed gradients and b values to {save_path}")
+        if self.projection_matrix is not None:
+            print(f"  Projection matrix included: {self.projection_matrix.shape}")
 
     def load_precomputed_gradients_and_b(self, load_path: str):
         """Load precomputed gradients and b values from disk."""
@@ -319,6 +380,18 @@ class ApproxDPOTrainer():
         data = torch.load(load_path, map_location='cpu', weights_only=False)
         self.precomputed_gradients = data['gradients']
         self.precomputed_b_values = data['b_values']
+        
+        # Load projection matrix if it exists
+        if 'projection_matrix' in data:
+            self.projection_matrix = data['projection_matrix']
+            if 'projection_dim' in data:
+                self.projection_dim = data['projection_dim']
+            print(f"  Loaded projection matrix: {self.projection_matrix.shape}")
+        elif self.projection_dim is not None:
+            # Projection is enabled but not found in saved file
+            # This might be okay if we're loading old files, but warn the user
+            print(f"  Warning: Projection is enabled (dim={self.projection_dim}) but projection matrix not found in saved file.")
+            print(f"  Will generate new projection matrix if needed.")
         
         print(f"Loaded precomputed gradients and b values from {load_path}")
         print(f"  Number of samples: {len(self.precomputed_gradients)}")
@@ -425,6 +498,13 @@ class ApproxDPOTrainer():
                 # The gradient computation will determine which ones actually contribute
                 theta_diff_flat_list.append((p - p_theta0).detach().cpu().flatten())
             theta_diff_flat = torch.cat(theta_diff_flat_list).numpy()  # [num_params]
+            
+            # Apply random projection if enabled
+            if self.projection_dim is not None:
+                if self.projection_matrix is None:
+                    self._ensure_projection_matrix()
+                # Project: theta_diff_projected = projection_matrix^T @ theta_diff
+                theta_diff_flat = self.projection_matrix.T @ theta_diff_flat  # [projection_dim]
             
             # Compute logistic regression loss for each sample
             # According to paper A.1: l_hat(x, y1, y2, z) = log(1 + exp(b - z * g^T (θ - θ0)))

@@ -55,6 +55,8 @@ def main():
     parser.add_argument('--cache_dir', type=str, default='cache', help='Cache directory')
     parser.add_argument('--max_samples', type=int, default=None,
                        help='Maximum number of samples to precompute (None for all)')
+    parser.add_argument('--projection_dim', type=int, default=None,
+                       help='Dimension of the projected space for gradients (Johnson-Lindenstrauss). If None, no projection is applied.')
     args = parser.parse_args()
     
     set_seed(args.seed)
@@ -92,6 +94,7 @@ def main():
         tracker_project_name="precompute_gradients",
         log_with=None,
         seed=args.seed,
+        projection_dim=args.projection_dim,
     )
     
     # Create trainer
@@ -126,7 +129,11 @@ def main():
     pref_dataset_dataloader, all_eval_dataloaders = load_data(data_args)
     
     # Use training dataset for precomputation (same as training)
-    # Set up projection matrix if requested
+    # Ensure projection matrix is generated if projection is enabled
+    if config.projection_dim is not None:
+        trainer._ensure_projection_matrix()
+        print(f"Projection enabled: {trainer.projection_matrix.shape[0]} -> {trainer.projection_matrix.shape[1]}")
+    
     # Precompute gradients and b values
     print("Precomputing gradients and b values at reference model (θ0) on training dataset...")
     all_gradients = []
