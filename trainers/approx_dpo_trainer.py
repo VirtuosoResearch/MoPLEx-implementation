@@ -270,10 +270,21 @@ class ApproxDPOTrainer():
             )
             
             # Flatten and concatenate gradients
+            # IMPORTANT: Include ALL parameters that require_grad, even if gradient is None
+            # This ensures dimension consistency with training time
+            # If gradient is None, use zero gradient (parameter doesn't contribute to loss)
             grad_diff = []
-            for gw, gl in zip(grads_w_i, grads_l_i):
+            for param, gw, gl in zip(model_params, grads_w_i, grads_l_i):
                 if gw is not None and gl is not None:
                     grad_diff.append((gw - gl).detach().cpu().flatten())
+                elif gw is None and gl is None:
+                    # Parameter has no gradient (not in computation graph), use zero
+                    # This maintains dimension consistency with training time
+                    zero_grad = torch.zeros_like(param).cpu().flatten()
+                    grad_diff.append(zero_grad)
+                else:
+                    # One gradient is None but the other isn't - this shouldn't happen
+                    raise ValueError(f"Inconsistent gradients for parameter: {param.shape}")
             
             if grad_diff:
                 g_i = beta * torch.cat(grad_diff).numpy()  # [num_params]
@@ -404,8 +415,14 @@ class ApproxDPOTrainer():
                     ref_model_params.append(p_ref)
             
             # Compute (θ - θ0) for all parameters
+            # IMPORTANT: Use the same parameter filtering logic as in precomputation
+            # We need to match exactly which parameters were included in precomputation
+            # In precomputation, we only include parameters that have non-None gradients
+            # So here we should only include parameters that would have gradients
             theta_diff_flat_list = []
             for p, p_theta0 in zip(model_params, ref_model_params):
+                # Include all parameters that require grad (same filtering as model_params)
+                # The gradient computation will determine which ones actually contribute
                 theta_diff_flat_list.append((p - p_theta0).detach().cpu().flatten())
             theta_diff_flat = torch.cat(theta_diff_flat_list).numpy()  # [num_params]
             
@@ -429,10 +446,19 @@ class ApproxDPOTrainer():
                 
                 # Ensure dimensions match
                 if len(g_i) != len(theta_diff_flat):
+                    # Provide more detailed error message
+                    model_param_count = sum(p.numel() for p in model_params if p.requires_grad)
                     raise ValueError(
-                        f"Gradient dimension mismatch: precomputed gradient has {len(g_i)} dimensions, "
-                        f"but model parameters have {len(theta_diff_flat)} dimensions. "
-                        f"Make sure the precomputed gradients match the current model architecture."
+                        f"Gradient dimension mismatch:\n"
+                        f"  Precomputed gradient dimension: {len(g_i)}\n"
+                        f"  Current model parameter dimension: {len(theta_diff_flat)}\n"
+                        f"  Total trainable parameters: {model_param_count}\n"
+                        f"  Difference: {abs(len(g_i) - len(theta_diff_flat))}\n"
+                        f"This usually happens when:\n"
+                        f"  1. The model architecture changed between precomputation and training\n"
+                        f"  2. Tokenizer vocabulary size changed (affects embedding layer)\n"
+                        f"  3. LoRA configuration changed\n"
+                        f"Please recompute gradients with the same model configuration used for training."
                     )
                 
                 # Compute g^T (θ - θ0)
