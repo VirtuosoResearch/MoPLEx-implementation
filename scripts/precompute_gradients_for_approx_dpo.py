@@ -60,7 +60,7 @@ def main():
     args = parser.parse_args()
     
     set_seed(args.seed)
-    
+    output_path = os.path.join("pre_compute", args.output_path, f"{args.model_name.split('/')[-1]}_{args.projection_dim}.pt")
     # Setup accelerator
     accelerator = Accelerator(
         project_config=ProjectConfiguration(project_dir="./cache"),
@@ -190,13 +190,13 @@ def main():
     trainer.precomputed_b_values = np.array(all_b_values)
     
     # Save to disk
-    trainer.save_precomputed_gradients_and_b(args.output_path)
+    trainer.save_precomputed_gradients_and_b(output_path)
     
     print(f"\nPrecomputation complete!")
     print(f"  Total samples: {len(all_gradients)}")
     if len(all_gradients) > 0:
         print(f"  Gradient dimension: {len(all_gradients[0])}")
-        print(f"  Saved to: {args.output_path}")
+        print(f"  Saved to: {output_path}")
 
 
 if __name__ == "__main__":
