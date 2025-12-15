@@ -41,7 +41,7 @@ from accelerate.utils import ProjectConfiguration
 
 def main(args):
     set_seed(args.seed)
-    output_path = os.path.join("pre_compute", f"{args.model_name.split('/')[-1]}_{args.projection_dim}.pt")
+    output_path = os.path.join("pre_compute", f"{args.model_name.split('/')[-1]}_{args.projection_dim}_{args.downsample_ratio}.pt")
     # Setup accelerator
     accelerator = Accelerator(
         project_config=ProjectConfiguration(project_dir="./cache"),
@@ -115,10 +115,10 @@ def main(args):
         trainer._ensure_projection_matrix()
         print(f"Projection enabled: {trainer.projection_matrix.shape[0]} -> {trainer.projection_matrix.shape[1]}")
     
-    # Precompute gradients, b values, and (optionally) z values
-    print("Precomputing gradients and b values at reference model (theta_0) on training dataset...")
+    # Precompute gradients and (optionally) z values
+    # Note: b = 0 (since model == ref_model at θ0), so we don't compute or store it
+    print("Precomputing gradients at reference model (theta_0) on training dataset...")
     all_gradients = []
-    all_b_values = []
     all_z_values = []  # z \in {+1, -1}. For standard DPO, z = +1 (winner preferred).
     
     num_samples = 0
@@ -153,15 +153,14 @@ def main(args):
             responses_w = batch["response_w"].to(accelerator.device)
             responses_l = batch["response_l"].to(accelerator.device)
         
-        # Precompute for this batch
-        batch_gradients, batch_b_values = trainer.precompute_gradients_and_b(
+        # Precompute for this batch (only gradients, b = 0)
+        batch_gradients = trainer.precompute_gradients_and_b(
             queries=queries,
             responses_w=responses_w,
             responses_l=responses_l,
         )
         
         all_gradients.extend(batch_gradients)
-        all_b_values.extend(batch_b_values)
         # For standard DPO, each (query, response_w, response_l) has label z = +1
         all_z_values.extend([1.0] * len(batch_gradients))
         num_samples += len(batch_gradients)
@@ -171,7 +170,6 @@ def main(args):
     
     # Store in trainer
     trainer.precomputed_gradients = all_gradients
-    trainer.precomputed_b_values = np.array(all_b_values, dtype=np.float32)
     trainer.precomputed_z_values = np.array(all_z_values, dtype=np.float32)
     
     # Save to disk

@@ -123,10 +123,10 @@ class ApproxDPOTrainer():
         self.current_device = self.accelerator.device
         self.running = RunningMoments(self.accelerator)
         
-        # Storage for precomputed gradients, b values, and optional z values at reference model (θ0)
-        # According to paper A.1: g = ∇_θ h_θ0, b = -h_θ0, z ∈ {+1, -1}
+        # Storage for precomputed gradients at reference model (θ0)
+        # According to paper A.1: g = ∇_θ h_θ0
+        # Note: b = -h_θ0 = 0 (since model == ref_model at θ0), so we don't store it
         self.precomputed_gradients = None  # List of gradient vectors for each sample
-        self.precomputed_b_values = None   # List of b values for each sample
         self.precomputed_z_values = None   # Optional labels z_i for each sample
         
         # Random projection matrix for dimension reduction (Johnson-Lindenstrauss)
@@ -220,10 +220,10 @@ class ApproxDPOTrainer():
         sample_indices: Optional[torch.LongTensor] = None,
     ):
         """
-        Precompute gradients g and b values at reference model (θ0) for each sample.
+        Precompute gradients g at reference model (θ0) for each sample.
         According to paper A.1:
         - g = ∇_θ h_θ0(x, y1, y2) = β(∇_θ log π_θ0(y_w|x) - ∇_θ log π_θ0(y_l|x))
-        - b = -h_θ0(x, y1, y2) = -β(log π_θ0(y_w|x) - log π_θ0(y_l|x) - log π_ref(y_w|x) + log π_ref(y_l|x))
+        - b = -h_θ0(x, y1, y2) = 0 (since model == ref_model at θ0, so h_θ0 = 0)
         
         Args:
             queries: Query tensors [B, Lq]
@@ -233,7 +233,6 @@ class ApproxDPOTrainer():
             
         Returns:
             gradients: List of gradient vectors [B, num_params]
-            b_values: List of b values [B]
         """
         # Temporarily set model to reference model state for gradient computation.
         # IMPORTANT: store backups on CPU to avoid doubling GPU memory usage.
@@ -274,13 +273,6 @@ class ApproxDPOTrainer():
         logprobs_w_theta0, attn_shift_w = process_at_theta0(input_ids_w)
         logprobs_l_theta0, attn_shift_l = process_at_theta0(input_ids_l)
         
-        # Also compute at ref_model for b calculation
-        with torch.no_grad():
-            old_logits_w, _, _ = self.ref_model(**{"input_ids": input_ids_w, "attention_mask": (input_ids_w != pad_id).long()})
-            old_logits_l, _, _ = self.ref_model(**{"input_ids": input_ids_l, "attention_mask": (input_ids_l != pad_id).long()})
-            old_logprobs_w = logprobs_from_logits(old_logits_w[:, :-1, :], input_ids_w[:, 1:])
-            old_logprobs_l = logprobs_from_logits(old_logits_l[:, :-1, :], input_ids_l[:, 1:])
-        
         q_len = queries.size(1)
         mask_w = attn_shift_w.clone()
         mask_l = attn_shift_l.clone()
@@ -291,17 +283,8 @@ class ApproxDPOTrainer():
         # Compute sequence-level logprobs at theta_0
         seq_logprob_w_theta0 = (logprobs_w_theta0 * mask_w).sum(dim=1)  # [B]
         seq_logprob_l_theta0 = (logprobs_l_theta0 * mask_l).sum(dim=1)  # [B]
-        seq_old_logprob_w = (old_logprobs_w * mask_w).sum(dim=1)  # [B]
-        seq_old_logprob_l = (old_logprobs_l * mask_l).sum(dim=1)  # [B]
         
-        # Compute h_θ0 and b
-        # h_θ0 = β(log π_θ0(y_w|x) - log π_θ0(y_l|x)) - β(log π_ref(y_w|x) - log π_ref(y_l|x))
-        # Since model is set to theta_0 (ref_model), and ref_model is also theta_0:
-        # h_θ0 = β(log π_θ0(y_w|x) - log π_θ0(y_l|x)) - β(log π_θ0(y_w|x) - log π_θ0(y_l|x)) = 0
-        # So b = -h_θ0 = 0
-        # However, we compute it explicitly for correctness
-        h_theta0 = beta * ((seq_logprob_w_theta0 - seq_logprob_l_theta0) - (seq_old_logprob_w - seq_old_logprob_l))  # [B]
-        b_values = -h_theta0.detach().cpu().numpy()  # [B]
+        # Note: b = -h_θ0 = 0 (since model == ref_model at θ0), so we don't compute or return it
         
         # Compute gradients g = β(∇_θ log π_θ0(y_w|x) - ∇_θ log π_θ0(y_l|x))
         model_params = [p for p in self.model.parameters() if p.requires_grad]
@@ -363,7 +346,7 @@ class ApproxDPOTrainer():
                     # Copy from CPU backup to the current device
                     param.data.copy_(original_state[name].to(param.device).data)
         
-        return gradients_list, b_values
+        return gradients_list
 
     def solve_logistic_regression_for_theta(
         self,
@@ -381,7 +364,7 @@ class ApproxDPOTrainer():
             L(θ) = 1/N * Σ_i log(1 + exp(b_i - z_i * g_i^T θ)),
         where:
             - g_i: precomputed_gradients[i] (already projected if projection_dim is not None)
-            - b_i: precomputed_b_values[i]
+            - b_i = 0 (since model == ref_model at θ0)
             - z_i ∈ {+1, -1}: preference label (default +1 for all if not provided)
 
         Args:
@@ -408,10 +391,6 @@ class ApproxDPOTrainer():
         if num_samples == 0:
             raise ValueError("precomputed_gradients is empty - nothing to fit logistic regression on.")
 
-        # If b_values is None, create zeros (backward compatible)
-        if self.precomputed_b_values is None:
-            self.precomputed_b_values = np.zeros(num_samples, dtype=np.float32)
-
         # Determine which samples to use
         if sample_indices is None:
             indices = np.arange(num_samples, dtype=int)
@@ -431,7 +410,8 @@ class ApproxDPOTrainer():
             g_list.append(g_i)
 
         G = np.stack(g_list, axis=0).astype(np.float32)  # [N, d]
-        b_vec = self.precomputed_b_values[indices].astype(np.float32)  # [N]
+        # b = 0 for all samples (since model == ref_model at θ0)
+        b_vec = np.zeros(len(indices), dtype=np.float32)  # [N]
 
         N, d = G.shape
         if N == 0:
@@ -486,21 +466,13 @@ class ApproxDPOTrainer():
         return theta.detach().cpu().numpy()
 
     def save_precomputed_gradients_and_b(self, save_path: str):
-        """Save precomputed gradients, b values, and optional z values to disk."""
+        """Save precomputed gradients and optional z values to disk."""
         if self.precomputed_gradients is None:
             raise ValueError("No precomputed gradients to save. Call precompute_gradients_and_b first.")
         
         data = {
             'gradients': self.precomputed_gradients,
         }
-
-        # Only save b_values if they are not all zeros (to save disk space)
-        if self.precomputed_b_values is not None:
-            b_array = np.asarray(self.precomputed_b_values)
-            if not np.allclose(b_array, 0.0):
-                data['b_values'] = self.precomputed_b_values
-            else:
-                print("  Skipping b_values (all zeros)")
 
         # Save z values if they exist
         if self.precomputed_z_values is not None:
@@ -519,20 +491,11 @@ class ApproxDPOTrainer():
             print(f"  Projection matrix included: {self.projection_matrix.shape}")
 
     def load_precomputed_gradients_and_b(self, load_path: str):
-        """Load precomputed gradients, b values, and optional z values from disk."""
+        """Load precomputed gradients and optional z values from disk."""
         # Use weights_only=False to allow loading numpy arrays (PyTorch 2.6+ compatibility)
         data = torch.load(load_path, map_location='cpu', weights_only=False)
         self.precomputed_gradients = data['gradients']
         
-        # Load b_values if they exist, otherwise create zeros (backward compatible)
-        if 'b_values' in data:
-            self.precomputed_b_values = data['b_values']
-        else:
-            # If b_values not saved (because they were all zeros), create zeros
-            num_samples = len(self.precomputed_gradients)
-            self.precomputed_b_values = np.zeros(num_samples, dtype=np.float32)
-            print(f"  b_values not found in file (likely all zeros), created zeros array with shape {self.precomputed_b_values.shape}")
-
         # Load z values if they exist (backward compatible with older files)
         if 'z_values' in data:
             self.precomputed_z_values = data['z_values']
@@ -630,11 +593,6 @@ class ApproxDPOTrainer():
         if len(self.precomputed_gradients) == 0:
             raise ValueError("Precomputed gradients list is empty. Cannot proceed without precomputed gradients.")
         
-        # If b_values is None, create zeros (backward compatible)
-        if self.precomputed_b_values is None:
-            num_samples = len(self.precomputed_gradients)
-            self.precomputed_b_values = np.zeros(num_samples, dtype=np.float32)
-        
         # Use precomputed gradients and b values for logistic regression
         if compute_first_order:
             # Use precomputed gradients and b values for logistic regression
@@ -677,15 +635,14 @@ class ApproxDPOTrainer():
                 # Use sample index if provided, otherwise use batch index
                 sample_idx = sample_indices[i].item() if sample_indices is not None and i < len(sample_indices) else i
                 
-                if sample_idx >= len(self.precomputed_gradients) or sample_idx >= len(self.precomputed_b_values):
+                if sample_idx >= len(self.precomputed_gradients):
                     raise ValueError(
                         f"Sample index {sample_idx} out of range. "
-                        f"Precomputed gradients has {len(self.precomputed_gradients)} samples, "
-                        f"b_values has {len(self.precomputed_b_values)} samples."
+                        f"Precomputed gradients has {len(self.precomputed_gradients)} samples."
                     )
                 
                 g_i = self.precomputed_gradients[sample_idx]  # [num_params]
-                b_i = self.precomputed_b_values[sample_idx]    # scalar
+                b_i = 0.0  # b = 0 (since model == ref_model at θ0)
                 
                 # Ensure dimensions match
                 if len(g_i) != len(theta_diff_flat):
@@ -709,6 +666,7 @@ class ApproxDPOTrainer():
                 
                 # l_hat = log(1 + exp(b - g^T (θ - θ0)))
                 # This is the approximate DPO loss according to paper A.1
+                # Note: b = 0, so this simplifies to log(1 + exp(-g^T (θ - θ0)))
                 loss_i = np.log(1 + np.exp(b_i - g_dot_theta_diff))
                 loss_vec.append(loss_i)
             

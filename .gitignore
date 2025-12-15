@@ -178,3 +178,5 @@ gradients/
 results/
 
 *.csv
+*.png
+*.pt
