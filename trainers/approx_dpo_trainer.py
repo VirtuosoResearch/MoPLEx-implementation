@@ -123,10 +123,11 @@ class ApproxDPOTrainer():
         self.current_device = self.accelerator.device
         self.running = RunningMoments(self.accelerator)
         
-        # Storage for precomputed gradients and b values at reference model (θ0)
-        # According to paper A.1: g = ∇_θ h_θ0, b = -h_θ0
+        # Storage for precomputed gradients, b values, and optional z values at reference model (θ0)
+        # According to paper A.1: g = ∇_θ h_θ0, b = -h_θ0, z ∈ {+1, -1}
         self.precomputed_gradients = None  # List of gradient vectors for each sample
         self.precomputed_b_values = None   # List of b values for each sample
+        self.precomputed_z_values = None   # Optional labels z_i for each sample
         
         # Random projection matrix for dimension reduction (Johnson-Lindenstrauss)
         self.projection_matrix = None  # [num_params, projection_dim] if projection_dim is not None
@@ -234,17 +235,25 @@ class ApproxDPOTrainer():
             gradients: List of gradient vectors [B, num_params]
             b_values: List of b values [B]
         """
-        # Temporarily set model to reference model state for gradient computation
-        original_state = {name: param.clone() for name, param in self.model.named_parameters()}
+        # Temporarily set model to reference model state for gradient computation.
+        # IMPORTANT: store backups on CPU to avoid doubling GPU memory usage.
+        original_state = {
+            name: param.detach().cpu().clone()
+            for name, param in self.model.named_parameters()
+        }
         
-        # Save reference model state
-        ref_state_dict = {name: param.clone() for name, param in self.ref_model.named_parameters()}
+        # Save reference model state (also on CPU)
+        ref_state_dict = {
+            name: param.detach().cpu().clone()
+            for name, param in self.ref_model.named_parameters()
+        }
         
         # Set model to reference model state (theta_0)
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if name in ref_state_dict:
-                    param.data.copy_(ref_state_dict[name].data)
+                    # Copy from CPU backup to the current device
+                    param.data.copy_(ref_state_dict[name].to(param.device).data)
         
         input_ids_w = torch.cat((queries, responses_w), dim=1)
         input_ids_l = torch.cat((queries, responses_l), dim=1)
@@ -351,7 +360,8 @@ class ApproxDPOTrainer():
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if name in original_state:
-                    param.data.copy_(original_state[name].data)
+                    # Copy from CPU backup to the current device
+                    param.data.copy_(original_state[name].to(param.device).data)
         
         return gradients_list, b_values
 
@@ -388,15 +398,19 @@ class ApproxDPOTrainer():
             theta: numpy array of shape [d], where d = len(g_i). If projection_dim is not None,
                    this is in the projected space; otherwise it corresponds to full parameter space.
         """
-        if self.precomputed_gradients is None or self.precomputed_b_values is None:
+        if self.precomputed_gradients is None:
             raise ValueError(
-                "No precomputed gradients/b values found. "
+                "No precomputed gradients found. "
                 "Call `load_precomputed_gradients_and_b` or `precompute_gradients_and_b` first."
             )
 
         num_samples = len(self.precomputed_gradients)
         if num_samples == 0:
             raise ValueError("precomputed_gradients is empty - nothing to fit logistic regression on.")
+
+        # If b_values is None, create zeros (backward compatible)
+        if self.precomputed_b_values is None:
+            self.precomputed_b_values = np.zeros(num_samples, dtype=np.float32)
 
         # Determine which samples to use
         if sample_indices is None:
@@ -472,14 +486,25 @@ class ApproxDPOTrainer():
         return theta.detach().cpu().numpy()
 
     def save_precomputed_gradients_and_b(self, save_path: str):
-        """Save precomputed gradients and b values to disk."""
-        if self.precomputed_gradients is None or self.precomputed_b_values is None:
-            raise ValueError("No precomputed gradients and b values to save. Call precompute_gradients_and_b first.")
+        """Save precomputed gradients, b values, and optional z values to disk."""
+        if self.precomputed_gradients is None:
+            raise ValueError("No precomputed gradients to save. Call precompute_gradients_and_b first.")
         
         data = {
             'gradients': self.precomputed_gradients,
-            'b_values': self.precomputed_b_values,
         }
+
+        # Only save b_values if they are not all zeros (to save disk space)
+        if self.precomputed_b_values is not None:
+            b_array = np.asarray(self.precomputed_b_values)
+            if not np.allclose(b_array, 0.0):
+                data['b_values'] = self.precomputed_b_values
+            else:
+                print("  Skipping b_values (all zeros)")
+
+        # Save z values if they exist
+        if self.precomputed_z_values is not None:
+            data['z_values'] = self.precomputed_z_values
         
         # Save projection matrix if it exists
         if self.projection_matrix is not None:
@@ -494,11 +519,25 @@ class ApproxDPOTrainer():
             print(f"  Projection matrix included: {self.projection_matrix.shape}")
 
     def load_precomputed_gradients_and_b(self, load_path: str):
-        """Load precomputed gradients and b values from disk."""
+        """Load precomputed gradients, b values, and optional z values from disk."""
         # Use weights_only=False to allow loading numpy arrays (PyTorch 2.6+ compatibility)
         data = torch.load(load_path, map_location='cpu', weights_only=False)
         self.precomputed_gradients = data['gradients']
-        self.precomputed_b_values = data['b_values']
+        
+        # Load b_values if they exist, otherwise create zeros (backward compatible)
+        if 'b_values' in data:
+            self.precomputed_b_values = data['b_values']
+        else:
+            # If b_values not saved (because they were all zeros), create zeros
+            num_samples = len(self.precomputed_gradients)
+            self.precomputed_b_values = np.zeros(num_samples, dtype=np.float32)
+            print(f"  b_values not found in file (likely all zeros), created zeros array with shape {self.precomputed_b_values.shape}")
+
+        # Load z values if they exist (backward compatible with older files)
+        if 'z_values' in data:
+            self.precomputed_z_values = data['z_values']
+        else:
+            self.precomputed_z_values = None
         
         # Load projection matrix if it exists
         if 'projection_matrix' in data:
@@ -583,13 +622,18 @@ class ApproxDPOTrainer():
         beta = self.config.temperature  # β in the paper
         
         # MUST use precomputed gradients - no online computation allowed
-        if self.precomputed_gradients is None or self.precomputed_b_values is None:
+        if self.precomputed_gradients is None:
             raise ValueError(
-                "ApproxDPOTrainer requires precomputed gradients and b values. "
+                "ApproxDPOTrainer requires precomputed gradients. "
                 "Please call load_precomputed_gradients_and_b() or precompute_gradients_and_b() first."
             )
         if len(self.precomputed_gradients) == 0:
             raise ValueError("Precomputed gradients list is empty. Cannot proceed without precomputed gradients.")
+        
+        # If b_values is None, create zeros (backward compatible)
+        if self.precomputed_b_values is None:
+            num_samples = len(self.precomputed_gradients)
+            self.precomputed_b_values = np.zeros(num_samples, dtype=np.float32)
         
         # Use precomputed gradients and b values for logistic regression
         if compute_first_order:

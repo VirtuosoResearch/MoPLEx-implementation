@@ -39,28 +39,9 @@ from trainers.utils import set_seed
 from accelerate import Accelerator
 from accelerate.utils import ProjectConfiguration
 
-def main():
-    parser = argparse.ArgumentParser(description='Precompute gradients and b values for ApproxDPO')
-    parser.add_argument('--model_name', type=str, default='meta-llama/Llama-3.2-1B',
-                       help='Model name')
-    parser.add_argument('--preference_dataset_path', type=str,
-                       default='Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength',
-                       help='Path to preference dataset')
-    parser.add_argument('--output_path', type=str, default='precomputed_gradients_b.pt',
-                       help='Path to save precomputed gradients and b values')
-    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for precomputation')
-    parser.add_argument('--temperature', type=float, default=0.05, help='Temperature parameter')
-    parser.add_argument('--use_lora', action='store_true', help='Use LoRA')
-    parser.add_argument('--seed', type=int, default=42, help='Random seed')
-    parser.add_argument('--cache_dir', type=str, default='cache', help='Cache directory')
-    parser.add_argument('--max_samples', type=int, default=None,
-                       help='Maximum number of samples to precompute (None for all)')
-    parser.add_argument('--projection_dim', type=int, default=None,
-                       help='Dimension of the projected space for gradients (Johnson-Lindenstrauss). If None, no projection is applied.')
-    args = parser.parse_args()
-    
+def main(args):
     set_seed(args.seed)
-    output_path = os.path.join("pre_compute", args.output_path, f"{args.model_name.split('/')[-1]}_{args.projection_dim}.pt")
+    output_path = os.path.join("pre_compute", f"{args.model_name.split('/')[-1]}_{args.projection_dim}.pt")
     # Setup accelerator
     accelerator = Accelerator(
         project_config=ProjectConfiguration(project_dir="./cache"),
@@ -117,7 +98,7 @@ def main():
         preference_dataset_subset=None,
         preference_dataset_split=None,
         preference_num_samples=None,
-        downsample_ratio=1.0,
+        downsample_ratio=args.downsample_ratio,
         batch_size=args.batch_size,
         mini_batch_size=args.batch_size,
         seed=args.seed,
@@ -134,10 +115,11 @@ def main():
         trainer._ensure_projection_matrix()
         print(f"Projection enabled: {trainer.projection_matrix.shape[0]} -> {trainer.projection_matrix.shape[1]}")
     
-    # Precompute gradients and b values
-    print("Precomputing gradients and b values at reference model (θ0) on training dataset...")
+    # Precompute gradients, b values, and (optionally) z values
+    print("Precomputing gradients and b values at reference model (theta_0) on training dataset...")
     all_gradients = []
     all_b_values = []
+    all_z_values = []  # z \in {+1, -1}. For standard DPO, z = +1 (winner preferred).
     
     num_samples = 0
     for batch_idx, batch in enumerate(tqdm(pref_dataset_dataloader, desc="Precomputing")):
@@ -180,6 +162,8 @@ def main():
         
         all_gradients.extend(batch_gradients)
         all_b_values.extend(batch_b_values)
+        # For standard DPO, each (query, response_w, response_l) has label z = +1
+        all_z_values.extend([1.0] * len(batch_gradients))
         num_samples += len(batch_gradients)
         
         if args.max_samples is not None and num_samples >= args.max_samples:
@@ -187,7 +171,8 @@ def main():
     
     # Store in trainer
     trainer.precomputed_gradients = all_gradients
-    trainer.precomputed_b_values = np.array(all_b_values)
+    trainer.precomputed_b_values = np.array(all_b_values, dtype=np.float32)
+    trainer.precomputed_z_values = np.array(all_z_values, dtype=np.float32)
     
     # Save to disk
     trainer.save_precomputed_gradients_and_b(output_path)
@@ -200,4 +185,22 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description='Precompute gradients and b values for ApproxDPO')
+    parser.add_argument('--model_name', type=str, default='meta-llama/Llama-3.2-1B',
+                       help='Model name')
+    parser.add_argument('--preference_dataset_path', type=str,
+                       default='Asap7772/relabeled_alpacafarm_pythiasft_20K_preference_data_minlength',
+                       help='Path to preference dataset')
+    parser.add_argument('--batch_size', type=int, default=4, help='Batch size for precomputation')
+    parser.add_argument('--temperature', type=float, default=0.05, help='Temperature parameter')
+    parser.add_argument('--use_lora', action='store_true', help='Use LoRA')
+    parser.add_argument('--seed', type=int, default=42, help='Random seed')
+    parser.add_argument('--cache_dir', type=str, default='cache', help='Cache directory')
+    parser.add_argument('--max_samples', type=int, default=None,
+                       help='Maximum number of samples to precompute (None for all)')
+    parser.add_argument('--projection_dim', type=int, default=None,
+                       help='Dimension of the projected space for gradients (Johnson-Lindenstrauss). If None, no projection is applied.')
+    parser.add_argument('--downsample_ratio', type=float, default=1.0,
+                       help='Downsample ratio for the dataset. If 1.0, use the full dataset')
+    args = parser.parse_args()
+    main(args)

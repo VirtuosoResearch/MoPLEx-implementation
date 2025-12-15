@@ -123,6 +123,16 @@ def load_data(args):
     pref_dataset, eval_pref_dataset = pref_dataset['train'], pref_dataset['test']
     remove_columns = ['output', 'text', 'alpaca_text', 'y_ref', 'y_1', 'y_2', 'y_w', 'y_w_alpaca', 'y_l', 'y_l_alpaca', 'y_w_score', 'y_l_score', 'score_diff', 'prompt', 'alpaca_prompt']
 
+    # Optionally restrict the size of the evaluation dataset using args.num_samples_test.
+    # If args.num_samples_test is None or missing, use the full evaluation dataset.
+    num_samples_test = getattr(args, "num_samples_test", None)
+    if num_samples_test is not None:
+        if num_samples_test <= 0:
+            raise ValueError(f"num_samples_test must be positive when provided, got {num_samples_test}.")
+        n_eval = len(eval_pref_dataset)
+        num_eval = min(int(num_samples_test), n_eval)
+        eval_pref_dataset = eval_pref_dataset.select(range(num_eval))
+
     pref_dataset = pref_dataset.shuffle(seed=args.seed).select(range(int(len(pref_dataset) * args.downsample_ratio)))
     eval_pref_dataset = eval_pref_dataset.shuffle(seed=args.seed).select(range(int(len(eval_pref_dataset) * args.downsample_ratio)))
 

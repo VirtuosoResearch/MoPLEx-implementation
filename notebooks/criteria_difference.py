@@ -88,7 +88,7 @@ from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 rc('font', **{'family': 'sans-serif', 'sans-serif': ['Helvetica']})
 mpl.rcParams['savefig.dpi'] = 1200
-mpl.rcParams['text.usetex'] = True  # optional
+mpl.rcParams['text.usetex'] = False  # optional
 
 CRITERIA = ["helpfulness", "truthfulness", "instruction_following", "honesty"]
 
