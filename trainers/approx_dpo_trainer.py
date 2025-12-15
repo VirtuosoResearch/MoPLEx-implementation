@@ -35,6 +35,7 @@ from packaging import version
 import datasets
 from copy import deepcopy
 import tqdm
+import math
 
 PreTrainedModelWrapper = typing.Union[nn.Module, nn.DataParallel]
 
@@ -239,7 +240,7 @@ class ApproxDPOTrainer():
         # Save reference model state
         ref_state_dict = {name: param.clone() for name, param in self.ref_model.named_parameters()}
         
-        # Set model to reference model state (θ0)
+        # Set model to reference model state (theta_0)
         with torch.no_grad():
             for name, param in self.model.named_parameters():
                 if name in ref_state_dict:
@@ -252,7 +253,7 @@ class ApproxDPOTrainer():
         batch_size = queries.size(0)
         beta = self.config.temperature
         
-        # Compute logprobs at θ0
+        # Compute logprobs at theta_0
         def process_at_theta0(input_ids):
             attention_mask = (input_ids != pad_id).long()
             input_data = {"input_ids": input_ids, "attention_mask": attention_mask}
@@ -278,7 +279,7 @@ class ApproxDPOTrainer():
             mask_w[:, :q_len - 1] = 0
             mask_l[:, :q_len - 1] = 0
         
-        # Compute sequence-level logprobs at θ0
+        # Compute sequence-level logprobs at theta_0
         seq_logprob_w_theta0 = (logprobs_w_theta0 * mask_w).sum(dim=1)  # [B]
         seq_logprob_l_theta0 = (logprobs_l_theta0 * mask_l).sum(dim=1)  # [B]
         seq_old_logprob_w = (old_logprobs_w * mask_w).sum(dim=1)  # [B]
@@ -286,7 +287,7 @@ class ApproxDPOTrainer():
         
         # Compute h_θ0 and b
         # h_θ0 = β(log π_θ0(y_w|x) - log π_θ0(y_l|x)) - β(log π_ref(y_w|x) - log π_ref(y_l|x))
-        # Since model is set to θ0 (ref_model), and ref_model is also θ0:
+        # Since model is set to theta_0 (ref_model), and ref_model is also theta_0:
         # h_θ0 = β(log π_θ0(y_w|x) - log π_θ0(y_l|x)) - β(log π_θ0(y_w|x) - log π_θ0(y_l|x)) = 0
         # So b = -h_θ0 = 0
         # However, we compute it explicitly for correctness
@@ -354,6 +355,122 @@ class ApproxDPOTrainer():
         
         return gradients_list, b_values
 
+    def solve_logistic_regression_for_theta(
+        self,
+        sample_indices: Optional[Iterable[int]] = None,
+        z: Optional[Union[np.ndarray, List[float]]] = None,
+        max_iters: int = 1000,
+        lr: float = 0.1,
+        tol: float = 1e-6,
+        verbose: bool = True,
+    ) -> np.ndarray:
+        """
+        Solve the logistic regression described in Appendix A.1 using precomputed g, b, z.
+
+        We minimize, over θ,
+            L(θ) = 1/N * Σ_i log(1 + exp(b_i - z_i * g_i^T θ)),
+        where:
+            - g_i: precomputed_gradients[i] (already projected if projection_dim is not None)
+            - b_i: precomputed_b_values[i]
+            - z_i ∈ {+1, -1}: preference label (default +1 for all if not provided)
+
+        Args:
+            sample_indices: Optional iterable of indices specifying a subset S of samples.
+                            If None, use all precomputed samples.
+            z: Optional array/list of labels with same length as sample_indices (or all samples if None).
+               If None, we assume standard DPO setting where y_w is always preferred, so z_i = +1.
+            max_iters: Maximum number of optimization steps.
+            lr: Learning rate for optimizer.
+            tol: Early stopping tolerance on loss improvement.
+            verbose: Whether to print optimization progress.
+
+        Returns:
+            theta: numpy array of shape [d], where d = len(g_i). If projection_dim is not None,
+                   this is in the projected space; otherwise it corresponds to full parameter space.
+        """
+        if self.precomputed_gradients is None or self.precomputed_b_values is None:
+            raise ValueError(
+                "No precomputed gradients/b values found. "
+                "Call `load_precomputed_gradients_and_b` or `precompute_gradients_and_b` first."
+            )
+
+        num_samples = len(self.precomputed_gradients)
+        if num_samples == 0:
+            raise ValueError("precomputed_gradients is empty - nothing to fit logistic regression on.")
+
+        # Determine which samples to use
+        if sample_indices is None:
+            indices = np.arange(num_samples, dtype=int)
+        else:
+            indices = np.array(list(sample_indices), dtype=int)
+            if indices.ndim != 1:
+                raise ValueError("sample_indices must be a 1D iterable of indices.")
+
+        # Build feature matrix G and vectors b, z
+        g_list = []
+        for idx in indices:
+            if idx < 0 or idx >= num_samples:
+                raise IndexError(f"sample index {idx} out of range [0, {num_samples}).")
+            g_i = self.precomputed_gradients[idx]
+            if not isinstance(g_i, np.ndarray):
+                g_i = np.asarray(g_i)
+            g_list.append(g_i)
+
+        G = np.stack(g_list, axis=0).astype(np.float32)  # [N, d]
+        b_vec = self.precomputed_b_values[indices].astype(np.float32)  # [N]
+
+        N, d = G.shape
+        if N == 0:
+            raise ValueError("Selected sample_indices result in zero samples.")
+
+        if z is None:
+            # In standard DPO, y_w is always preferred, so z = +1
+            z_vec = np.ones(N, dtype=np.float32)
+        else:
+            z_arr = np.asarray(z, dtype=np.float32)
+            if z_arr.shape[0] != N:
+                raise ValueError(
+                    f"Provided z has length {z_arr.shape[0]}, "
+                    f"but number of selected samples is {N}."
+                )
+            z_vec = z_arr
+
+        # Convert to torch tensors on CPU – this is a small optimization problem
+        device = torch.device("cpu")
+        G_t = torch.from_numpy(G).to(device)          # [N, d]
+        b_t = torch.from_numpy(b_vec).to(device)      # [N]
+        z_t = torch.from_numpy(z_vec).to(device)      # [N]
+
+        # Initialize theta at zero (i.e., θ = θ0 initially)
+        theta = torch.zeros(d, device=device, requires_grad=True)
+
+        optimizer = torch.optim.Adam([theta], lr=lr)
+
+        prev_loss = math.inf
+        for it in range(max_iters):
+            optimizer.zero_grad()
+
+            # logits_i = b_i - z_i * g_i^T θ
+            logits = b_t - z_t * (G_t @ theta)  # [N]
+
+            # log(1 + exp(logits)) is the per-sample logistic loss
+            loss = torch.log1p(torch.exp(logits)).mean()
+
+            loss.backward()
+            optimizer.step()
+
+            current_loss = loss.item()
+            if verbose and (it % 100 == 0 or it == max_iters - 1):
+                print(f"[LogReg] iter={it}, loss={current_loss:.6f}")
+
+            if abs(prev_loss - current_loss) < tol:
+                if verbose:
+                    print(f"[LogReg] Converged at iter={it}, loss={current_loss:.6f}")
+                break
+            prev_loss = current_loss
+
+        return theta.detach().cpu().numpy()
+
     def save_precomputed_gradients_and_b(self, save_path: str):
         """Save precomputed gradients and b values to disk."""
         if self.precomputed_gradients is None or self.precomputed_b_values is None:
@@ -369,7 +486,9 @@ class ApproxDPOTrainer():
             data['projection_matrix'] = self.projection_matrix
             data['projection_dim'] = self.projection_dim
         
-        torch.save(data, save_path, _use_new_zipfile_serialization=False)
+        # Use pickle protocol 4 to support files larger than 4GB
+        import pickle
+        torch.save(data, save_path, pickle_protocol=4, _use_new_zipfile_serialization=False)
         print(f"Saved precomputed gradients and b values to {save_path}")
         if self.projection_matrix is not None:
             print(f"  Projection matrix included: {self.projection_matrix.shape}")
