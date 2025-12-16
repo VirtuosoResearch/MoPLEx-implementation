@@ -12,7 +12,7 @@ import os
 import sys
 import numpy as np
 import torch
-from typing import List, Set, Optional, Union, Iterable
+from typing import List, Set, Optional, Union, Iterable, Tuple, Tuple
 
 # Add notebooks directory to path for imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -106,6 +106,11 @@ def compute_f_i(
     if z is not None:
         z_S = z[S_list]
     
+    # Note: If gradients were projected during precomputation (e.g., from millions to 200 dims),
+    # then theta_S will also be in the projected space. This is correct because:
+    # - g_i (projected) @ theta_S (projected) gives the same result as
+    # - g_i (full) @ theta_S (full) in terms of the logistic regression loss
+    # No inverse projection is needed since all operations stay in the projected space.
     theta_S = solve_logistic_regression(
         gradients=gradients_S,
         b_values=b_values_S,
@@ -122,10 +127,131 @@ def compute_f_i(
     z_i = 1.0 if z is None else z[test_idx]
     
     # Compute loss: log(1 + exp(b_i - z_i * g_i^T theta_S))
+    # Both g_i and theta_S are in the same space (projected if projection was used)
     g_dot_theta = np.dot(g_i, theta_S)
     loss_i = np.log(1 + np.exp(b_i - z_i * g_dot_theta))
     
     return float(loss_i)
+
+
+def unproject_theta(
+    theta_projected: np.ndarray,
+    projection_matrix: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """
+    Unproject theta from projected space back to full parameter space using pseudo-inverse.
+    
+    If projection_matrix is None, returns theta_projected as-is (no projection was used).
+    
+    During precomputation, projection is: g_projected = projection_matrix.T @ g_full
+    So unprojection uses pseudo-inverse: g_full = (projection_matrix.T)^+ @ g_projected
+    
+    Args:
+        theta_projected: theta in projected space [projection_dim]
+        projection_matrix: projection matrix [num_params, projection_dim] or None
+        
+    Returns:
+        theta_full: theta in full parameter space [num_params]
+    """
+    if projection_matrix is None:
+        return theta_projected
+    
+    # projection_matrix: [num_params, projection_dim]
+    # projection_matrix.T: [projection_dim, num_params]
+    # Pseudo-inverse: (projection_matrix.T)^+ = projection_matrix @ (projection_matrix.T @ projection_matrix)^(-1)
+    # This is more accurate than just projection_matrix @ theta_projected
+    
+    # Compute (projection_matrix.T @ projection_matrix)^(-1)
+    # This is [projection_dim, projection_dim]
+    PTP = projection_matrix.T @ projection_matrix  # [projection_dim, projection_dim]
+    PTP_inv = np.linalg.pinv(PTP)  # Use pseudo-inverse for numerical stability
+    
+    # Compute pseudo-inverse of projection_matrix.T
+    # (projection_matrix.T)^+ = projection_matrix @ PTP_inv
+    proj_T_pinv = projection_matrix @ PTP_inv  # [num_params, projection_dim]
+    
+    # Unproject: theta_full = (projection_matrix.T)^+ @ theta_projected
+    theta_full = proj_T_pinv @ theta_projected  # [num_params]
+    
+    return theta_full
+
+
+def evaluate_model_on_new_data(
+    theta_full: np.ndarray,
+    gradients_new: List[np.ndarray],
+    z_new: Optional[np.ndarray] = None,
+    projection_matrix: Optional[np.ndarray] = None,
+) -> Tuple[np.ndarray, float]:
+    losses = []
+    
+    for idx, g_new in enumerate(gradients_new):
+        if projection_matrix is not None:
+            theta_projected = projection_matrix.T @ theta_full
+            g_dot_theta = np.dot(g_new, theta_projected)
+        else:
+            # New gradients are in full space, use theta_full directly
+            g_dot_theta = np.dot(g_new, theta_full)
+        
+        b_i = 0.0  # b = 0
+        z_i = 1.0 if z_new is None else z_new[idx]
+        loss_i = np.log(1 + np.exp(b_i - z_i * g_dot_theta))
+        losses.append(loss_i)
+    
+    losses = np.array(losses, dtype=np.float32)
+    mean_loss = float(np.mean(losses))
+    
+    return losses, mean_loss
+
+
+def train_and_evaluate_model(
+    training_subset: Set[int],
+    gradients: List[np.ndarray],
+    z: Optional[np.ndarray] = None,
+    projection_matrix: Optional[np.ndarray] = None,
+    test_gradients: Optional[List[np.ndarray]] = None,
+    test_z: Optional[np.ndarray] = None,
+    max_iters: int = 1000,
+    lr: float = 0.1,
+    tol: float = 1e-6,
+    verbose: bool = False,
+) -> Tuple[np.ndarray, np.ndarray, Optional[Tuple[np.ndarray, float]]]:
+
+    if len(training_subset) == 0:
+        raise ValueError("Training subset cannot be empty.")
+    
+    # Train logistic regression
+    S_list = sorted(training_subset)
+    gradients_S = [gradients[j] for j in S_list]
+    b_values_S = np.zeros(len(S_list), dtype=np.float32)  # b = 0
+    
+    z_S = None
+    if z is not None:
+        z_S = z[S_list]
+    
+    theta_projected = solve_logistic_regression(
+        gradients=gradients_S,
+        b_values=b_values_S,
+        z=z_S,
+        max_iters=max_iters,
+        lr=lr,
+        tol=tol,
+        verbose=verbose,
+    )
+    
+    # Unproject to full parameter space
+    theta_full = unproject_theta(theta_projected, projection_matrix)
+    
+    # Optionally evaluate on test data
+    test_results = None
+    if test_gradients is not None:
+        test_results = evaluate_model_on_new_data(
+            theta_full=theta_full,
+            gradients_new=test_gradients,
+            z_new=test_z,
+            projection_matrix=projection_matrix,
+        )
+    
+    return theta_projected, theta_full, test_results
 
 
 def compute_kernel_matrix(
@@ -163,19 +289,6 @@ def predict_surrogate(
     n: int,
     sigma: float = 1.0,
 ) -> float:
-    """
-    Predict f_i(S) using surrogate model: g_i(S) = Σ_j α_j K(1_S, 1_{S_j}).
-    
-    Args:
-        S: query subset
-        basis_subsets: list of basis subsets S_j (typically single-element sets)
-        alpha: learned coefficients
-        n: total number of samples
-        sigma: RBF kernel bandwidth
-        
-    Returns:
-        prediction: predicted value g_i(S)
-    """
     indicator_S = indicator_vector(S, n)
     prediction = 0.0
     
@@ -187,9 +300,11 @@ def predict_surrogate(
     return float(prediction)
 
 
+
 def estimate_affinity_scores(
     gradients: List[np.ndarray],
     z: Optional[np.ndarray] = None,
+    projection_matrix: Optional[np.ndarray] = None,
     num_training_subsets: int = 1000,
     training_subset_size: int = 10,
     num_evaluation_subsets: Optional[int] = None,
@@ -200,35 +315,7 @@ def estimate_affinity_scores(
     tol: float = 1e-6,
     verbose: bool = True,
 ) -> np.ndarray:
-    """
-    Estimate affinity scores T_{i,j} using kernel-based surrogate model.
-    
-    According to paper Section A.2:
-    T_{i,j} = (1 / n_{i,j}) * Σ_{t: i in S_t, j in S_t} f_i(S_t)
-    
-    We use surrogate model to approximate f_i(S_t) without full training.
-    
-    Fix for the three problems:
-    1. Train surrogate on diverse subsets S (not just singletons)
-    2. Use singleton basis S_j = {j} for kernel representation
-    3. f_i(S) correctly represents training on subset S, testing on preference i
-    
-    Args:
-        gradients: list of gradient vectors for all samples
-        z: optional labels for all samples
-        num_training_subsets: number of diverse subsets to use for training surrogate
-        training_subset_size: size of each training subset
-        num_evaluation_subsets: number of subsets for final T estimation (None = use training subsets)
-        sigma: RBF kernel bandwidth
-        reg: L2 regularization for surrogate learning
-        max_iters: max iterations for logistic regression
-        lr: learning rate for logistic regression
-        tol: tolerance for convergence
-        verbose: whether to print progress
-        
-    Returns:
-        T: affinity matrix of shape [n, n] where T[i, j] estimates how task j affects task i
-    """
+
     import random
     
     n = len(gradients)
@@ -310,15 +397,6 @@ def estimate_affinity_scores(
         
         training_targets = np.array(training_targets, dtype=np.float32)
         
-        # Build kernel matrix between training subsets and basis subsets
-        # Note on kernel structure with singleton basis S_j = {j}:
-        # For fixed subset size |S|, ||1_S - 1_{j}||^2 = |S| + 1 - 2·1[j ∈ S]
-        # So K(1_S, 1_j) = exp(-(|S|-1)/(2σ^2)) if j ∈ S, else exp(-(|S|+1)/(2σ^2))
-        # This means for fixed |S|, each column feature has only two values,
-        # determined solely by membership j ∈ S. The model is essentially a
-        # "smooth linear model based on membership", where sigma only controls
-        # the in/out interval. To capture finer "nonlinearity of subset overlap",
-        # we would need to expand the basis to more representative subsets.
         K_train_basis = np.zeros((len(training_subsets), len(basis_subsets)), dtype=np.float32)
         for idx, S in enumerate(training_subsets):
             indicator_S = indicator_vector(S, n)
@@ -410,6 +488,7 @@ if __name__ == "__main__":
     T = estimate_affinity_scores(
         gradients=gradients_np,
         z=z_values_np,
+        projection_matrix=projection_matrix,  # Pass projection matrix for potential unprojection
         num_training_subsets=1000,  # Diverse subsets for training surrogate
         training_subset_size=10,    # Size of each training subset
         num_evaluation_subsets=None,  # None = reuse training subsets for evaluation
