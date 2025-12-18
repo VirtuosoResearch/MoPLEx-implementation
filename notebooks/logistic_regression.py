@@ -9,16 +9,17 @@ import torch
 
 def load_precomputed_gradients_b(precompute_filename: str):
     """
-    Load precomputed gradients and b values from ./pre_compute.
+    Load precomputed gradients from ./pre_compute.
 
     The expected file is created by scripts/precompute_gradients_for_approx_dpo.py
     and should contain at least:
         - "gradients": list/array of gradient vectors (optionally projected)
-        - "b_values": numpy array or tensor of shape [N]
     Optionally:
         - "z_values": numpy array or tensor of shape [N] with labels in {+1, -1}
         - "projection_matrix": [num_params, projection_dim]
         - "projection_dim": int
+    
+    Note: b_values are not stored (b = 0 since model == ref_model at θ0).
     """
     script_dir = os.path.dirname(os.path.abspath(__file__))
     precompute_path = os.path.join(script_dir, "..", "pre_compute", precompute_filename)
@@ -34,14 +35,9 @@ def load_precomputed_gradients_b(precompute_filename: str):
         )
 
     gradients = data["gradients"]
-    # b_values may not exist if they were all zeros (to save disk space)
-    if "b_values" in data:
-        b_values = data["b_values"]
-    else:
-        # If b_values not saved (because they were all zeros), create zeros
-        num_samples = len(gradients)
-        b_values = np.zeros(num_samples, dtype=np.float32)
-        print(f"  b_values not found in file (likely all zeros), created zeros array with shape {b_values.shape}")
+    # b_values are not stored (b = 0), so create zeros array
+    num_samples = len(gradients)
+    b_values = np.zeros(num_samples, dtype=np.float32)
     
     z_values = data.get("z_values", None)
 
@@ -212,7 +208,7 @@ if __name__ == "__main__":
 
     # You can either hard-code the precompute file or pass it via CLI.
     # Here we keep the default path for convenience, but still support z_values if present.
-    precompute_filename = "../pre_compute/precomputed_gradients_b.pt"
+    precompute_filename = "../pre_compute/Llama-3.2-1B_200.pt"
     gradients_np, b_values_np, z_values_np, projection_matrix, projection_dim = load_precomputed_gradients_b(
         precompute_filename
     )

@@ -4,5 +4,5 @@ python trainers/precompute_gradients_for_approx_dpo.py \
     --batch_size 4 \
     --use_lora \
     --projection_dim 200 \
-    --downsample_ratio 0.02 \
+    --downsample_ratio 0.05 \
     # --max_samples 100
