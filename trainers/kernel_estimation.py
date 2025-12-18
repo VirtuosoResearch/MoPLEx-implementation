@@ -1,18 +1,21 @@
 """
-Kernel-based surrogate model for reward estimation.
+Direct computation of affinity scores for reward estimation.
 
-According to the paper Section 3.1:
+According to the paper Section A.2:
 - f_i(S): test result for preference i when reward model is trained on subset S
-- g_i(S): surrogate model that predicts f_i(S) using kernel method
-- g_i(S) = Σ_{j=1}^n α_{ij} K(1_S, 1_{S_j})
-  where K(u, v) = exp(-||u-v||^2 / (2σ^2)) is RBF kernel
+- T_{i,j}: affinity score = (1 / n_{i,j}) * Σ_{t: i in S_t, j in S_t} f_i(S_t)
+
+We compute T_{i,j} directly by:
+1. Sampling random subsets S_t
+2. Computing f_i(S_t) for each subset and preference i
+3. Accumulating and averaging according to the formula
 """
 
 import os
 import sys
 import numpy as np
 import torch
-from typing import List, Set, Optional, Union, Iterable, Tuple, Tuple
+from typing import List, Set, Optional, Union, Iterable, Tuple
 
 # Add notebooks directory to path for imports
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -24,41 +27,6 @@ from logistic_regression import (
     compute_dpo_loss,
     load_precomputed_gradients_b,
 )
-
-
-def indicator_vector(S: Set[int], n: int) -> np.ndarray:
-    """
-    Convert subset S to indicator vector 1_S ∈ {0, 1}^n.
-    
-    Args:
-        S: set of indices (subset of {0, 1, ..., n-1})
-        n: total number of samples
-        
-    Returns:
-        indicator: numpy array of shape [n] with 1s at positions in S, 0s elsewhere
-    """
-    indicator = np.zeros(n, dtype=np.float32)
-    for idx in S:
-        if 0 <= idx < n:
-            indicator[idx] = 1.0
-    return indicator
-
-
-def rbf_kernel(u: np.ndarray, v: np.ndarray, sigma: float = 1.0) -> float:
-    """
-    Radial Basis Function (RBF) kernel: K(u, v) = exp(-||u-v||^2 / (2σ^2)).
-    
-    Args:
-        u: numpy array of shape [n]
-        v: numpy array of shape [n]
-        sigma: bandwidth parameter (default 1.0)
-        
-    Returns:
-        kernel value: scalar
-    """
-    diff = u - v
-    squared_norm = np.sum(diff ** 2)
-    return np.exp(-squared_norm / (2 * sigma ** 2))
 
 
 def compute_f_i(
@@ -254,113 +222,84 @@ def train_and_evaluate_model(
     return theta_projected, theta_full, test_results
 
 
-def compute_kernel_matrix(
-    subsets: List[Set[int]],
-    n: int,
-    sigma: float = 1.0,
-) -> np.ndarray:
-    """
-    Compute kernel matrix K where K[i, j] = K(1_{S_i}, 1_{S_j}).
-    
-    Args:
-        subsets: list of subsets S_i
-        n: total number of samples
-        sigma: RBF kernel bandwidth
-        
-    Returns:
-        K: kernel matrix of shape [len(subsets), len(subsets)]
-    """
-    m = len(subsets)
-    K = np.zeros((m, m), dtype=np.float32)
-    
-    indicators = [indicator_vector(S, n) for S in subsets]
-    
-    for i in range(m):
-        for j in range(m):
-            K[i, j] = rbf_kernel(indicators[i], indicators[j], sigma)
-    
-    return K
-
-
-def predict_surrogate(
-    S: Set[int],
-    basis_subsets: List[Set[int]],
-    alpha: np.ndarray,
-    n: int,
-    sigma: float = 1.0,
-) -> float:
-    indicator_S = indicator_vector(S, n)
-    prediction = 0.0
-    
-    for j, S_j in enumerate(basis_subsets):
-        indicator_Sj = indicator_vector(S_j, n)
-        k_val = rbf_kernel(indicator_S, indicator_Sj, sigma)
-        prediction += alpha[j] * k_val
-    
-    return float(prediction)
-
-
-
 def estimate_affinity_scores(
     gradients: List[np.ndarray],
     z: Optional[np.ndarray] = None,
     projection_matrix: Optional[np.ndarray] = None,
-    num_training_subsets: int = 1000,
-    training_subset_size: int = 10,
-    num_evaluation_subsets: Optional[int] = None,
-    sigma: float = 1.0,
-    reg: float = 1e-6,
+    num_subsets: int = 1000,
+    subset_size: int = 10,
     max_iters: int = 1000,
     lr: float = 0.1,
     tol: float = 1e-6,
     verbose: bool = True,
 ) -> np.ndarray:
-
+    """
+    Estimate affinity scores T_{i,j} directly without kernel/surrogate model.
+    
+    According to paper Section A.2:
+    T_{i,j} = (1 / n_{i,j}) * Σ_{t: i in S_t, j in S_t} f_i(S_t)
+    
+    where:
+    - n_{i,j} is the number of sampled subsets containing both i and j
+    - f_i(S_t) is the test loss on preference i when model is trained on subset S_t
+    
+    Args:
+        gradients: list of gradient vectors for all samples
+        z: optional labels for all samples
+        projection_matrix: projection matrix if gradients are projected
+        num_subsets: number of random subsets to sample
+        subset_size: size of each subset
+        max_iters: max iterations for logistic regression
+        lr: learning rate for logistic regression
+        tol: tolerance for convergence
+        verbose: whether to print progress
+        
+    Returns:
+        T: affinity matrix of shape [n, n] where T[i, j] estimates how task j affects task i
+    """
     import random
     
     n = len(gradients)
     T = np.zeros((n, n), dtype=np.float32)
+    counts = np.zeros((n, n), dtype=np.int32)
     
     # Set random seeds for reproducibility
     random.seed(42)
     np.random.seed(42)
     
-    # Use single-element subsets as basis: S_j = {j}
-    # These are used in the kernel representation g_i(S) = Σ_j α_ij K(1_S, 1_{S_j})
-    basis_subsets = [{j} for j in range(n)]
-    
-    # Sample diverse training subsets for learning surrogate coefficients
-    # This fixes Problem 1: training on diverse S, not just singletons
+    # Sample random subsets
     if verbose:
-        print(f"Sampling {num_training_subsets} diverse training subsets of size {training_subset_size}...")
+        print(f"Sampling {num_subsets} random subsets of size {subset_size}...")
     
-    training_subsets = []
-    effective_subset_size = min(training_subset_size, n)
-    for _ in range(num_training_subsets):
+    effective_subset_size = min(subset_size, n)
+    sampled_subsets = []
+    for _ in range(num_subsets):
         if n < effective_subset_size:
             subset = set(range(n))
         else:
             subset = set(np.random.choice(n, size=effective_subset_size, replace=False))
-        training_subsets.append(subset)
+        sampled_subsets.append(subset)
     
-    # For each test preference i, compute f_i(S) for all training subsets S
-    # This fixes Problem 3: f_i(S) correctly represents training on S, testing on i
+    # Compute f_i(S_t) for each subset S_t and each preference i in S_t
     if verbose:
-        print(f"Computing f_i(S) for all preferences i and training subsets S...")
-        print(f"  This will compute {n * num_training_subsets} values (may take time)...")
+        print(f"Computing f_i(S_t) for all subsets and preferences...")
+        print(f"  Total computations: ~{sum(len(S) for S in sampled_subsets)} (may take time)...")
     
-    f_values = {}  # Dict: (i, tuple(sorted(S))) -> f_i(S)
+    f_values = {}  # Cache: (i, tuple(sorted(S))) -> f_i(S)
+    total_computed = 0
     
-    for i in range(n):
-        if verbose and i % max(1, n // 10) == 0:
-            print(f"  Processing preference {i}/{n}...")
+    for subset_idx, S_t in enumerate(sampled_subsets):
+        if verbose and subset_idx % max(1, num_subsets // 10) == 0:
+            print(f"  Processing subset {subset_idx}/{num_subsets}...")
         
-        for S in training_subsets:
-            S_key = tuple(sorted(S))
+        S_key = tuple(sorted(S_t))
+        
+        # For each preference i in S_t, compute f_i(S_t)
+        for i in S_t:
             if (i, S_key) not in f_values:
                 try:
                     f_val = compute_f_i(
-                        S=S,
+                        S=S_t,
                         test_idx=i,
                         gradients=gradients,
                         z=z,
@@ -370,85 +309,27 @@ def estimate_affinity_scores(
                         verbose=False,
                     )
                     f_values[(i, S_key)] = f_val
+                    total_computed += 1
                 except Exception as e:
                     if verbose:
-                        print(f"    Warning: f_{i}(S) failed for S={S_key}: {e}")
+                        print(f"    Warning: f_{i}(S_t) failed for S_t={S_key}: {e}")
                     f_values[(i, S_key)] = 0.0
-    
-    # Learn surrogate coefficients α_ij for each test preference i
-    # This fixes Problem 2: training on diverse S provides non-degenerate kernel matrix
-    if verbose:
-        print(f"Learning surrogate coefficients α_ij for each preference...")
-    
-    alphas = np.zeros((n, n), dtype=np.float32)
-    
-    for i in range(n):
-        if verbose and i % max(1, n // 10) == 0:
-            print(f"  Learning coefficients for preference {i}/{n}...")
         
-        # Collect training data: (S, f_i(S)) pairs
-        training_targets = []
-        training_subset_list = []
-        for S in training_subsets:
-            S_key = tuple(sorted(S))
-            f_val = f_values.get((i, S_key), 0.0)
-            training_targets.append(f_val)
-            training_subset_list.append(S)
-        
-        training_targets = np.array(training_targets, dtype=np.float32)
-        
-        K_train_basis = np.zeros((len(training_subsets), len(basis_subsets)), dtype=np.float32)
-        for idx, S in enumerate(training_subsets):
-            indicator_S = indicator_vector(S, n)
-            for j, S_j in enumerate(basis_subsets):
-                indicator_Sj = indicator_vector(S_j, n)
-                K_train_basis[idx, j] = rbf_kernel(indicator_S, indicator_Sj, sigma)
-        
-        # Solve for basis coefficients: K_train_basis @ alpha_basis ≈ training_targets
-        # With regularization: (K_train_basis^T @ K_train_basis + reg*I) @ alpha_basis = K_train_basis^T @ training_targets
-        KtK = K_train_basis.T @ K_train_basis + reg * np.eye(len(basis_subsets), dtype=np.float32)
-        Kt_f = K_train_basis.T @ training_targets
-        alpha_basis = np.linalg.solve(KtK, Kt_f)
-        
-        alphas[i, :] = alpha_basis
-    
-    # Estimate T_{i,j} using surrogate predictions
-    if verbose:
-        print(f"Estimating affinity scores T_{i,j} using surrogate model...")
-    
-    # Use evaluation subsets (can be same as training or different)
-    if num_evaluation_subsets is None:
-        evaluation_subsets = training_subsets
-    else:
-        evaluation_subsets = []
-        for _ in range(num_evaluation_subsets):
-            if n < effective_subset_size:
-                subset = set(range(n))
-            else:
-                subset = set(np.random.choice(n, size=effective_subset_size, replace=False))
-            evaluation_subsets.append(subset)
-    
-    if verbose:
-        print(f"  Using {len(evaluation_subsets)} subsets for evaluation")
-    
-    counts = np.zeros((n, n), dtype=np.int32)
-    
-    for S_t in evaluation_subsets:
+        # Accumulate T_{i,j} for all pairs (i, j) in S_t
         for i in S_t:
-            # Predict f_i(S_t) using surrogate
-            pred = predict_surrogate(
-                S=S_t,
-                basis_subsets=basis_subsets,
-                alpha=alphas[i, :],
-                n=n,
-                sigma=sigma,
-            )
-            
+            f_i_St = f_values.get((i, S_key), 0.0)
             for j in S_t:
-                T[i, j] += pred
+                T[i, j] += f_i_St
                 counts[i, j] += 1
     
-    # Normalize by counts
+    if verbose:
+        print(f"  Computed {total_computed} unique f_i(S) values")
+        print(f"  (Reused {sum(len(S) for S in sampled_subsets) - total_computed} cached values)")
+    
+    # Normalize by counts: T_{i,j} = (1 / n_{i,j}) * Σ f_i(S_t)
+    if verbose:
+        print(f"Normalizing affinity scores...")
+    
     for i in range(n):
         for j in range(n):
             if counts[i, j] > 0:
@@ -483,17 +364,17 @@ if __name__ == "__main__":
     
     print(f"Loaded {len(gradients_np)} gradients")
     
-    # Estimate affinity scores
-    # Uses 1000 random subsets of size 10 for training surrogate
+    # Estimate affinity scores directly without kernel/surrogate
+    # Uses 1000 random subsets of size 10
     T = estimate_affinity_scores(
         gradients=gradients_np,
         z=z_values_np,
-        projection_matrix=projection_matrix,  # Pass projection matrix for potential unprojection
-        num_training_subsets=1000,  # Diverse subsets for training surrogate
-        training_subset_size=10,    # Size of each training subset
-        num_evaluation_subsets=None,  # None = reuse training subsets for evaluation
-        sigma=1.0,
-        reg=1e-6,
+        projection_matrix=projection_matrix,
+        num_subsets=1000,  # Number of random subsets to sample
+        subset_size=10,    # Size of each subset
+        max_iters=1000,
+        lr=0.1,
+        tol=1e-6,
         verbose=True,
     )
     
