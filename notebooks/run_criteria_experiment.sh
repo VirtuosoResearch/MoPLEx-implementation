@@ -22,16 +22,30 @@
 # echo ""
 # echo "Step 2: Training DPO models and evaluating..."
 # echo "----------------------------------------"
+# python train_dpo_criteria_experiment.py \
+#     --datasets_dir synthetic_datasets \
+#     --model_name Qwen/Qwen3-0.6B \
+#     --output_dir dpo_criteria_results \
+#     --num_epochs 10 \
+#     --batch_size 8 \
+#     --learning_rate 1e-7 \
+#     --device cuda \
+#     --seed 42 \
+#     --downsample_ratio 0.25
+
+
+
 python train_dpo_criteria_experiment.py \
     --datasets_dir synthetic_datasets \
     --model_name Qwen/Qwen3-0.6B \
     --output_dir dpo_criteria_results \
-    --num_epochs 10 \
+    --num_epochs 50 \
     --batch_size 8 \
     --learning_rate 1e-7 \
     --device cuda \
     --seed 42 \
     --downsample_ratio 0.25
+
 
 # echo ""
 # echo "=========================================="

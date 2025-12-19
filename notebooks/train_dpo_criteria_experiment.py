@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 from trainers.network_utils import AutoModelForCausalLMWithValueHead
 from trainers.dpo_trainer import DPOTrainer
 from trainers.dpo_config import DPOConfig
-from trainers.data_loader import load_data
+from trainers.data_loader import load_data, generation_kwargs
 import accelerate
 
 PROMPT_TOKEN = '<|prompter|>'
@@ -48,7 +48,7 @@ def compute_accuracy(model, tokenizer, dataset, device, batch_size=8):
             y_w_list = batch["y_w"]
             y_l_list = batch["y_l"]
             
-            # Tokenize
+            # Tokenize query
             query_tensors = tokenizer(
                 prompts,
                 padding=True,
@@ -57,22 +57,20 @@ def compute_accuracy(model, tokenizer, dataset, device, batch_size=8):
                 return_tensors="pt"
             ).to(device)
             
-            response_w_texts = [y.split(ASSISTANT_TOKEN)[-1] if ASSISTANT_TOKEN in y else y for y in y_w_list]
-            response_l_texts = [y.split(ASSISTANT_TOKEN)[-1] if ASSISTANT_TOKEN in y else y for y in y_l_list]
-            
+            # Use original responses without splitting (matching training logic)
             response_w_tensors = tokenizer(
-                response_w_texts,
+                y_w_list,
                 padding=True,
                 truncation=True,
-                max_length=256,
+                max_length=64 + generation_kwargs['max_new_tokens'],
                 return_tensors="pt"
             ).to(device)
             
             response_l_tensors = tokenizer(
-                response_l_texts,
+                y_l_list,
                 padding=True,
                 truncation=True,
-                max_length=256,
+                max_length=64 + generation_kwargs['max_new_tokens'],
                 return_tensors="pt"
             ).to(device)
             
@@ -113,6 +111,104 @@ def compute_accuracy(model, tokenizer, dataset, device, batch_size=8):
     
     accuracy = correct / total if total > 0 else 0.0
     return accuracy
+
+
+def compute_accuracy_by_criterion(model, tokenizer, dataset, device, batch_size=8):
+    """
+    Compute accuracy broken down by criterion (for mixed_criteria dataset).
+    Returns overall accuracy and per-criterion accuracies.
+    """
+    if "criterion_used" not in dataset.column_names:
+        return None, None
+    
+    model.eval()
+    correct_by_criterion = {}
+    total_by_criterion = {}
+    overall_correct = 0
+    overall_total = 0
+    
+    with torch.no_grad():
+        for i in tqdm(range(0, len(dataset), batch_size), desc="Evaluating by criterion"):
+            batch = dataset[i:i+batch_size]
+            
+            prompts = batch["prompt"]
+            y_w_list = batch["y_w"]
+            y_l_list = batch["y_l"]
+            criteria = batch["criterion_used"]
+            
+            # Tokenize query
+            query_tensors = tokenizer(
+                prompts,
+                padding=True,
+                truncation=True,
+                max_length=128,
+                return_tensors="pt"
+            ).to(device)
+            
+            response_w_tensors = tokenizer(
+                y_w_list,
+                padding=True,
+                truncation=True,
+                max_length=64 + generation_kwargs['max_new_tokens'],
+                return_tensors="pt"
+            ).to(device)
+            
+            response_l_tensors = tokenizer(
+                y_l_list,
+                padding=True,
+                truncation=True,
+                max_length=64 + generation_kwargs['max_new_tokens'],
+                return_tensors="pt"
+            ).to(device)
+            
+            input_ids_w = torch.cat((query_tensors.input_ids, response_w_tensors.input_ids), dim=1)
+            input_ids_l = torch.cat((query_tensors.input_ids, response_l_tensors.input_ids), dim=1)
+            
+            def get_logprob(input_ids):
+                attention_mask = (input_ids != tokenizer.pad_token_id).long()
+                if hasattr(model, 'pretrained_model'):
+                    outputs = model.pretrained_model(input_ids=input_ids, attention_mask=attention_mask)
+                else:
+                    outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits if hasattr(outputs, 'logits') else outputs[0]
+                
+                from trainers.utils import logprobs_from_logits
+                logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
+                attn_mask_shifted = attention_mask[:, 1:]
+                
+                q_len = query_tensors.input_ids.size(1)
+                mask = attn_mask_shifted.clone()
+                if q_len > 1:
+                    mask[:, :q_len-1] = 0
+                
+                seq_logprob = (logprobs * mask).sum(dim=1)
+                return seq_logprob
+            
+            logprob_w = get_logprob(input_ids_w)
+            logprob_l = get_logprob(input_ids_l)
+            
+            predictions = (logprob_w > logprob_l).cpu().numpy()
+            
+            for j, criterion in enumerate(criteria):
+                if criterion not in correct_by_criterion:
+                    correct_by_criterion[criterion] = 0
+                    total_by_criterion[criterion] = 0
+                
+                if predictions[j]:
+                    correct_by_criterion[criterion] += 1
+                total_by_criterion[criterion] += 1
+                overall_total += 1
+                if predictions[j]:
+                    overall_correct += 1
+    
+    overall_accuracy = overall_correct / overall_total if overall_total > 0 else 0.0
+    per_criterion_accuracy = {
+        crit: correct_by_criterion[crit] / total_by_criterion[crit] 
+        if total_by_criterion[crit] > 0 else 0.0
+        for crit in correct_by_criterion
+    }
+    
+    return overall_accuracy, per_criterion_accuracy
 
 
 def train_and_evaluate(
@@ -218,59 +314,74 @@ def train_and_evaluate(
     acc_before = compute_accuracy(model, tokenizer, test_dataset, device, batch_size=batch_size)
     print(f"Accuracy before training: {acc_before:.4f}")
     
+    # For mixed_criteria dataset, also compute accuracy by criterion
+    if "criterion_used" in test_dataset.column_names:
+        print("\nAnalyzing accuracy by criterion (before training)...")
+        overall_acc, per_crit_acc = compute_accuracy_by_criterion(model, tokenizer, test_dataset, device, batch_size=batch_size)
+        if per_crit_acc:
+            print(f"Overall accuracy: {overall_acc:.4f}")
+            for crit, acc in sorted(per_crit_acc.items()):
+                print(f"  {crit}: {acc:.4f} (n={sum(1 for x in test_dataset['criterion_used'] if x == crit)})")
+    
     # Training loop
     model.train()
     for epoch in range(num_epochs):
         print(f"\nEpoch {epoch + 1}/{num_epochs}")
         
         for batch in tqdm(train_dataloader, desc=f"Training epoch {epoch+1}"):
-            # Process batch
-            prompts = [item["prompt"] for item in batch]
-            y_w = [item["y_w"] for item in batch]
-            y_l = [item["y_l"] for item in batch]
+            # Process batch - map field names to match dpo.py format
+            # Dataset uses "prompt", "y_w", "y_l", but we need "query", "response_w", "response_l"
+            pref_batch = {
+                "query": [item["prompt"] for item in batch],
+                "response_w": [item["y_w"] for item in batch],
+                "response_l": [item["y_l"] for item in batch],
+            }
             
-            # Tokenize
-            query_tensors = tokenizer(
-                prompts,
+            # Tokenize query
+            pref_query = tokenizer(
+                pref_batch["query"],
                 padding=True,
                 truncation=True,
                 max_length=128,
                 return_tensors="pt"
-            )
-            query_tensors = accelerate.utils.send_to_device(query_tensors, trainer.accelerator.device)
+            ).input_ids
+            pref_query_tensors = accelerate.utils.send_to_device(pref_query, trainer.accelerator.device)
             
-            response_w_texts = [y.split(ASSISTANT_TOKEN)[-1] for y in y_w]
-            response_l_texts = [y.split(ASSISTANT_TOKEN)[-1] for y in y_l]
-            
-            response_w_tensors = tokenizer(
-                response_w_texts,
+            # Tokenize responses together to ensure same length (matching dpo.py logic)
+            all_pref = pref_batch["response_w"] + pref_batch["response_l"]
+            tokenized = tokenizer(
+                all_pref,
                 padding=True,
                 truncation=True,
-                max_length=256,
+                max_length=64 + generation_kwargs['max_new_tokens'],
                 return_tensors="pt"
-            )
-            response_w_tensors = accelerate.utils.send_to_device(response_w_tensors, trainer.accelerator.device)
+            ).input_ids
             
-            response_l_tensors = tokenizer(
-                response_l_texts,
-                padding=True,
-                truncation=True,
-                max_length=256,
-                return_tensors="pt"
-            )
-            response_l_tensors = accelerate.utils.send_to_device(response_l_tensors, trainer.accelerator.device)
+            pref_response_w_tensors = tokenized[:len(pref_batch["response_w"])]
+            pref_response_w_tensors = accelerate.utils.send_to_device(pref_response_w_tensors, trainer.accelerator.device)
+            pref_response_l_tensors = tokenized[len(pref_batch["response_w"]):]
+            pref_response_l_tensors = accelerate.utils.send_to_device(pref_response_l_tensors, trainer.accelerator.device)
             
             # Train step
             stats = trainer.step(
-                queries=query_tensors.input_ids,
-                responses_w=response_w_tensors.input_ids,
-                responses_l=response_l_tensors.input_ids,
+                queries=pref_query_tensors,
+                responses_w=pref_response_w_tensors,
+                responses_l=pref_response_l_tensors,
             )
         
         # Evaluate after each epoch
         print(f"\nEvaluating after epoch {epoch + 1}...")
         acc_after = compute_accuracy(model, tokenizer, test_dataset, device, batch_size=batch_size)
         print(f"Accuracy after epoch {epoch + 1}: {acc_after:.4f}")
+        
+        # For mixed_criteria dataset, also compute accuracy by criterion
+        if "criterion_used" in test_dataset.column_names:
+            print(f"\nAnalyzing accuracy by criterion (after epoch {epoch + 1})...")
+            overall_acc, per_crit_acc = compute_accuracy_by_criterion(model, tokenizer, test_dataset, device, batch_size=batch_size)
+            if per_crit_acc:
+                print(f"Overall accuracy: {overall_acc:.4f}")
+                for crit, acc in sorted(per_crit_acc.items()):
+                    print(f"  {crit}: {acc:.4f}")
     
     return {
         "dataset": os.path.basename(dataset_path),
@@ -305,7 +416,7 @@ def main():
     results = []
     
     # Train on single-criteria datasets
-    criteria = ["semantic_intensity"]
+    criteria = ["semantic_intensity", "sentiment"]
     for criterion in criteria:
         dataset_path = os.path.join(args.datasets_dir, f"single_{criterion}")
         if os.path.exists(dataset_path):
