@@ -180,3 +180,5 @@ results/
 *.csv
 *.png
 *.pt
+
+*/synthetic_datasets/
