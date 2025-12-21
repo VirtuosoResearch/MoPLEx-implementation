@@ -181,7 +181,7 @@ if __name__ == "__main__":
     parser.add_argument('--wandb_project', type=str, default='simpo', help='the wandb project name')
     parser.add_argument('--run_name', type=str, default='simpo', help='the wandb run name')
     parser.add_argument('--output_dir', type=str, default=None, help='the output directory')
-    parser.add_argument('--tokenizer_type', type=str, default="EleutherAI/pythia-1.4b', help='the model name")
+    parser.add_argument('--tokenizer_type', type=str, default="EleutherAI/pythia-1.4b", help='the model name')
     parser.add_argument('--pretrained_dir', type=str, default="", help='the path to the pretrained model')
     parser.add_argument('--learning_rate', type=float, default=1.0e-6, help='the learning rate')
     parser.add_argument('--cosine_annealing_lr_eta_min', type=float, default=1.0e-7, help='the cosine annealing eta min')

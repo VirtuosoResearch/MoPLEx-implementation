@@ -303,9 +303,10 @@ class SimPOTrainer():
     ):
         assert queries.ndim == 2 and responses_w.ndim == 2 and responses_l.ndim == 2
         self.model.train()
-        bs = self.config.batch_size
+        # Use actual batch size from queries, not config.batch_size
+        # This handles cases where dataloader batch_size != config.batch_size
+        bs = queries.size(0)
         sub_bs = self.config.mini_batch_size
-        assert bs % sub_bs == 0
         
         for i in range(0, bs, sub_bs):
             queries_ = queries[i : i + sub_bs]
@@ -313,16 +314,20 @@ class SimPOTrainer():
             responses_l_ = responses_l[i : i + sub_bs]
             preference_mask_ = preference_mask[i : i + sub_bs] if preference_mask is not None else None
 
-            loss, stats = self._step(
-                queries=queries_,
-                responses_w=responses_w_,
-                responses_l=responses_l_,
-                preference_mask=preference_mask_,
-            )
+            # Use accelerator.accumulate to properly handle gradient accumulation
+            # This ensures one logical batch (config.batch_size) corresponds to one optimizer.step()
+            with self.accelerator.accumulate(self.model):
+                loss, stats = self._step(
+                    queries=queries_,
+                    responses_w=responses_w_,
+                    responses_l=responses_l_,
+                    preference_mask=preference_mask_,
+                )
+                
+                self.accelerator.backward(loss)
+                if self.lr_scheduler is not None:
+                    self.lr_scheduler.step()
             
-            self.optimizer.zero_grad()
-            self.accelerator.backward(loss)
-            self.optimizer.step()
             self.current_step += 1
         return stats
     

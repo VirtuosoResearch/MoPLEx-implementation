@@ -106,7 +106,13 @@ def load_imdb_dataset(args):
     return pref_dataset
 
 def load_data(args):
-    if args.preference_dataset_path.startswith('Asap7772'):
+    # Check if path is a local directory with DatasetDict (e.g., synthetic_datasets)
+    if os.path.isdir(args.preference_dataset_path) and os.path.exists(
+        os.path.join(args.preference_dataset_path, "dataset_dict.json")
+    ):
+        pref_dataset_name = os.path.basename(args.preference_dataset_path)
+        pref_dataset = load_from_disk(args.preference_dataset_path)
+    elif args.preference_dataset_path.startswith('Asap7772'):
         pref_dataset_name = os.path.basename(args.preference_dataset_path)
         pref_dataset = load_dataset(args.preference_dataset_path)
     elif "imdb" in args.preference_dataset_path.lower():
