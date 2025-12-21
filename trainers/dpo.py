@@ -178,7 +178,7 @@ def main(args):
             rewards=torch.zeros(1),
             columns_to_log=["query", "response_w", "response_l"],
         )
-        if epoch % 5==0:
+        if epoch % 10==0:
             save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{epoch}", epoch, args)
 
 if __name__ == "__main__":
