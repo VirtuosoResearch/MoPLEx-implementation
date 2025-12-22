@@ -416,7 +416,7 @@ def main():
     results = []
     
     # Train on single-criteria datasets
-    criteria = ["semantic_intensity", "sentiment"]
+    criteria = ["helpfulness", "truthfulness", "instruction_following", "honesty"]
     for criterion in criteria:
         dataset_path = os.path.join(args.datasets_dir, f"single_{criterion}")
         if os.path.exists(dataset_path):

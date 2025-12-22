@@ -13,10 +13,10 @@
 # # echo ""
 # # echo "Step 1: Creating synthetic datasets..."
 # # echo "----------------------------------------"
-# # python create_synthetic_datasets.py \
-# #     --data_dir data_out \
-# #     --output_dir synthetic_datasets \
-# #     --seed 42
+# python create_synthetic_datasets.py \
+#     --data_dir data_out \
+#     --output_dir synthetic_datasets \
+#     --seed 42
 
 # # Step 2: Train and evaluate
 # echo ""
@@ -36,11 +36,11 @@
 
 
 python train_dpo_criteria_experiment.py \
-    --datasets_dir synthetic_datasets \
+    --datasets_dir ultrafeedback_synthetic \
     --model_name Qwen/Qwen3-0.6B \
     --output_dir dpo_criteria_results \
-    --num_epochs 50 \
-    --batch_size 8 \
+    --num_epochs 3 \
+    --batch_size 2 \
     --learning_rate 1e-7 \
     --device cuda \
     --seed 42 \

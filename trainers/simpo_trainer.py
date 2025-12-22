@@ -359,6 +359,9 @@ class SimPOTrainer():
             self.save_p()
 
     def save_pstar(self):
+        import os
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(self.pstar_save_path) if os.path.dirname(self.pstar_save_path) else ".", exist_ok=True)
         self.model.eval()
         device = next(self.model.parameters()).device
         with torch.no_grad():
@@ -368,6 +371,9 @@ class SimPOTrainer():
         self.model.train()
 
     def save_p(self):
+        import os
+        # Create directory if it doesn't exist
+        os.makedirs(os.path.dirname(self.p_save_path) if os.path.dirname(self.p_save_path) else ".", exist_ok=True)
         self.model.eval()
         device = next(self.model.parameters()).device
         with torch.no_grad():

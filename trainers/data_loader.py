@@ -55,7 +55,8 @@ def construct_dataset(
     concatenate_prompt=False,
     num_samples_test=1000,
 ):
-    data, test_data = get_dataset(args.path, num_samples=num_samples, return_test_data=True, num_samples_test=num_samples_test)
+    path = getattr(args, 'path', None) or args.preference_dataset_path
+    data, test_data = get_dataset(path, num_samples=num_samples, return_test_data=True, num_samples_test=num_samples_test)
 
     if concatenate_prompt:
         def map_fn(d):
@@ -68,7 +69,7 @@ def construct_dataset(
             num_proc=args.num_proc,
         )
 
-    dataset_name = os.path.basename(args.path).split(".")[0]
+    dataset_name = os.path.basename(path).split(".")[0]
 
     ds = DatasetDict({
         "train": data,
@@ -106,7 +107,7 @@ def load_imdb_dataset(args):
     return pref_dataset
 
 def load_data(args):
-    # Check if path is a local directory with DatasetDict (e.g., synthetic_datasets)
+    # Check if path is a local directory with DatasetDict (e.g., imdb_synthetic)
     if os.path.isdir(args.preference_dataset_path) and os.path.exists(
         os.path.join(args.preference_dataset_path, "dataset_dict.json")
     ):
@@ -118,6 +119,10 @@ def load_data(args):
     elif "imdb" in args.preference_dataset_path.lower():
         pref_dataset_name = os.path.basename(args.preference_dataset_path)
         pref_dataset = load_imdb_dataset(args)
+    elif "ultrafeedback" in args.preference_dataset_path.lower():
+        # UltraFeedback synthetic datasets are already in the correct format
+        pref_dataset_name = os.path.basename(args.preference_dataset_path)
+        pref_dataset = load_from_disk(args.preference_dataset_path)
     else:
         pref_dataset_name, pref_dataset = construct_dataset(
             args=args,
