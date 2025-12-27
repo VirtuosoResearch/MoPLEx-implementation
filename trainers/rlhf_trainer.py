@@ -274,8 +274,10 @@ class RLHFTrainer:
         
         with torch.no_grad():
             for query, response in zip(queries, responses):
-                # Concatenate query and response
-                full_input = torch.cat([query, response]).unsqueeze(0).to(self.current_device)
+                # Ensure both query and response are on the same device before concatenation
+                query = query.to(self.current_device)
+                response = response.to(self.current_device)
+                full_input = torch.cat([query, response]).unsqueeze(0)
                 attention_mask = torch.ones_like(full_input)
                 
                 # Get reward from reward model
@@ -409,6 +411,9 @@ class RLHFTrainer:
         attention_mask_list = []
         
         for q, r in zip(queries, responses):
+            # Ensure both query and response are on the same device
+            q = q.to(self.current_device)
+            r = r.to(self.current_device)
             full_seq = torch.cat([q, r])
             pad_len = max_len - full_seq.shape[0]
             if pad_len > 0:
@@ -580,7 +585,10 @@ class RLHFTrainer:
         attention_masks = []
         
         for query, response in zip(queries, response_tensors):
-            full_input = torch.cat([query, response]).unsqueeze(0).to(self.current_device)
+            # Ensure both query and response are on the same device
+            query = query.to(self.current_device)
+            response = response.to(self.current_device)
+            full_input = torch.cat([query, response]).unsqueeze(0)
             attention_mask = torch.ones_like(full_input)
             attention_masks.append(attention_mask.squeeze(0))
             

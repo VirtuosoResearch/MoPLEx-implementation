@@ -103,13 +103,33 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         super().__init__(pretrained_model)
         v_head_kwargs, _, _ = self._split_kwargs(kwargs)
 
-        if not any(hasattr(self.pretrained_model, attribute) for attribute in self.lm_head_namings):
+        # Check for lm_head - handle PeftModel case where lm_head might be in base_model.model
+        if not self._has_lm_head():
             raise ValueError("The model does not have a language model head, please use a model that has one.")
 
         self.v_head = ValueHead(self.pretrained_model.config, **v_head_kwargs)
 
         self._init_weights(**v_head_kwargs)
-        self.is_peft_model = False
+        # Check if the wrapped model is a PeftModel
+        self.is_peft_model = hasattr(self.pretrained_model, "peft_config") or hasattr(self.pretrained_model, "base_model")
+        
+    def _has_lm_head(self):
+        """Check if the model has a language model head, handling PeftModel case."""
+        # First, try direct attribute check
+        if any(hasattr(self.pretrained_model, attribute) for attribute in self.lm_head_namings):
+            return True
+        
+        # For PeftModel, check in base_model.model
+        if hasattr(self.pretrained_model, "base_model") and hasattr(self.pretrained_model.base_model, "model"):
+            if any(hasattr(self.pretrained_model.base_model.model, attribute) for attribute in self.lm_head_namings):
+                return True
+        
+        # Also check by iterating through named modules (works for nested structures)
+        for name, _ in self.pretrained_model.named_modules():
+            if any(attribute in name for attribute in self.lm_head_namings):
+                return True
+        
+        return False
 
     def _init_weights(self, **kwargs):
         r"""
@@ -157,11 +177,16 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
             kwargs (`dict`, `optional`):
                 Additional keyword arguments, that are passed to the wrapped model.
         """
-        kwargs["output_hidden_states"] = True  # this had already been set in the LORA / PEFT examples
-        kwargs["past_key_values"] = past_key_values
+        # Ensure output_hidden_states and return_dict are set
+        kwargs["output_hidden_states"] = True  # Force output_hidden_states=True
+        kwargs["return_dict"] = True  # Force return_dict=True to get BaseModelOutput
+        if past_key_values is not None:
+            kwargs["past_key_values"] = past_key_values
 
-        if self.is_peft_model and self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING":
-            kwargs.pop("past_key_values")
+        if self.is_peft_model and hasattr(self.pretrained_model, "active_peft_config") and \
+           hasattr(self.pretrained_model.active_peft_config, "peft_type") and \
+           self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING":
+            kwargs.pop("past_key_values", None)
 
         base_model_output = self.pretrained_model(
             input_ids=input_ids,
@@ -169,9 +194,28 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
             **kwargs,
         )
 
+        # Handle both dict-like output (BaseModelOutput) and tuple output
+        if isinstance(base_model_output, tuple):
+            # This shouldn't happen with return_dict=True, but handle it gracefully
+            # If it's a tuple, the first element is usually logits
+            # For hidden_states, we need to re-run with explicit return_dict
+            # or access them differently
+            raise ValueError(
+                f"Model returned tuple instead of BaseModelOutput despite return_dict=True. "
+                f"This may indicate an issue with the model wrapper. "
+                f"Output type: {type(base_model_output)}, length: {len(base_model_output) if isinstance(base_model_output, tuple) else 'N/A'}"
+            )
+        
+        # Extract from BaseModelOutput
+        if not hasattr(base_model_output, 'hidden_states'):
+            raise ValueError(
+                f"Model output does not have 'hidden_states' attribute. "
+                f"Output type: {type(base_model_output)}, attributes: {dir(base_model_output)}"
+            )
+        
         last_hidden_state = base_model_output.hidden_states[-1]
         lm_logits = base_model_output.logits
-        loss = base_model_output.loss
+        loss = getattr(base_model_output, 'loss', None)
 
         if last_hidden_state.device != self.v_head.summary.weight.device:
             last_hidden_state = last_hidden_state.to(self.v_head.summary.weight.device)

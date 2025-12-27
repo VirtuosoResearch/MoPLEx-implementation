@@ -54,13 +54,33 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         super().__init__(pretrained_model)
         v_head_kwargs, _, _ = self._split_kwargs(kwargs)
 
-        if not any(hasattr(self.pretrained_model, attribute) for attribute in self.lm_head_namings):
+        # Check for lm_head - handle PeftModel case where lm_head might be in base_model.model
+        if not self._has_lm_head():
             raise ValueError("The model does not have a language model head, please use a model that has one.")
 
         self.v_head = ValueHead(self.pretrained_model.config, **v_head_kwargs).to('cuda')
 
         self._init_weights(**v_head_kwargs)
-        self.is_peft_model = False
+        # Check if the wrapped model is a PeftModel
+        self.is_peft_model = hasattr(self.pretrained_model, "peft_config") or hasattr(self.pretrained_model, "base_model")
+        
+    def _has_lm_head(self):
+        """Check if the model has a language model head, handling PeftModel case."""
+        # First, try direct attribute check
+        if any(hasattr(self.pretrained_model, attribute) for attribute in self.lm_head_namings):
+            return True
+        
+        # For PeftModel, check in base_model.model
+        if hasattr(self.pretrained_model, "base_model") and hasattr(self.pretrained_model.base_model, "model"):
+            if any(hasattr(self.pretrained_model.base_model.model, attribute) for attribute in self.lm_head_namings):
+                return True
+        
+        # Also check by iterating through named modules (works for nested structures)
+        for name, _ in self.pretrained_model.named_modules():
+            if any(attribute in name for attribute in self.lm_head_namings):
+                return True
+        
+        return False
 
     def _init_weights(self, **kwargs):
         r"""
@@ -109,6 +129,7 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
                 Additional keyword arguments, that are passed to the wrapped model.
         """
         kwargs["output_hidden_states"] = True  # this had already been set in the LORA / PEFT examples
+        kwargs["return_dict"] = True  # Ensure we get a dict-like output
         kwargs["past_key_values"] = past_key_values
 
         if self.is_peft_model and self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING":
@@ -120,9 +141,16 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
             **kwargs,
         )
 
+        # Handle both dict-like output and tuple output
+        if isinstance(base_model_output, tuple):
+            raise ValueError(
+                "Model returned tuple instead of BaseModelOutput with return_dict=True. "
+                "This may happen with some PeftModel versions. Please ensure your transformers and peft versions are compatible."
+            )
+        
         last_hidden_state = base_model_output.hidden_states[-1]
         lm_logits = base_model_output.logits
-        loss = base_model_output.loss
+        loss = getattr(base_model_output, 'loss', None)
 
         if last_hidden_state.device != self.v_head.summary.weight.device:
             last_hidden_state = last_hidden_state.to(self.v_head.summary.weight.device)
