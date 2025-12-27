@@ -84,8 +84,10 @@ class RewardModel(nn.Module):
     def compute_reward(self, x: str, y: str) -> float:
         """Compute reward for a (prompt, response) pair."""
         text = f"{x}{y}"  # Simple concatenation, can be customized
-        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-        inputs = {k: v.to(next(self.model.parameters()).device) for k, v in inputs.items()}
+        inputs = self.tokenizer(text, return_tensors="pt", truncation=True, max_length=512, padding="max_length")
+        # Ensure input_ids is on the correct device
+        device = next(self.model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
         with torch.no_grad():
             reward = self.forward(**inputs)
         return reward.item() if reward.numel() == 1 else reward.mean().item()
@@ -135,6 +137,16 @@ class EMRewardLearner:
         self.reward_num_epochs = reward_num_epochs
         
         # Initialize reward models for each cluster
+        # IMPORTANT: Reward models need their own tokenizer, not the policy tokenizer!
+        # Using policy tokenizer with reward model can cause vocab size mismatch
+        try:
+            reward_tokenizer = AutoTokenizer.from_pretrained(reward_model_name)
+            if reward_tokenizer.pad_token is None:
+                reward_tokenizer.pad_token = reward_tokenizer.eos_token or "[PAD]"
+        except Exception as e:
+            logger.warning(f"Failed to load tokenizer for reward model {reward_model_name}: {e}. Using policy tokenizer.")
+            reward_tokenizer = tokenizer
+        
         self.reward_models = []
         for u in range(num_clusters):
             config = AutoConfig.from_pretrained(reward_model_name)
@@ -143,7 +155,7 @@ class EMRewardLearner:
                 reward_model_name, config=config
             )
             model.to(device)
-            reward_model = RewardModel(model, tokenizer)
+            reward_model = RewardModel(model, reward_tokenizer)  # Use reward_tokenizer, not policy tokenizer
             self.reward_models.append(reward_model)
         
         # Cluster assignments: user_id -> cluster_id
@@ -248,22 +260,45 @@ class EMRewardLearner:
                     chosen_texts.append(f"{x}{y_chosen}")
                     rejected_texts.append(f"{x}{y_rejected}")
                 
-                # Tokenize batch
+                # Tokenize batch with proper padding
+                # Use max_length padding to ensure consistent tensor sizes
                 chosen_inputs = reward_model.tokenizer(
-                    chosen_texts, return_tensors="pt", truncation=True, 
-                    max_length=512, padding=True
+                    chosen_texts, 
+                    return_tensors="pt", 
+                    truncation=True, 
+                    max_length=512, 
+                    padding="max_length",
+                    return_attention_mask=True
                 )
                 rejected_inputs = reward_model.tokenizer(
-                    rejected_texts, return_tensors="pt", truncation=True,
-                    max_length=512, padding=True
+                    rejected_texts, 
+                    return_tensors="pt", 
+                    truncation=True,
+                    max_length=512, 
+                    padding="max_length",
+                    return_attention_mask=True
                 )
                 
-                chosen_inputs = {k: v.to(self.device) for k, v in chosen_inputs.items()}
-                rejected_inputs = {k: v.to(self.device) for k, v in rejected_inputs.items()}
+                # Clamp input_ids to valid vocab range to avoid index errors
+                vocab_size = reward_model.model.config.vocab_size
+                chosen_inputs['input_ids'] = torch.clamp(chosen_inputs['input_ids'], 0, vocab_size - 1)
+                rejected_inputs['input_ids'] = torch.clamp(rejected_inputs['input_ids'], 0, vocab_size - 1)
+                
+                # Move to device and ensure proper dtype
+                device = next(reward_model.model.parameters()).device
+                chosen_inputs = {k: v.to(device) for k, v in chosen_inputs.items()}
+                rejected_inputs = {k: v.to(device) for k, v in rejected_inputs.items()}
                 
                 # Forward pass
-                reward_chosen = reward_model(**chosen_inputs)
-                reward_rejected = reward_model(**rejected_inputs)
+                try:
+                    reward_chosen = reward_model(**chosen_inputs)
+                    reward_rejected = reward_model(**rejected_inputs)
+                except RuntimeError as e:
+                    logger.error(f"Error in forward pass: {e}")
+                    logger.error(f"Chosen input_ids shape: {chosen_inputs['input_ids'].shape}")
+                    logger.error(f"Rejected input_ids shape: {rejected_inputs['input_ids'].shape}")
+                    logger.error(f"Chosen input_ids max: {chosen_inputs['input_ids'].max()}, vocab size: {reward_model.model.config.vocab_size}")
+                    raise
                 
                 # Ranking loss: -log sigmoid(reward_chosen - reward_rejected)
                 loss = -F.logsigmoid(reward_chosen - reward_rejected).mean()

@@ -156,7 +156,16 @@ def main(args):
     print("\n=== Step 1: Learning Reward Models with EM Algorithm ===")
     
     # Get the full dataset for EM (before downsampling)
-    if "imdb" in args.preference_dataset_path.lower():
+    # Use the same loading logic as load_data function - check local directory first
+    if os.path.isdir(args.preference_dataset_path) and os.path.exists(
+        os.path.join(args.preference_dataset_path, "dataset_dict.json")
+    ):
+        # Local directory with DatasetDict (e.g., imdb_synthetic/mixed_criteria, ultrafeedback)
+        from datasets import load_from_disk
+        pref_dataset_full = load_from_disk(args.preference_dataset_path)
+        train_dataset_for_em = pref_dataset_full['train']
+    elif "imdb" in args.preference_dataset_path.lower() and not os.path.isdir(args.preference_dataset_path):
+        # IMDB from HuggingFace (not local directory, e.g., "ZHZisZZ/imdb_preference")
         pref_dataset_full = load_dataset(args.preference_dataset_path)
         # Process IMDB format
         def make_imdb_pref(batch):
@@ -183,16 +192,9 @@ def main(args):
         )
         train_dataset_for_em = pref_dataset_full['train']
     else:
-        # Load the dataset again for EM
-        if os.path.isdir(args.preference_dataset_path) and os.path.exists(
-            os.path.join(args.preference_dataset_path, "dataset_dict.json")
-        ):
-            from datasets import load_from_disk
-            pref_dataset_full = load_from_disk(args.preference_dataset_path)
-            train_dataset_for_em = pref_dataset_full['train']
-        else:
-            pref_dataset_full = load_dataset(args.preference_dataset_path)
-            train_dataset_for_em = pref_dataset_full['train']
+        # Other datasets (from HuggingFace or other sources)
+        pref_dataset_full = load_dataset(args.preference_dataset_path)
+        train_dataset_for_em = pref_dataset_full['train']
     
     # Downsample for EM if needed (can use more data for EM)
     em_downsample_ratio = getattr(args, 'em_downsample_ratio', None)
