@@ -73,6 +73,7 @@ class RLHFTrainer:
         model: PreTrainedModelWrapper = None,
         ref_model: Optional[PreTrainedModelWrapper] = None,
         reward_model: Optional[PreTrainedModel] = None,
+        reward_model_pos_label_idx: Optional[int] = None,
         tokenizer: PreTrainedTokenizerBase = None,
         dataset: Optional[Union[torch.utils.data.Dataset, Dataset]] = None,
         optimizer: Optional[torch.optim.Optimizer] = None,
@@ -106,6 +107,7 @@ class RLHFTrainer:
             self.ref_model = ref_model
             
         self.reward_model = reward_model
+        self.reward_model_pos_label_idx = reward_model_pos_label_idx
         if self.reward_model is not None:
             self.reward_model.eval()
             
@@ -277,20 +279,41 @@ class RLHFTrainer:
                 attention_mask = torch.ones_like(full_input)
                 
                 # Get reward from reward model
-                # Reward models typically output logits with shape (batch_size, 1)
                 reward_output = self.reward_model(
                     input_ids=full_input,
                     attention_mask=attention_mask,
                 )
                 
                 if hasattr(reward_output, "logits"):
-                    # Get scalar reward (reward models output single value per sequence)
-                    reward = reward_output.logits.squeeze(-1).squeeze(0)
-                    if reward.ndim == 0:
+                    logits = reward_output.logits  # shape: (batch_size, num_labels)
+                    
+                    # Handle different reward model types
+                    if logits.shape[-1] == 1:
+                        # Single-output reward model (regression)
+                        reward = logits.squeeze(-1).squeeze(0)
+                        if reward.ndim == 0:
+                            reward_value = reward.item()
+                        else:
+                            reward_value = reward[-1].item() if reward.ndim > 0 else reward.item()
+                    elif logits.shape[-1] == 2 and self.reward_model_pos_label_idx is not None:
+                        # Binary classification model (e.g., sentiment classifier)
+                        # Extract positive class probability as reward
+                        probs = torch.softmax(logits, dim=-1)
+                        reward = probs[0, self.reward_model_pos_label_idx]
+                        reward_value = reward.item()
+                    elif logits.shape[-1] == 2:
+                        # Binary classification without pos_label_idx specified
+                        # Use the second class (index 1) as positive by default
+                        probs = torch.softmax(logits, dim=-1)
+                        reward = probs[0, 1]
                         reward_value = reward.item()
                     else:
-                        # If per-token rewards, take the last one
-                        reward_value = reward[-1].item()
+                        # Multi-class or unknown format, use last logit
+                        reward = logits.squeeze(0)
+                        if reward.ndim == 0:
+                            reward_value = reward.item()
+                        else:
+                            reward_value = reward[-1].item()
                 elif isinstance(reward_output, torch.Tensor):
                     reward = reward_output.squeeze(-1).squeeze(0)
                     if reward.ndim == 0:
@@ -462,14 +485,41 @@ class RLHFTrainer:
         vf_losses2 = (vpred_clipped - returns_tensor) ** 2
         vf_loss = 0.5 * torch.max(vf_losses1, vf_losses2).mean()
         
-        # KL penalty
+        # KL penalty - compute KL divergence relative to reference model
         with torch.no_grad():
-            # Compute KL divergence (simplified - using logprob difference)
-            kl = new_logprobs - old_logprobs_tensor
+            # Get reference model logprobs
+            ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask)
+            if hasattr(ref_logits, "logits"):
+                ref_logits = ref_logits.logits
+            elif isinstance(ref_logits, tuple):
+                ref_logits = ref_logits[0]
+            
+            # Compute reference logprobs for responses only
+            ref_logprobs_list = []
+            for i, (q, r) in enumerate(zip(queries, responses)):
+                q_len = q.shape[0]
+                r_len = r.shape[0]
+                
+                # Get logprobs for response tokens
+                response_logits = ref_logits[i, q_len-1:q_len-1+r_len, :]
+                response_tokens = r
+                response_logprobs = logprobs_from_logits(
+                    response_logits.unsqueeze(0),
+                    response_tokens.unsqueeze(0),
+                ).squeeze(0)
+                
+                # Sum over sequence length to get sequence-level logprob
+                seq_logprob = response_logprobs.sum()
+                ref_logprobs_list.append(seq_logprob)
+            
+            ref_logprobs = torch.stack(ref_logprobs_list)
+            
+            # Compute KL divergence as difference between new policy and reference model
+            kl = new_logprobs - ref_logprobs
             kl_penalty = (self.kl_ctl.value * kl).mean()
             
-        # Total loss
-        total_loss = pg_loss + self.config.vf_coef * vf_loss - kl_penalty
+        # Total loss - add KL penalty (positive) to penalize deviation from reference
+        total_loss = pg_loss + self.config.vf_coef * vf_loss + kl_penalty
         
         # Update KL controller
         if self.config.adap_kl_ctrl:

@@ -71,8 +71,6 @@ def main(args):
         vf_coef=getattr(args, "vf_coef", 0.1),
         whiten_rewards=getattr(args, "whiten_rewards", False),
         max_grad_norm=getattr(args, "max_grad_norm", None),
-        max_length=getattr(args, "max_length", 512),
-        max_new_tokens=getattr(args, "max_new_tokens", 256),
         project_kwargs={
             'project_dir': output_dir,
         },
@@ -91,6 +89,10 @@ def main(args):
         target=getattr(args, "target_kl", 6.0),
         horizon=getattr(args, "kl_horizon", 10000),
     )
+    
+    # Set max_length and max_new_tokens as attributes (not DPOConfig parameters)
+    config.max_length = getattr(args, "max_length", 512)
+    config.max_new_tokens = getattr(args, "max_new_tokens", 256)
 
     tokenizer = AutoTokenizer.from_pretrained(args.pretrained_dir)
     if tokenizer.pad_token is None:
@@ -99,21 +101,33 @@ def main(args):
     tokenizer.truncation_side = "left"
     
     # Load policy model (with value head)
-    base_model = load_model(tokenizer, args)
-    model = AutoModelForCausalLMWithValueHead(base_model)
+    model = load_model(tokenizer, args)
     
     # Load reward model if provided
     reward_model = None
+    reward_model_pos_label_idx = None
     if hasattr(args, "reward_model_path") and args.reward_model_path:
         print(f"Loading reward model from {args.reward_model_path}")
         reward_model = AutoModelForSequenceClassification.from_pretrained(
             args.reward_model_path,
-            num_labels=1,
             torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
             device_map="auto" if torch.cuda.is_available() else None,
         )
         reward_model.eval()
-        print("Reward model loaded")
+        
+        # Determine positive label index for binary classification models
+        # This is useful for sentiment models like lvwerra/distilbert-imdb
+        if hasattr(reward_model.config, 'id2label') and reward_model.config.id2label:
+            id2label = reward_model.config.id2label
+            for idx, label in id2label.items():
+                if "POS" in label.upper():
+                    reward_model_pos_label_idx = int(idx)
+                    break
+            # If not found and it's binary classification, default to index 1
+            if reward_model_pos_label_idx is None and len(id2label) == 2:
+                reward_model_pos_label_idx = 1
+        
+        print(f"Reward model loaded (num_labels={reward_model.config.num_labels}, pos_label_idx={reward_model_pos_label_idx})")
     
     # Create trainer
     trainer = RLHFTrainer(
@@ -121,6 +135,7 @@ def main(args):
         config=config,
         tokenizer=tokenizer,
         reward_model=reward_model,
+        reward_model_pos_label_idx=reward_model_pos_label_idx,
         additional_config_kwargs=vars(args),
     )
     
@@ -131,7 +146,13 @@ def main(args):
         torch.cuda.empty_cache()
         gc.collect()
 
-    @empty_cache
+    def empty_cache_decorator(func):
+        def func_wrapper(*args, **kwargs):
+            empty_cache()
+            return func(*args, **kwargs)
+        return func_wrapper
+
+    @empty_cache_decorator
     @torch.no_grad()
     def process_query_batch(query_batch):
         # Process query batch for RLHF
@@ -217,6 +238,10 @@ if __name__ == "__main__":
     parser.add_argument("--pretrained_dir", type=str, required=True, help="Path to pretrained model")
     parser.add_argument("--reward_model_path", type=str, default=None, help="Path to reward model")
     parser.add_argument("--use_lora", action="store_true", help="Use LoRA")
+    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank")
+    parser.add_argument("--lora_alpha", type=float, default=32.0, help="LoRA alpha")
+    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout")
+    parser.add_argument("--lora_target_modules", type=str, default="", help="comma-separated module names to apply LoRA to; if empty, auto-detect by model_type")
     
     # Dataset arguments
     parser.add_argument("--preference_dataset_path", type=str, required=True, help="Path to preference dataset")
