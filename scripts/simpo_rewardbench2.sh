@@ -1,5 +1,5 @@
 cache_dir="cache"
-wandb_project="maxmin_dpo"
+wandb_project="simpo_motivation"
 model_name="Qwen/Qwen3-0.6B"
 output_dir='outputs'
 
@@ -12,41 +12,33 @@ export WANDB_DATA_DIR="./cache"
 export WANDB_CACHE_DIR="./cache"
 export WANDB_TEMP="./cache/tmp"
 export HF_DATASETS_CACHE=$cache_dir
-export CUDA_VISIBLE_DEVICES=0,1
+export CUDA_VISIBLE_DEVICES=0
 
 which_exp=${1:--1}
 dryrun=false
 debug=false
 lr=1e-7
-beta=0.05
+beta=1.0
+gamma=0.0
 gradient_accumulation_steps=2
 batch_size=4
 mini_batch_size=1
-downsample_ratio=0.01
+downsample_ratio=0.1
 num_train_epochs=100
-
-ipo_loss=false
-
-# MaxMin-DPO specific parameters
-num_clusters=2
-maxmin_weight=0.1
-reward_model_name="distilbert-base-uncased"
-em_max_iterations=20
-reward_learning_rate=1e-5
-reward_num_epochs=3
 
 if [[ $debug = true ]]; then
     echo "Running in debug mode"
     export WANDB_MODE="dryrun"
 fi
 
-# IMDB dataset
-preference_dataset_path="ZHZisZZ/imdb_preference"
+# Use mixed_criteria dataset (multi-preference)
+preference_dataset_path="notebooks/reward_bench2_synthetic_datasets/mixed_criteria"
 
-run_name="maxmin_dpo_${model_name}_bs${batch_size}_clusters${num_clusters}"
+run_name="simpo_rewardbench2_mixed_criteria_${model_name}_bs${batch_size}_beta${beta}_gamma${gamma}"
 echo "Running experiment $run_name"
+echo "Using dataset: $preference_dataset_path"
 
-command="python -m trainers.maxmin_dpo \
+command="python -m trainers.simpo \
     --wandb_project $wandb_project --run_name $run_name \
     --inner_iteration_steps 1 \
     --batch_size $batch_size \
@@ -54,6 +46,7 @@ command="python -m trainers.maxmin_dpo \
     --pretrained_dir $model_name \
     --preference_dataset_path $preference_dataset_path \
     --temperature $beta \
+    --gamma $gamma \
     --gradient_accumulation_steps $gradient_accumulation_steps \
     --cache_dir $cache_dir \
     --learning_rate $lr \
@@ -61,17 +54,8 @@ command="python -m trainers.maxmin_dpo \
     --downsample_ratio $downsample_ratio \
     --num_train_epochs $num_train_epochs \
     --use_lora True \
-    --num_clusters $num_clusters \
-    --maxmin_weight $maxmin_weight \
-    --reward_model_name $reward_model_name \
-    --em_max_iterations $em_max_iterations \
-    --reward_learning_rate $reward_learning_rate \
-    --reward_num_epochs $reward_num_epochs
+    --seed 42
 "
-
-if [[ $ipo_loss = true ]]; then
-    command+="--ipo_loss "
-fi
 
 echo -e "$command\n"
 if [ $dryrun = false ]; then
