@@ -95,17 +95,37 @@ def identify_error_examples(model, tokenizer, dataset, config, device, max_steps
             if steps_trained >= max_steps:
                 break
             
+            # Skip empty batches
+            if len(pref_batch["query"]) == 0:
+                continue
+            
             # Process batch
             pref_query = tokenizer(pref_batch["query"], padding='max_length' if config.use_tpu else True, truncation=True, max_length=128, return_tensors='pt').input_ids
             pref_query_tensors = accelerate.utils.send_to_device(pref_query, device)
             
+            # Validate batch size after tokenization
+            if pref_query_tensors.shape[0] == 0:
+                continue
+            
             all_pref = pref_batch["response_w"] + pref_batch["response_l"]
             tokenized = tokenizer(all_pref, padding='max_length' if config.use_tpu else True, truncation=True, max_length=64 + generation_kwargs['max_new_tokens'], return_tensors='pt').input_ids
+            
+            # Validate tokenized batch size
+            if tokenized.shape[0] == 0:
+                continue
             
             pref_response_w_tensors = tokenized[:len(pref_batch["response_w"])]
             pref_response_w_tensors = accelerate.utils.send_to_device(pref_response_w_tensors, device)
             pref_response_l_tensors = tokenized[len(pref_batch["response_w"]):]
             pref_response_l_tensors = accelerate.utils.send_to_device(pref_response_l_tensors, device)
+            
+            # Validate response tensors batch sizes
+            if pref_response_w_tensors.shape[0] == 0 or pref_response_l_tensors.shape[0] == 0:
+                continue
+            
+            # Ensure all tensors have the same batch size
+            if pref_query_tensors.shape[0] != pref_response_w_tensors.shape[0] or pref_query_tensors.shape[0] != pref_response_l_tensors.shape[0]:
+                continue
             
             # Train step
             id_trainer.step(
@@ -129,16 +149,51 @@ def identify_error_examples(model, tokenizer, dataset, config, device, max_steps
         for i in tqdm(range(0, len(dataset), batch_size), desc="Identifying errors"):
             batch = dataset.select(range(i, min(i + batch_size, len(dataset))))
             
-            pref_query = tokenizer(batch["query"], padding='max_length' if config.use_tpu else True, truncation=True, max_length=128, return_tensors='pt').input_ids
+            # Skip empty batches
+            if len(batch) == 0:
+                continue
+            
+            # Extract fields from dataset as lists
+            # HuggingFace datasets: batch["column"] returns a list of all values in that column
+            try:
+                batch_queries = list(batch["query"])
+                batch_response_w = list(batch["response_w"])
+                batch_response_l = list(batch["response_l"])
+            except (TypeError, KeyError) as e:
+                # Fallback: extract field by field
+                batch_queries = [batch[j]["query"] for j in range(len(batch))]
+                batch_response_w = [batch[j]["response_w"] for j in range(len(batch))]
+                batch_response_l = [batch[j]["response_l"] for j in range(len(batch))]
+            
+            if len(batch_queries) == 0:
+                continue
+            
+            pref_query = tokenizer(batch_queries, padding='max_length' if config.use_tpu else True, truncation=True, max_length=128, return_tensors='pt').input_ids
             pref_query_tensors = accelerate.utils.send_to_device(pref_query, device)
             
-            all_pref = batch["response_w"] + batch["response_l"]
+            # Validate batch size after tokenization
+            if pref_query_tensors.shape[0] == 0:
+                continue
+            
+            all_pref = batch_response_w + batch_response_l
             tokenized = tokenizer(all_pref, padding='max_length' if config.use_tpu else True, truncation=True, max_length=64 + generation_kwargs['max_new_tokens'], return_tensors='pt').input_ids
             
-            pref_response_w_tensors = tokenized[:len(batch["response_w"])]
+            # Validate tokenized batch size
+            if tokenized.shape[0] == 0:
+                continue
+            
+            pref_response_w_tensors = tokenized[:len(batch_response_w)]
             pref_response_w_tensors = accelerate.utils.send_to_device(pref_response_w_tensors, device)
-            pref_response_l_tensors = tokenized[len(batch["response_w"]):]
+            pref_response_l_tensors = tokenized[len(batch_response_w):]
             pref_response_l_tensors = accelerate.utils.send_to_device(pref_response_l_tensors, device)
+            
+            # Validate response tensors batch sizes
+            if pref_response_w_tensors.shape[0] == 0 or pref_response_l_tensors.shape[0] == 0:
+                continue
+            
+            # Ensure all tensors have the same batch size
+            if pref_query_tensors.shape[0] != pref_response_w_tensors.shape[0] or pref_query_tensors.shape[0] != pref_response_l_tensors.shape[0]:
+                continue
             
             # Compute log probabilities
             input_ids_w = torch.cat((pref_query_tensors, pref_response_w_tensors), dim=1)
