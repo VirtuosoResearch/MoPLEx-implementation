@@ -1,5 +1,5 @@
 cache_dir="cache"
-wandb_project="jtt_dpo"
+wandb_project="rlchf_synthetic"
 model_name="Qwen/Qwen3-0.6B"
 output_dir='outputs'
 
@@ -22,14 +22,20 @@ beta=0.05
 gradient_accumulation_steps=2
 batch_size=4
 mini_batch_size=1
-downsample_ratio=0.14
+downsample_ratio=0.25
 num_train_epochs=100
 
 ipo_loss=false
 
-# JTT-DPO specific parameters
-jtt_identification_steps=100
-jtt_upweight_factor=3.0
+# RLCHF-specific parameters
+num_latent_groups=4
+aggregation_type="weighted_avg"  # or "log_sum_exp"
+aggregation_temperature=1.0
+gating_type="prompt_dependent"  # or "global"
+gating_hidden_size=128
+entropy_reg_coef=0.1
+use_group_embeddings=false
+group_embedding_dim=64
 
 if [[ $debug = true ]]; then
     echo "Running in debug mode"
@@ -37,13 +43,13 @@ if [[ $debug = true ]]; then
 fi
 
 # Use mixed_criteria dataset (multi-preference)
-preference_dataset_path="notebooks/ultrafeedback_synthetic/mixed_criteria"
+preference_dataset_path="notebooks/imdb_synthetic/mixed_criteria"
 
-run_name="jtt_dpo_ultrafeedback_mixed_criteria_${model_name}_bs${batch_size}_idsteps${jtt_identification_steps}_upweight${jtt_upweight_factor}_beta${beta}"
+run_name="rlchf_imdb_${model_name}_bs${batch_size}_beta${beta}_K${num_latent_groups}_${aggregation_type}"
 echo "Running experiment $run_name"
 echo "Using dataset: $preference_dataset_path"
 
-command="python -m trainers.jtt_dpo \
+command="python -m trainers.rlchf \
     --wandb_project $wandb_project --run_name $run_name \
     --inner_iteration_steps 1 \
     --batch_size $batch_size \
@@ -58,9 +64,15 @@ command="python -m trainers.jtt_dpo \
     --downsample_ratio $downsample_ratio \
     --num_train_epochs $num_train_epochs \
     --use_lora True \
-    --jtt_identification_steps $jtt_identification_steps \
-    --jtt_upweight_factor $jtt_upweight_factor \
-    --seed 42
+    --seed 42 \
+    --num_latent_groups $num_latent_groups \
+    --aggregation_type $aggregation_type \
+    --aggregation_temperature $aggregation_temperature \
+    --gating_type $gating_type \
+    --gating_hidden_size $gating_hidden_size \
+    --entropy_reg_coef $entropy_reg_coef \
+    --use_group_embeddings $use_group_embeddings \
+    --group_embedding_dim $group_embedding_dim
 "
 
 if [[ $ipo_loss = true ]]; then
