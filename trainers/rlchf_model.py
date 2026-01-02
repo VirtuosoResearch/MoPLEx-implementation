@@ -292,4 +292,25 @@ class AutoModelForCausalLMWithGroupConditionalScoring(PreTrainedModelWrapper):
     def get_gating_weights(self, hidden_states):
         """Get gating weights π_z(x) for given hidden states."""
         return self.gating_network(hidden_states)
+    
+    def state_dict(self, *args, **kwargs):
+        r"""
+        Returns the state dictionary of the model. We add the state dictionary of the group scoring head
+        and gating network to the state dictionary of the wrapped model.
+        """
+        if not self.is_peft_model:
+            pretrained_model_state_dict = self.pretrained_model.state_dict(*args, **kwargs)
+        else:
+            # if it is a peft model, only save the group_scoring_head and gating_network
+            pretrained_model_state_dict = {}
+
+        group_scoring_head_state_dict = self.group_scoring_head.state_dict(*args, **kwargs)
+        for k, v in group_scoring_head_state_dict.items():
+            pretrained_model_state_dict[f"group_scoring_head.{k}"] = v
+        
+        gating_network_state_dict = self.gating_network.state_dict(*args, **kwargs)
+        for k, v in gating_network_state_dict.items():
+            pretrained_model_state_dict[f"gating_network.{k}"] = v
+        
+        return pretrained_model_state_dict
 
