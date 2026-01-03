@@ -123,6 +123,10 @@ def load_data(args):
         # UltraFeedback synthetic datasets are already in the correct format
         pref_dataset_name = os.path.basename(args.preference_dataset_path)
         pref_dataset = load_from_disk(args.preference_dataset_path)
+    elif "mixinstruct" in args.preference_dataset_path.lower():
+        # Mix-instruct synthetic datasets are already in the correct format
+        pref_dataset_name = os.path.basename(args.preference_dataset_path)
+        pref_dataset = load_from_disk(args.preference_dataset_path)
     else:
         pref_dataset_name, pref_dataset = construct_dataset(
             args=args,
