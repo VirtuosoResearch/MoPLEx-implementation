@@ -1,21 +1,3 @@
-"""
-Process llm-blender/mix-instruct dataset into preference pairs with per-response scores.
-
-For each example:
-- Build prompt from (instruction, input)
-- Select response_0 = best candidate, response_1 = worst candidate
-  using aggregate score = mean([rougeL, bleu, bertscore, bleurt, bartscore])
-- Output one row with:
-  prompt, response_0, response_1,
-  rougeL_0, rougeL_1, bleu_0, bleu_1, bertscore_0, bertscore_1,
-  bleurt_0, bleurt_1, bartscore_0, bartscore_1
-
-Also:
-- Process all three splits: train, validation, test
-- Downsample each split to 10% (frac=0.1) after processing
-- Save each split as CSV
-"""
-
 import os
 import random
 from typing import Dict, Any, List, Optional, Tuple
