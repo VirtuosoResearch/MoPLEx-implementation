@@ -178,7 +178,9 @@ def main(args):
             rewards=torch.zeros(1),
             columns_to_log=["query", "response_w", "response_l"],
         )
-        if epoch % 10==0:
+        # Save checkpoint every N epochs (default 10, can be overridden by save_every_epochs)
+        save_every_epochs = getattr(args, 'save_every_epochs', 10)
+        if save_every_epochs > 0 and epoch % save_every_epochs == 0:
             save_model(trainer, output_dir, model, tokenizer, model_name + f"_epoch_{epoch}", epoch, args)
 
 if __name__ == "__main__":
@@ -194,6 +196,7 @@ if __name__ == "__main__":
     parser.add_argument('--inner_iteration_steps', type=int, default=1, help='the number of training epochs')
     parser.add_argument('--eval_every_steps', type=int, default=10, help='how often to evaluate')
     parser.add_argument('--save_every_steps', type=int, default=1000, help='how often to save checkpoints')
+    parser.add_argument('--save_every_epochs', type=int, default=10, help='how often to save checkpoints (in epochs)')
     parser.add_argument('--num_eval_batches', type=int, default=8, help='the number of evaluation batches of size gold shard size')
     parser.add_argument('--downsample_ratio', type=float, default=1.0, help='the downsample ratio for the dataset, 1.0 means no downsampling')
     parser.add_argument('--clip_range', type=float, default=0.2, help='the clip range')

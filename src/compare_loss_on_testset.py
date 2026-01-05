@@ -39,6 +39,7 @@ def compute_dpo_loss_on_testset(
     beta: float = 0.05,
     cache_dir: str = "cache",
     verbose: bool = True,
+    test_downsample_ratio: float = 0.05,
 ):
     """
     Compute DPO loss on test set for trained model and estimated model.
@@ -156,19 +157,23 @@ def compute_dpo_loss_on_testset(
         print(f"Theta (full) norm: {np.linalg.norm(theta_estimated_flat):.6e}")
     
     # Load test dataset
+    # Note: test_downsample_ratio can be different from training downsample_ratio
+    # This allows using more test samples for evaluation
     if verbose:
         print(f"\nLoading test dataset from: {preference_dataset_path}")
+        print(f"Using test_downsample_ratio={test_downsample_ratio} (can be different from training ratio)")
     data_args = argparse.Namespace(
         preference_dataset_path=preference_dataset_path,
         preference_dataset_subset=None,
         preference_dataset_split=None,
-        downsample_ratio=0.05,  # Downsample test set to 0.05
+        downsample_ratio=test_downsample_ratio,  # Use test-specific downsample ratio
         batch_size=1,  # Use batch_size=1 for simplicity (can be increased for efficiency)
         mini_batch_size=1,
-        seed=42,
+        seed=42,  # Same seed as training to ensure same data split
         cache_dir=cache_dir,
         batched=True,
         num_proc=32,
+        num_samples_test=None,  # Can be set to limit test set size
     )
     
     _, all_eval_dataloaders = load_data(data_args)
@@ -269,6 +274,17 @@ def compute_dpo_loss_on_testset(
         print(f"Trained model - Mean loss: {trained_mean_loss:.6f}")
         print(f"Trained model - Std loss: {np.std(trained_losses):.6f}")
     
+    # Free GPU memory: delete trained_model since it's no longer needed
+    # Note: ref_model is kept because it's used in estimated model inference
+    # This is crucial to avoid OOM when loading estimated_model_wrapper and ref_model_wrapper
+    if verbose:
+        print("\nFreeing GPU memory by deleting trained_model...")
+    del trained_model
+    import gc
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    
     # Compute DPO loss for estimated model on test set
     # For estimated model, we need to compute gradients on test set and use logistic regression form
     if verbose:
@@ -304,8 +320,12 @@ def compute_dpo_loss_on_testset(
     # We must NOT set all parameters to requires_grad=True, as that would change which parameters are trainable
     
     # Get reference parameters: create reference model wrapper to get the reference parameters
+    # IMPORTANT: Move model to CPU before deepcopy to avoid OOM (deepcopy duplicates GPU memory)
     from trainers.utils import create_reference_model
-    ref_model_wrapper = create_reference_model(estimated_model_wrapper)
+    estimated_model_wrapper_cpu = estimated_model_wrapper.to("cpu")
+    ref_model_wrapper = create_reference_model(estimated_model_wrapper_cpu)
+    # Move both models back to GPU
+    estimated_model_wrapper = estimated_model_wrapper_cpu.to(device)
     ref_model_wrapper = ref_model_wrapper.to(device)
     ref_model_wrapper.eval()
     
@@ -480,6 +500,8 @@ def main():
                        help='Cache directory')
     parser.add_argument('--verbose', action='store_true',
                        help='Print detailed progress')
+    parser.add_argument('--test_downsample_ratio', type=float, default=0.05,
+                       help='Downsample ratio for test set (can be different from training ratio)')
     
     args = parser.parse_args()
     
@@ -491,6 +513,7 @@ def main():
         beta=args.beta,
         cache_dir=args.cache_dir,
         verbose=args.verbose,
+        test_downsample_ratio=args.test_downsample_ratio,
     )
     
     return results

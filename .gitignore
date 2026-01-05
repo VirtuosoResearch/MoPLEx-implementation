@@ -163,7 +163,8 @@ model_checkpoints/
 relabeled_samples*/
 
 slurm_logs/
-src/
+pre_compute
+params
 data
 outputs/
 tatsu-lab*

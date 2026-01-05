@@ -132,7 +132,7 @@ class AutoModelForCausalLMWithValueHead(PreTrainedModelWrapper):
         kwargs["return_dict"] = True  # Ensure we get a dict-like output
         kwargs["past_key_values"] = past_key_values
 
-        if self.is_peft_model and self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING":
+        if self.is_peft_model and hasattr(self.pretrained_model, "active_peft_config") and self.pretrained_model.active_peft_config.peft_type == "PREFIX_TUNING":
             kwargs.pop("past_key_values")
 
         base_model_output = self.pretrained_model(

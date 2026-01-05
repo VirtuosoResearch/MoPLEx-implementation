@@ -325,9 +325,9 @@ class ApproxDPOTrainer():
                     raise ValueError(f"Inconsistent gradients for parameter: {param.shape}")
             
             if grad_diff:
-                g_i = beta * torch.cat(grad_diff).numpy()  # [num_params]
+                g_i = beta * torch.cat(grad_diff)  # [num_params] - keep as torch tensor
             else:
-                g_i = np.array([])
+                g_i = torch.tensor([], dtype=torch.float32)
             
             # Apply random projection if enabled
             if self.projection_dim is not None:
@@ -335,9 +335,17 @@ class ApproxDPOTrainer():
                     self._ensure_projection_matrix()
                 if len(g_i) > 0:
                     # Project: g_projected = projection_matrix^T @ g
-                    g_i = self.projection_matrix.T @ g_i  # [projection_dim]
+                    # Convert projection_matrix to torch tensor if it's numpy
+                    # g_i is already on CPU (from .detach().cpu().flatten()), so ensure projection matrix is also on CPU
+                    if isinstance(self.projection_matrix, np.ndarray):
+                        proj_matrix_torch = torch.from_numpy(self.projection_matrix).float()
+                    else:
+                        proj_matrix_torch = self.projection_matrix.cpu() if self.projection_matrix.is_cuda else self.projection_matrix
+                    g_i = proj_matrix_torch.T @ g_i  # [projection_dim], both on CPU
+                # g_i is already on CPU, no need to move
             
-            gradients_list.append(g_i)
+            # Convert to numpy after projection (if any)
+            gradients_list.append(g_i.numpy())
         
         # Restore original model state
         with torch.no_grad():
