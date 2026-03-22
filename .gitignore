@@ -178,8 +178,8 @@ alignment-handbook/
 gradients/
 results/
 
-*.csv
 *.png
 *.pt
 
 */synthetic_datasets/
+mixture_of_pls/
