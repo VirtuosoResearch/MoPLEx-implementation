@@ -23,3 +23,9 @@ ACCELERATE_LOG_LEVEL=info accelerate launch \
   --output_dir "${OUTPUT_DIR}" \
   --report_to wandb \
   --run_name "${WANDB_NAME}"
+# ACCELERATE_LOG_LEVEL=info accelerate launch --config_file recipes/accelerate_configs/ddp.yaml --num_processes=1 scripts/dpo.py --config recipes/zephyr-7b-beta/dpo/config_qlora.yaml
+
+# CUDA_VISIBLE_DEVICES=0 python -m alpaca_eval.main evaluate_from_model zephyr-7b-dpo-qlora-gpu1-ckpt1600 \
+#   --annotators_config=alpaca_eval_gpt4_0613 \
+#   --max_instances=2 \
+#   --output_path=/home/ldy/Scalable-preference-optimization-and-evaluation/evaluations/alpaca_eval/results/zephyr-7b-dpo-qlora-gpu1-ckpt1600-smoke

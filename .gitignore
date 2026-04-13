@@ -177,6 +177,8 @@ lrr-neurips/
 alignment-handbook/
 gradients/
 results/
+MiCRo/
+evaluations/
 
 *.png
 *.pt
