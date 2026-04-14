@@ -57,7 +57,7 @@ import transformers
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
-from alignment import DPOConfig, ScriptArguments, get_dataset, get_model, get_tokenizer
+from alignment import DPOConfig, ListwiseDPOTrainer, ScriptArguments, get_dataset, get_model, get_tokenizer
 from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
 
 
@@ -122,8 +122,13 @@ def main(script_args, training_args, model_args):
     peft_config = get_peft_config(model_args)
     # When using PEFT adapters with DPO, don't pass a separate ref_model.
     # DPOTrainer will handle creating the reference model internally.
-    trainer = DPOTrainer(
-        model,
+    use_listwise = script_args.dataset_format == "listwise" or training_args.listwise
+    trainer_cls = ListwiseDPOTrainer if use_listwise else DPOTrainer
+    if use_listwise:
+        logger.info("Using listwise DPO trainer for dimension '%s'", script_args.preference_dimension)
+
+    trainer_kwargs = dict(
+        model=model,
         ref_model=None if peft_config is not None else ref_model,
         args=training_args,
         train_dataset=dataset[script_args.dataset_train_split],
@@ -131,6 +136,10 @@ def main(script_args, training_args, model_args):
         processing_class=tokenizer,
         peft_config=peft_config,
     )
+    if use_listwise:
+        trainer_kwargs["listwise_beta"] = training_args.listwise_beta
+
+    trainer = trainer_cls(**trainer_kwargs)
 
     logger.info("*** Train ***")
     checkpoint = None

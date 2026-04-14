@@ -15,8 +15,10 @@
 import unittest
 
 import pytest
+from datasets import Dataset
 
 from alignment import ScriptArguments, get_dataset
+from alignment.data import _to_listwise_dataset
 
 
 class GetDatasetTest(unittest.TestCase):
@@ -121,3 +123,82 @@ class GetDatasetTest(unittest.TestCase):
         self.assertEqual(len(datasets["train"]), 100)
         self.assertIn("test", datasets)
         self.assertEqual(len(datasets["test"]), 100)
+
+    def test_listwise_conversion_sorts_by_dimension(self):
+        data = Dataset.from_list(
+            [
+                {
+                    "prompt": "p1",
+                    "completions": [
+                        {"response": "A", "scores": {"helpfulness": 1.0}},
+                        {"response": "B", "scores": {"helpfulness": 3.0}},
+                        {"response": "C", "scores": {"helpfulness": 2.0}},
+                        {"response": "D", "scores": {"helpfulness": 0.5}},
+                    ],
+                }
+            ]
+        )
+        args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="listwise",
+            preference_dimension="helpfulness",
+            listwise_num_responses=4,
+        )
+        converted = _to_listwise_dataset(data, args)
+        self.assertEqual(len(converted), 1)
+        first = converted[0]
+        self.assertEqual(first["responses"], ["B", "C", "A", "D"])
+
+    def test_listwise_requires_dimension(self):
+        with pytest.raises(ValueError, match=r"preference_dimension"):
+            _ = ScriptArguments(dataset_name="dummy", dataset_format="listwise")
+
+    def test_listwise_random_subsample_is_seeded(self):
+        data = Dataset.from_list(
+            [
+                {
+                    "prompt": "p1",
+                    "completions": [
+                        {"response": "A", "scores": {"helpfulness": 6.0}},
+                        {"response": "B", "scores": {"helpfulness": 5.0}},
+                        {"response": "C", "scores": {"helpfulness": 4.0}},
+                        {"response": "D", "scores": {"helpfulness": 3.0}},
+                        {"response": "E", "scores": {"helpfulness": 2.0}},
+                        {"response": "F", "scores": {"helpfulness": 1.0}},
+                    ],
+                }
+            ]
+        )
+
+        args_seed_1a = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="listwise",
+            preference_dimension="helpfulness",
+            listwise_num_responses=3,
+            listwise_seed=123,
+        )
+        args_seed_1b = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="listwise",
+            preference_dimension="helpfulness",
+            listwise_num_responses=3,
+            listwise_seed=123,
+        )
+        args_seed_2 = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="listwise",
+            preference_dimension="helpfulness",
+            listwise_num_responses=3,
+            listwise_seed=999,
+        )
+
+        converted_1a = _to_listwise_dataset(data, args_seed_1a)
+        converted_1b = _to_listwise_dataset(data, args_seed_1b)
+        converted_2 = _to_listwise_dataset(data, args_seed_2)
+
+        responses_1a = converted_1a[0]["responses"]
+        responses_1b = converted_1b[0]["responses"]
+        responses_2 = converted_2[0]["responses"]
+
+        self.assertEqual(responses_1a, responses_1b)
+        self.assertNotEqual(responses_1a, responses_2)
