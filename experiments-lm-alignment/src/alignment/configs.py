@@ -88,10 +88,15 @@ class ScriptArguments(trl.ScriptArguments):
         default="pairwise",
         metadata={"help": "Dataset format to load: 'pairwise' (default) or 'listwise'."},
     )
-    preference_dimension: Optional[str] = field(
+    preference_dimensions: Optional[list[str]] = field(
         default=None,
         metadata={
-            "help": "Preference dimension for listwise training (e.g. helpfulness, honesty, instruction_following, truthfulness)."
+            "help": (
+                "Ordered preference dimensions for listwise training/conversion. "
+                "For non-cyclic listwise, one listwise row is emitted per dimension. "
+                "For cyclic listwise, dimensions define rotation checks. "
+                "Example: ['instruction_following', 'helpfulness']."
+            )
         },
     )
     listwise_num_responses: int = field(
@@ -122,6 +127,19 @@ class ScriptArguments(trl.ScriptArguments):
         default=2,
         metadata={"help": "Drop prompts with fewer than this number of scored responses."},
     )
+    listwise_seed: int = field(
+        default=0,
+        metadata={"help": "Random seed for listwise subsampling operations."},
+    )
+    listwise_use_cyclic_filter: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Enable rotated-cycle filtering for listwise conversion. "
+                "When enabled, listwise rows are built only from cyclic-matching candidates."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.dataset_name is None and self.dataset_mixture is None:
@@ -129,12 +147,19 @@ class ScriptArguments(trl.ScriptArguments):
 
         if self.dataset_format not in {"pairwise", "listwise"}:
             raise ValueError("`dataset_format` must be either 'pairwise' or 'listwise'")
-        if self.dataset_format == "listwise" and self.preference_dimension is None:
-            raise ValueError("`preference_dimension` is required when dataset_format='listwise'")
+        if self.dataset_format == "listwise" and self.preference_dimensions is None:
+            raise ValueError("`preference_dimensions` is required when dataset_format='listwise'")
         if self.listwise_num_responses < 2:
             raise ValueError("`listwise_num_responses` must be >= 2")
         if self.listwise_min_responses < 2:
             raise ValueError("`listwise_min_responses` must be >= 2")
+        if self.preference_dimensions is not None:
+            if not isinstance(self.preference_dimensions, list):
+                raise ValueError("`preference_dimensions` must be a list when provided")
+            if len(self.preference_dimensions) < 1 or len(self.preference_dimensions) > 4:
+                raise ValueError("`preference_dimensions` must contain 1 to 4 dimensions")
+            if len(set(self.preference_dimensions)) != len(self.preference_dimensions):
+                raise ValueError("`preference_dimensions` must not contain duplicates")
 
         if self.dataset_mixture is not None:
             if not isinstance(self.dataset_mixture, dict) or "datasets" not in self.dataset_mixture:

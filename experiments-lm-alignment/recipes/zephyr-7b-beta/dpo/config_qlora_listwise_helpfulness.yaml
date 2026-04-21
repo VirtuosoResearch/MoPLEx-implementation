@@ -28,7 +28,8 @@ dataset_mixture:
   test_split_size: 2000
   seed: 0
 dataset_format: listwise
-preference_dimension: helpfulness
+preference_dimensions:
+- helpfulness
 listwise_num_responses: 2
 listwise_min_responses: 2
 listwise_prompt_column: instruction

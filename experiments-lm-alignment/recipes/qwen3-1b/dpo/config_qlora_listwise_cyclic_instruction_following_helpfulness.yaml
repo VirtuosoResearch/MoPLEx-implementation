@@ -18,17 +18,11 @@ lora_target_modules:
 - up_proj
 - down_proj
 
-# Data training arguments (raw UltraFeedback -> listwise by helpfulness)
-dataset_mixture:
-  datasets:
-    - id: openbmb/UltraFeedback
-      config: default
-      split: train
-      weight: 1.0
-  test_split_size: 2000
-  seed: 0
+# Data training arguments (pre-generated cyclic listwise dataset)
+dataset_name: ./data/cyclic_ultrafeedback_m2_instruction_following_helpfulness
 dataset_format: listwise
 preference_dimensions:
+- instruction_following
 - helpfulness
 listwise_num_responses: 2
 listwise_min_responses: 2
@@ -43,14 +37,13 @@ bf16: true
 beta: 0.01
 listwise: true
 listwise_beta: 0.01
-do_eval: true
-eval_strategy: steps
-eval_steps: 100
+do_eval: false
+eval_strategy: "no"
 gradient_accumulation_steps: 4
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: qwen3-1b-listwise-dpo-qlora
+hub_model_id: qwen3-1b-listwise-dpo-qlora-cyclic-if-help
 learning_rate: 5.0e-6
 log_level: info
 logging_steps: 10
@@ -59,14 +52,14 @@ max_length: 1024
 max_prompt_length: 512
 num_train_epochs: 1
 optim: paged_adamw_32bit
-output_dir: data/qwen3-1b-listwise-dpo-qlora
-per_device_train_batch_size: 4
+output_dir: outputs/qwen3-1b-listwise-dpo-qlora-cyclic-if-help
+per_device_train_batch_size: 2
 per_device_eval_batch_size: 8
 push_to_hub: false
 remove_unused_columns: false
 report_to:
 - wandb
-run_name: qwen3-1b-listwise-dpo-qlora
+run_name: qwen3-1b-listwise-dpo-qlora-cyclic-if-help
 save_strategy: "steps"
 save_steps: 100
 save_total_limit: 1

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import re
 from typing import Any, Literal, Union
 
 from accelerate import PartialState
@@ -61,17 +62,19 @@ class ListwiseDPODataCollator:
         labels = [-100] * len(prompt_ids) + response_ids
         return input_ids, attention_mask, labels
 
-    def __call__(self, features: list[dict[str, Any]]) -> dict[str, torch.Tensor]:
+    def __call__(self, features: list[dict[str, Any]]) -> dict[str, Any]:
         batch_input_ids = []
         batch_attention_mask = []
         batch_labels = []
         batch_candidate_mask = []
+        batch_preference_dimensions = []
 
         max_candidates = max(len(feature["responses"]) for feature in features)
 
         for feature in features:
             prompt = feature["prompt"]
             responses = feature["responses"]
+            batch_preference_dimensions.append(feature.get("preference_dimension", "unknown"))
 
             item_input_ids = []
             item_attention_mask = []
@@ -114,6 +117,7 @@ class ListwiseDPODataCollator:
             "attention_mask": torch.tensor(batch_attention_mask, dtype=torch.long),
             "labels": torch.tensor(batch_labels, dtype=torch.long),
             "candidate_mask": torch.tensor(batch_candidate_mask, dtype=torch.bool),
+            "preference_dimension": batch_preference_dimensions,
         }
 
 
@@ -219,6 +223,11 @@ class ListwiseDPOTrainer(DPOTrainer):
         return row_losses[valid_rows].mean()
 
     @staticmethod
+    def _metric_dimension_key(dimension: str) -> str:
+        normalized = re.sub(r"[^a-zA-Z0-9_.-]+", "_", str(dimension).strip()).strip("_")
+        return normalized or "unknown"
+
+    @staticmethod
     def _listwise_metrics(utilities: torch.Tensor, candidate_mask: torch.Tensor) -> dict[str, torch.Tensor]:
         pred_order = torch.argsort(utilities, dim=1, descending=True)
         top1_acc = (pred_order[:, 0] == 0).float().mean()
@@ -263,13 +272,14 @@ class ListwiseDPOTrainer(DPOTrainer):
     def get_batch_loss_metrics(
         self,
         model,
-        batch: dict[str, torch.Tensor],
+        batch: dict[str, Any],
         train_eval: Literal["train", "eval"] = "train",
     ) -> tuple[torch.Tensor, dict[str, float]]:
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
         labels = batch["labels"]
         candidate_mask = batch["candidate_mask"]
+        preference_dimensions = batch.get("preference_dimension")
 
         batch_size, num_candidates, seq_len = input_ids.shape
         flat_input_ids = input_ids.view(batch_size * num_candidates, seq_len)
@@ -285,6 +295,23 @@ class ListwiseDPOTrainer(DPOTrainer):
         loss = self._pl_negative_log_likelihood(utilities, candidate_mask)
 
         metric_tensors = self._listwise_metrics(utilities, candidate_mask)
+
+        if preference_dimensions is not None:
+            dim_to_indices: dict[str, list[int]] = {}
+            for idx, dimension in enumerate(preference_dimensions):
+                dim_key = self._metric_dimension_key(dimension)
+                dim_to_indices.setdefault(dim_key, []).append(idx)
+
+            for dim_key, indices in dim_to_indices.items():
+                dim_index_tensor = torch.tensor(indices, device=utilities.device, dtype=torch.long)
+                dim_metrics = self._listwise_metrics(
+                    utilities.index_select(0, dim_index_tensor),
+                    candidate_mask.index_select(0, dim_index_tensor),
+                )
+                for metric_name, metric_value in dim_metrics.items():
+                    suffix = metric_name.removeprefix("listwise/")
+                    metric_tensors[f"listwise/by_dimension/{dim_key}/{suffix}"] = metric_value
+
         prefix = "eval_" if train_eval == "eval" else ""
         metrics = {
             f"{prefix}{name}": self.accelerator.gather_for_metrics(value.detach()).mean().item()

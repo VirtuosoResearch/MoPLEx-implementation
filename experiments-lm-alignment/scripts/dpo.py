@@ -112,6 +112,16 @@ def main(script_args, training_args, model_args):
     # Dataset
     #########
     dataset = get_dataset(script_args)
+    # print dataset sizes
+    for split in dataset:
+        logger.info(f"Loaded {len(dataset[split])} examples from the '{split}' split.")
+    
+    # print a few examples from the dataset for sanity check
+    for split in dataset:
+        logger.info(f"Sample examples from the '{split}' split:")
+        for i in range(min(3, len(dataset[split]))):
+            logger.info(dataset[split][i])
+    
     for split in dataset:
         if "messages" in dataset[split].column_names:
             dataset[split] = dataset[split].remove_columns("messages")
@@ -125,7 +135,7 @@ def main(script_args, training_args, model_args):
     use_listwise = script_args.dataset_format == "listwise" or training_args.listwise
     trainer_cls = ListwiseDPOTrainer if use_listwise else DPOTrainer
     if use_listwise:
-        logger.info("Using listwise DPO trainer for dimension '%s'", script_args.preference_dimension)
+        logger.info("Using listwise DPO trainer for dimensions '%s'", script_args.preference_dimensions)
 
     trainer_kwargs = dict(
         model=model,

@@ -15,10 +15,10 @@
 import unittest
 
 import pytest
-from datasets import Dataset
+from datasets import Dataset, DatasetDict
 
 from alignment import ScriptArguments, get_dataset
-from alignment.data import _to_listwise_dataset
+from alignment.data import _maybe_convert_to_listwise, _to_listwise_dataset
 
 
 class GetDatasetTest(unittest.TestCase):
@@ -141,7 +141,7 @@ class GetDatasetTest(unittest.TestCase):
         args = ScriptArguments(
             dataset_name="dummy",
             dataset_format="listwise",
-            preference_dimension="helpfulness",
+            preference_dimensions=["helpfulness"],
             listwise_num_responses=4,
         )
         converted = _to_listwise_dataset(data, args)
@@ -150,55 +150,199 @@ class GetDatasetTest(unittest.TestCase):
         self.assertEqual(first["responses"], ["B", "C", "A", "D"])
 
     def test_listwise_requires_dimension(self):
-        with pytest.raises(ValueError, match=r"preference_dimension"):
+        with pytest.raises(ValueError, match=r"preference_dimensions"):
             _ = ScriptArguments(dataset_name="dummy", dataset_format="listwise")
 
-    def test_listwise_random_subsample_is_seeded(self):
+    def test_listwise_expands_all_subrankings(self):
         data = Dataset.from_list(
             [
                 {
                     "prompt": "p1",
                     "completions": [
-                        {"response": "A", "scores": {"helpfulness": 6.0}},
-                        {"response": "B", "scores": {"helpfulness": 5.0}},
-                        {"response": "C", "scores": {"helpfulness": 4.0}},
-                        {"response": "D", "scores": {"helpfulness": 3.0}},
-                        {"response": "E", "scores": {"helpfulness": 2.0}},
-                        {"response": "F", "scores": {"helpfulness": 1.0}},
+                        {"response": "A", "scores": {"helpfulness": 4.0}},
+                        {"response": "B", "scores": {"helpfulness": 3.0}},
+                        {"response": "C", "scores": {"helpfulness": 2.0}},
+                        {"response": "D", "scores": {"helpfulness": 1.0}},
                     ],
                 }
             ]
         )
 
-        args_seed_1a = ScriptArguments(
+        args = ScriptArguments(
             dataset_name="dummy",
             dataset_format="listwise",
-            preference_dimension="helpfulness",
-            listwise_num_responses=3,
-            listwise_seed=123,
+            preference_dimensions=["helpfulness"],
+            listwise_num_responses=2,
         )
-        args_seed_1b = ScriptArguments(
+
+        converted = _to_listwise_dataset(data, args)
+        self.assertEqual(len(converted), 6)
+
+        response_pairs = {tuple(item) for item in converted["responses"]}
+        expected_pairs = {
+            ("A", "B"),
+            ("A", "C"),
+            ("A", "D"),
+            ("B", "C"),
+            ("B", "D"),
+            ("C", "D"),
+        }
+        self.assertEqual(response_pairs, expected_pairs)
+
+    def test_listwise_cyclic_filter_integration(self):
+        data = Dataset.from_list(
+            [
+                {
+                    "instruction": "p1",
+                    "completions": [
+                        {
+                            "response": "A",
+                            "annotations": {
+                                "instruction_following": {"Rating": 4.0},
+                                "helpfulness": {"Rating": 1.0},
+                            },
+                        },
+                        {
+                            "response": "B",
+                            "annotations": {
+                                "instruction_following": {"Rating": 3.0},
+                                "helpfulness": {"Rating": 4.0},
+                            },
+                        },
+                        {
+                            "response": "C",
+                            "annotations": {
+                                "instruction_following": {"Rating": 2.0},
+                                "helpfulness": {"Rating": 3.0},
+                            },
+                        },
+                        {
+                            "response": "D",
+                            "annotations": {
+                                "instruction_following": {"Rating": 1.0},
+                                "helpfulness": {"Rating": 2.0},
+                            },
+                        },
+                    ],
+                }
+            ]
+        )
+
+        args = ScriptArguments(
             dataset_name="dummy",
             dataset_format="listwise",
-            preference_dimension="helpfulness",
-            listwise_num_responses=3,
-            listwise_seed=123,
+            preference_dimensions=["instruction_following", "helpfulness"],
+            listwise_use_cyclic_filter=True,
+            listwise_prompt_column="instruction",
+            listwise_responses_column="completions",
+            listwise_response_text_key="response",
+            listwise_annotations_key="annotations",
         )
-        args_seed_2 = ScriptArguments(
+
+        converted = _to_listwise_dataset(data, args)
+        self.assertEqual(len(converted), 2)
+        pref_dims = set(converted["preference_dimension"])
+        self.assertEqual(pref_dims, {"instruction_following", "helpfulness"})
+
+    def test_preformatted_listwise_split_skips_reconversion(self):
+        preformatted = Dataset.from_list(
+            [
+                {
+                    "prompt": "p1",
+                    "responses": ["A", "B", "C", "D"],
+                    "scores": [4.0, 3.0, 2.0, 1.0],
+                    "preference_dimension": "instruction_following",
+                    "source_index": 0,
+                },
+                {
+                    "prompt": "p1",
+                    "responses": ["B", "C", "D", "A"],
+                    "scores": [4.0, 3.0, 2.0, 1.0],
+                    "preference_dimension": "helpfulness",
+                    "source_index": 0,
+                },
+            ]
+        )
+        ds_dict = DatasetDict({"train": preformatted})
+
+        args = ScriptArguments(
             dataset_name="dummy",
             dataset_format="listwise",
-            preference_dimension="helpfulness",
-            listwise_num_responses=3,
-            listwise_seed=999,
+            preference_dimensions=["helpfulness"],
         )
 
-        converted_1a = _to_listwise_dataset(data, args_seed_1a)
-        converted_1b = _to_listwise_dataset(data, args_seed_1b)
-        converted_2 = _to_listwise_dataset(data, args_seed_2)
+        converted = _maybe_convert_to_listwise(ds_dict, args)
+        self.assertEqual(len(converted["train"]), 2)
+        self.assertEqual(set(converted["train"]["preference_dimension"]), {"instruction_following", "helpfulness"})
 
-        responses_1a = converted_1a[0]["responses"]
-        responses_1b = converted_1b[0]["responses"]
-        responses_2 = converted_2[0]["responses"]
+    def test_preformatted_listwise_split_reduces_with_all_subrankings(self):
+        preformatted = Dataset.from_list(
+            [
+                {
+                    "prompt": "p1",
+                    "responses": ["A", "B", "C", "D"],
+                    "scores": [4.0, 3.0, 2.0, 1.0],
+                    "preference_dimension": "instruction_following",
+                }
+            ]
+        )
+        ds_dict = DatasetDict({"train": preformatted})
 
-        self.assertEqual(responses_1a, responses_1b)
-        self.assertNotEqual(responses_1a, responses_2)
+        args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="listwise",
+            preference_dimensions=["instruction_following", "helpfulness"],
+            listwise_num_responses=2,
+            listwise_min_responses=2,
+        )
+
+        converted = _maybe_convert_to_listwise(ds_dict, args)
+        train = converted["train"]
+        self.assertEqual(len(train), 6)
+
+        response_pairs = {tuple(item) for item in train["responses"]}
+        expected_pairs = {
+            ("A", "B"),
+            ("A", "C"),
+            ("A", "D"),
+            ("B", "C"),
+            ("B", "D"),
+            ("C", "D"),
+        }
+        self.assertEqual(response_pairs, expected_pairs)
+
+    def test_listwise_multiple_dimensions_non_cyclic(self):
+        data = Dataset.from_list(
+            [
+                {
+                    "prompt": "p1",
+                    "completions": [
+                        {
+                            "response": "A",
+                            "scores": {"helpfulness": 1.0, "honesty": 4.0},
+                        },
+                        {
+                            "response": "B",
+                            "scores": {"helpfulness": 3.0, "honesty": 3.0},
+                        },
+                        {
+                            "response": "C",
+                            "scores": {"helpfulness": 2.0, "honesty": 2.0},
+                        },
+                        {
+                            "response": "D",
+                            "scores": {"helpfulness": 0.5, "honesty": 1.0},
+                        },
+                    ],
+                }
+            ]
+        )
+        args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="listwise",
+            preference_dimensions=["helpfulness", "honesty"],
+            listwise_num_responses=4,
+        )
+        converted = _to_listwise_dataset(data, args)
+        self.assertEqual(len(converted), 2)
+        self.assertEqual(set(converted["preference_dimension"]), {"helpfulness", "honesty"})

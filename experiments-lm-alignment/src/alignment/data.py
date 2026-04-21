@@ -13,16 +13,66 @@
 # limitations under the License.
 
 import logging
-import random
+import os
+from itertools import combinations
 from typing import Any
 
 import datasets
 from datasets import Dataset, DatasetDict, concatenate_datasets
 
 from .configs import ScriptArguments
+from .cyclic_data import DIMENSIONS, build_cyclic_rows
 
 
 logger = logging.getLogger(__name__)
+
+
+def _is_preformatted_listwise_split(dataset: Dataset) -> bool:
+    required = {"prompt", "responses", "scores", "preference_dimension"}
+    return required.issubset(set(dataset.column_names))
+
+
+def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) -> Dataset:
+    rows: list[dict[str, Any]] = []
+    target_k = args.listwise_num_responses
+    min_k = args.listwise_min_responses
+
+    for row in dataset:
+        responses = row.get("responses")
+        scores = row.get("scores")
+        if not isinstance(responses, list) or not isinstance(scores, list):
+            continue
+
+        n = min(len(responses), len(scores))
+        if n < min_k:
+            continue
+
+        effective_k = min(target_k, n)
+        if effective_k < min_k:
+            continue
+
+        trimmed_responses = responses[:n]
+        trimmed_scores = [float(x) for x in scores[:n]]
+
+        if n <= effective_k:
+            new_row = dict(row)
+            new_row["responses"] = trimmed_responses
+            new_row["scores"] = trimmed_scores
+            rows.append(new_row)
+            continue
+
+        for idxs in combinations(range(n), effective_k):
+            new_row = dict(row)
+            new_row["responses"] = [trimmed_responses[i] for i in idxs]
+            new_row["scores"] = [trimmed_scores[i] for i in idxs]
+            rows.append(new_row)
+
+    if not rows:
+        raise ValueError(
+            "No listwise examples remain after applying listwise_num_responses to preformatted listwise data. "
+            "Check listwise_num_responses/listwise_min_responses settings and dataset columns."
+        )
+    return Dataset.from_list(rows)
 
 
 def _to_float(value: Any) -> float | None:
@@ -104,7 +154,7 @@ def _extract_dimension_score(
     return None
 
 
-def _extract_candidates(row: dict[str, Any], args: ScriptArguments) -> list[tuple[str, float]]:
+def _extract_candidates(row: dict[str, Any], args: ScriptArguments, dimension: str) -> list[tuple[str, float]]:
     raw_responses = row.get(args.listwise_responses_column)
     if raw_responses is None:
         # Allow common fallback names.
@@ -128,7 +178,7 @@ def _extract_candidates(row: dict[str, Any], args: ScriptArguments) -> list[tupl
                 item=item,
                 row=row,
                 idx=idx,
-                dimension=args.preference_dimension,
+                dimension=dimension,
                 scores_key=args.listwise_scores_key,
                 annotations_key=args.listwise_annotations_key,
             )
@@ -146,40 +196,78 @@ def _extract_candidates(row: dict[str, Any], args: ScriptArguments) -> list[tupl
 
 
 def _to_listwise_dataset(dataset: Dataset, args: ScriptArguments) -> Dataset:
+    if args.preference_dimensions is None:
+        raise ValueError("`preference_dimensions` must be set for listwise dataset conversion")
+
+    if args.listwise_use_cyclic_filter:
+        dimensions = tuple(args.preference_dimensions) if args.preference_dimensions else DIMENSIONS
+        seed = args.listwise_seed
+        rows, stats = build_cyclic_rows(
+            dataset,
+            prompt_column=args.listwise_prompt_column,
+            responses_column=args.listwise_responses_column,
+            response_text_key=args.listwise_response_text_key,
+            scores_key=args.listwise_scores_key,
+            annotations_key=args.listwise_annotations_key,
+            dimensions=dimensions,
+            seed=seed,
+        )
+        logger.info(
+            "Cyclic listwise filtering kept %d/%d eligible rows (%d valid candidate sets)",
+            stats.cycle_rows,
+            stats.eligible_rows,
+            stats.valid_score_rows,
+        )
+        if not rows:
+            raise ValueError(
+                "No cyclic listwise examples could be built from the dataset. "
+                "Try another split, dimensions, or annotation key settings."
+            )
+        return Dataset.from_list(rows)
+
     rows = []
-    rng = random.Random(args.dataset_mixture.seed)
+    dimensions = tuple(args.preference_dimensions)
     for row in dataset:
         raw_prompt = row.get(args.listwise_prompt_column)
         prompt = _as_text(raw_prompt).strip()
         if not prompt:
             continue
 
-        candidates = _extract_candidates(row, args)
-        if len(candidates) < args.listwise_min_responses:
-            continue
+        for dimension in dimensions:
+            candidates = _extract_candidates(row, args, dimension=dimension)
+            if len(candidates) < args.listwise_min_responses:
+                continue
 
-        ranked = sorted(candidates, key=lambda x: x[1], reverse=True)
-        if len(ranked) > args.listwise_num_responses:
-            ranked = rng.sample(ranked, args.listwise_num_responses)
-            ranked = sorted(ranked, key=lambda x: x[1], reverse=True)
-        if len(ranked) < args.listwise_min_responses:
-            continue
+            ranked = sorted(candidates, key=lambda x: x[1], reverse=True)
+            if len(ranked) < args.listwise_min_responses:
+                continue
 
-        responses = [x[0] for x in ranked]
-        scores = [float(x[1]) for x in ranked]
-        rows.append(
-            {
-                "prompt": prompt,
-                "responses": responses,
-                "scores": scores,
-                "preference_dimension": args.preference_dimension,
-            }
-        )
+            effective_k = min(args.listwise_num_responses, len(ranked))
+            if effective_k < args.listwise_min_responses:
+                continue
+
+            if len(ranked) == effective_k:
+                subset_rankings = [ranked]
+            else:
+                subset_rankings = [list(subset) for subset in combinations(ranked, effective_k)]
+
+            for subset in subset_rankings:
+                subset = sorted(subset, key=lambda x: x[1], reverse=True)
+                responses = [x[0] for x in subset]
+                scores = [float(x[1]) for x in subset]
+                rows.append(
+                    {
+                        "prompt": prompt,
+                        "responses": responses,
+                        "scores": scores,
+                        "preference_dimension": dimension,
+                    }
+                )
 
     if not rows:
         raise ValueError(
             "No listwise examples could be built from the dataset. "
-            "Check listwise column/key settings and preference_dimension."
+            "Check listwise column/key settings and preference_dimensions."
         )
     return Dataset.from_list(rows)
 
@@ -189,11 +277,26 @@ def _maybe_convert_to_listwise(dataset_dict: DatasetDict, args: ScriptArguments)
         return dataset_dict
 
     converted = {}
+    logged_dimensions = args.preference_dimensions if args.preference_dimensions is not None else []
     for split_name, split_data in dataset_dict.items():
+        if _is_preformatted_listwise_split(split_data):
+            logger.info(
+                "Split '%s' already has listwise columns; applying listwise_num_responses=%d reduction if needed.",
+                split_name,
+                args.listwise_num_responses,
+            )
+            converted[split_name] = _limit_preformatted_listwise_split(split_data, args)
+            logger.info(
+                "Preformatted split '%s' produced %d listwise examples after reduction.",
+                split_name,
+                len(converted[split_name]),
+            )
+            continue
+
         logger.info(
-            "Converting split '%s' to listwise format for dimension '%s'",
+            "Converting split '%s' to listwise format for dimensions '%s'",
             split_name,
-            args.preference_dimension,
+            logged_dimensions,
         )
         converted[split_name] = _to_listwise_dataset(split_data, args)
         logger.info("Built %d listwise examples for split '%s'", len(converted[split_name]), split_name)
@@ -211,7 +314,13 @@ def get_dataset(args: ScriptArguments) -> DatasetDict:
     """
     if args.dataset_name and not args.dataset_mixture:
         logger.info(f"Loading dataset: {args.dataset_name}")
-        dataset = datasets.load_dataset(args.dataset_name, args.dataset_config)
+        if os.path.isdir(args.dataset_name):
+            logger.info("Detected local dataset directory, trying datasets.load_from_disk")
+            dataset = datasets.load_from_disk(args.dataset_name)
+            if isinstance(dataset, Dataset):
+                dataset = DatasetDict({"train": dataset})
+        else:
+            dataset = datasets.load_dataset(args.dataset_name, args.dataset_config)
         return _maybe_convert_to_listwise(dataset, args)
     elif args.dataset_mixture:
         logger.info(f"Creating dataset mixture with {len(args.dataset_mixture.datasets)} datasets")
