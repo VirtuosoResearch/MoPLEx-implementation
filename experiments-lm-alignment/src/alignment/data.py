@@ -36,8 +36,13 @@ def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) 
     rows: list[dict[str, Any]] = []
     target_k = args.listwise_num_responses
     min_k = args.listwise_min_responses
+    allowed_dimensions = set(args.preference_dimensions) if args.preference_dimensions is not None else None
 
     for row in dataset:
+        row_dimension = row.get("preference_dimension")
+        if allowed_dimensions is not None and row_dimension not in allowed_dimensions:
+            continue
+
         responses = row.get("responses")
         scores = row.get("scores")
         if not isinstance(responses, list) or not isinstance(scores, list):
@@ -329,11 +334,33 @@ def get_dataset(args: ScriptArguments) -> DatasetDict:
 
         for dataset_config in args.dataset_mixture.datasets:
             logger.info(f"Loading dataset for mixture: {dataset_config.id} (config: {dataset_config.config})")
-            ds = datasets.load_dataset(
-                dataset_config.id,
-                dataset_config.config,
-                split=dataset_config.split,
-            )
+            if os.path.isdir(dataset_config.id):
+                logger.info("Detected local mixture dataset directory, trying datasets.load_from_disk")
+                local_ds = datasets.load_from_disk(dataset_config.id)
+                if isinstance(local_ds, DatasetDict):
+                    if dataset_config.split not in local_ds:
+                        raise ValueError(
+                            f"Requested split '{dataset_config.split}' not found in local dataset '{dataset_config.id}'. "
+                            f"Available splits: {list(local_ds.keys())}"
+                        )
+                    ds = local_ds[dataset_config.split]
+                elif isinstance(local_ds, Dataset):
+                    if dataset_config.split != "train":
+                        raise ValueError(
+                            f"Local dataset '{dataset_config.id}' is a single split dataset. "
+                            f"Requested split '{dataset_config.split}' is not available; use split='train'."
+                        )
+                    ds = local_ds
+                else:
+                    raise ValueError(
+                        f"Unsupported object loaded from local dataset '{dataset_config.id}': {type(local_ds)}"
+                    )
+            else:
+                ds = datasets.load_dataset(
+                    dataset_config.id,
+                    dataset_config.config,
+                    split=dataset_config.split,
+                )
             if dataset_config.columns is not None:
                 ds = ds.select_columns(dataset_config.columns)
             if dataset_config.weight is not None:

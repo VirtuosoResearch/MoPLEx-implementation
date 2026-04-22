@@ -119,7 +119,7 @@ def main(script_args, training_args, model_args):
     # print a few examples from the dataset for sanity check
     for split in dataset:
         logger.info(f"Sample examples from the '{split}' split:")
-        for i in range(min(3, len(dataset[split]))):
+        for i in range(min(12, len(dataset[split]))):
             logger.info(dataset[split][i])
     
     for split in dataset:

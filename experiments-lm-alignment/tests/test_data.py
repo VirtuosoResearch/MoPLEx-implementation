@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import unittest
+from tempfile import TemporaryDirectory
 
 import pytest
 from datasets import Dataset, DatasetDict
@@ -123,6 +124,28 @@ class GetDatasetTest(unittest.TestCase):
         self.assertEqual(len(datasets["train"]), 100)
         self.assertIn("test", datasets)
         self.assertEqual(len(datasets["test"]), 100)
+
+    def test_loading_local_dataset_mixture_entry(self):
+        with TemporaryDirectory() as tmpdir:
+            local_ds = DatasetDict(
+                {
+                    "train": Dataset.from_list([{"prompt": "p1", "completion": "c1"}, {"prompt": "p2", "completion": "c2"}]),
+                    "test": Dataset.from_list([{"prompt": "p3", "completion": "c3"}]),
+                }
+            )
+            local_ds.save_to_disk(tmpdir)
+
+            dataset_mixture = {
+                "datasets": [
+                    {"id": tmpdir, "split": "train", "columns": ["prompt", "completion"], "weight": 1.0},
+                ],
+                "seed": 42,
+            }
+
+            args = ScriptArguments(dataset_mixture=dataset_mixture)
+            datasets = get_dataset(args)
+            self.assertEqual(len(datasets["train"]), 2)
+            self.assertNotIn("test", datasets)
 
     def test_listwise_conversion_sorts_by_dimension(self):
         data = Dataset.from_list(
@@ -272,8 +295,8 @@ class GetDatasetTest(unittest.TestCase):
         )
 
         converted = _maybe_convert_to_listwise(ds_dict, args)
-        self.assertEqual(len(converted["train"]), 2)
-        self.assertEqual(set(converted["train"]["preference_dimension"]), {"instruction_following", "helpfulness"})
+        self.assertEqual(len(converted["train"]), 1)
+        self.assertEqual(set(converted["train"]["preference_dimension"]), {"helpfulness"})
 
     def test_preformatted_listwise_split_reduces_with_all_subrankings(self):
         preformatted = Dataset.from_list(
