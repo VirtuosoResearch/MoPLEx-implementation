@@ -16,15 +16,28 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import math
+import os
 import re
-from typing import Any, Literal, Union
+import time
+from typing import Any, Dict, Literal, Optional, Tuple, Union
 
 from accelerate import PartialState
 from datasets import Dataset, IterableDataset
 from transformers import BaseImageProcessor, FeatureExtractionMixin, PreTrainedTokenizerBase, ProcessorMixin
+from transformers.trainer_utils import TrainOutput
 import torch
 import torch.nn.functional as F
+from scipy.optimize import linear_sum_assignment
 from trl import DPOTrainer
+
+from .mixture_pl_components import (
+    em_expected_complete_nll,
+    em_responsibilities,
+    mixture_pl_nll,
+    MixturePLHead,
+    MixtureRouterHead,
+)
 
 
 @dataclass
@@ -124,6 +137,10 @@ class ListwiseDPODataCollator:
 class ListwiseDPOTrainer(DPOTrainer):
     def __init__(self, *args, listwise_beta: float | None = None, **kwargs):
         self.listwise_beta_override = listwise_beta
+        if kwargs.get("processing_class") is None and kwargs.get("tokenizer") is not None:
+            kwargs["processing_class"] = kwargs.pop("tokenizer")
+        elif kwargs.get("tokenizer") is not None:
+            kwargs.pop("tokenizer")
         if kwargs.get("data_collator") is None:
             processing_class = kwargs.get("processing_class") or kwargs.get("tokenizer")
             if processing_class is None:
@@ -365,3 +382,728 @@ class ListwiseDPOTrainer(DPOTrainer):
         labels = torch.zeros(logits.shape[0], device=self.accelerator.device)
 
         return (loss.detach(), logits, labels)
+
+
+class MixtureDPOTrainer(ListwiseDPOTrainer):
+    """
+    Listwise DPO trainer with Mixture of Plackett-Luce (MoPL) clustering.
+
+    Jointly optimizes DPO loss and mixture PL loss to discover latent ranking clusters
+    while learning dimension-aware preferences.
+    """
+
+    def __init__(
+        self,
+        model,
+        ref_model=None,
+        args=None,
+        data_collator=None,
+        train_dataset=None,
+        eval_dataset=None,
+        tokenizer=None,
+        model_init=None,
+        callbacks=None,
+        optimizers=(None, None),
+        preprocess_logits_for_metrics=None,
+        peft_config=None,
+        mixture_config=None,
+        **kwargs,
+    ):
+        """
+        Args:
+            mixture_config: MixturePLConfig instance with mixture hyperparameters
+        """
+        if tokenizer is not None and kwargs.get("processing_class") is None:
+            kwargs["processing_class"] = tokenizer
+
+        super().__init__(
+            model=model,
+            ref_model=ref_model,
+            args=args,
+            data_collator=data_collator,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            callbacks=callbacks,
+            optimizers=optimizers,
+            preprocess_logits_for_metrics=preprocess_logits_for_metrics,
+            peft_config=peft_config,
+            **kwargs,
+        )
+
+        self.mixture_config = mixture_config
+        if mixture_config is None or not mixture_config.use_mixture:
+            raise ValueError("MixtureDPOTrainer requires mixture_config with use_mixture=True")
+
+        # Determine number of clusters
+        self.num_clusters = mixture_config.num_clusters
+        if self.num_clusters is None:
+            # Try to infer from preference_dimensions in script args
+            if hasattr(args, "preference_dimensions") and args.preference_dimensions:
+                self.num_clusters = len(args.preference_dimensions)
+            else:
+                raise ValueError(
+                    "num_clusters must be specified in mixture_config or inferred from preference_dimensions"
+                )
+
+        # Get hidden size from the trained model after DPOTrainer has applied any wrapping.
+        model_config = getattr(self.model, "config", getattr(model, "config", None))
+        if model_config is not None and hasattr(model_config, "hidden_size"):
+            self.hidden_size = model_config.hidden_size
+        else:
+            raise ValueError("Model config must have hidden_size attribute")
+
+        self.mixture_reward_backend = mixture_config.mixture_reward_backend
+        self.mixture_head = None
+        self.mixture_router = None
+        self.policy_adapter_name = None
+        self.mixture_adapter_names = []
+
+        if self.mixture_reward_backend == "head":
+            self.mixture_head = MixturePLHead(
+                hidden_size=self.hidden_size,
+                num_clusters=self.num_clusters,
+                use_contextual_router=mixture_config.use_contextual_router,
+                router_hidden_size=mixture_config.router_hidden_size,
+            )
+            if (
+                not mixture_config.use_contextual_router
+                and getattr(mixture_config, "use_closed_form_router_prior_update", False)
+                and hasattr(self.mixture_head.router, "global_logits")
+            ):
+                self.mixture_head.router.global_logits.requires_grad_(False)
+            self.mixture_head.to(self.args.device)
+            self.model.add_module("mixture_pl_head", self.mixture_head)
+        else:
+            self._init_lora_mixture_backend(peft_config)
+
+        # Kept for quick diagnostics in notebooks/scripts.
+        self.router_accs_buffer = []
+        self.preference_dimension_to_cluster = self._infer_preference_dimension_to_cluster(
+            self.train_dataset,
+            self.eval_dataset,
+        )
+
+    def _get_active_adapter_name(self) -> Optional[str]:
+        adapter_model = self.accelerator.unwrap_model(self.model) if hasattr(self, "accelerator") else self.model
+        active_adapter = getattr(adapter_model, "active_adapter", None)
+        if isinstance(active_adapter, str):
+            return active_adapter
+        active_adapters = getattr(adapter_model, "active_adapters", None)
+        if isinstance(active_adapters, list) and active_adapters:
+            return str(active_adapters[0])
+        return None
+
+    def _set_active_adapter(self, adapter_name: str) -> None:
+        adapter_model = self.accelerator.unwrap_model(self.model) if hasattr(self, "accelerator") else self.model
+        if not hasattr(adapter_model, "set_adapter"):
+            raise ValueError("LoRA mixture backend requires a PEFT model with set_adapter().")
+        adapter_model.set_adapter(adapter_name)
+
+    def _peft_adapter_config(self, peft_config):
+        if peft_config is not None:
+            return peft_config
+        adapter_model = self.accelerator.unwrap_model(self.model) if hasattr(self, "accelerator") else self.model
+        model_peft_config = getattr(adapter_model, "peft_config", None)
+        if not model_peft_config:
+            return None
+        active_adapter = self._get_active_adapter_name()
+        if active_adapter is not None and active_adapter in model_peft_config:
+            return model_peft_config[active_adapter]
+        return next(iter(model_peft_config.values()))
+
+    def _set_trainable_lora_adapters(self, adapter_names: list[str]) -> None:
+        adapter_model = self.accelerator.unwrap_model(self.model) if hasattr(self, "accelerator") else self.model
+        adapter_tokens = tuple(f".{adapter_name}." for adapter_name in adapter_names)
+        for name, param in adapter_model.named_parameters():
+            if any(adapter_token in name for adapter_token in adapter_tokens):
+                param.requires_grad_(True)
+
+    def _init_lora_mixture_backend(self, peft_config) -> None:
+        adapter_config = self._peft_adapter_config(peft_config)
+        if adapter_config is None or not hasattr(self.model, "add_adapter"):
+            raise ValueError(
+                "mixture_reward_backend='lora' requires PEFT/LoRA training. "
+                "Pass --use_peft and LoRA target modules."
+            )
+
+        self.policy_adapter_name = self._get_active_adapter_name() or "default"
+        self.mixture_adapter_names = [
+            f"{self.mixture_config.mixture_lora_adapter_prefix}_{cluster_idx}"
+            for cluster_idx in range(self.num_clusters)
+        ]
+
+        existing_adapters = set(getattr(self.model, "peft_config", {}).keys())
+        for adapter_name in self.mixture_adapter_names:
+            if adapter_name not in existing_adapters:
+                self.model.add_adapter(adapter_name, adapter_config)
+
+        self.mixture_router = MixtureRouterHead(
+            hidden_size=self.hidden_size,
+            num_clusters=self.num_clusters,
+            use_contextual=self.mixture_config.use_contextual_router,
+            router_hidden_size=self.mixture_config.router_hidden_size,
+        )
+        if (
+            not self.mixture_config.use_contextual_router
+            and getattr(self.mixture_config, "use_closed_form_router_prior_update", False)
+            and hasattr(self.mixture_router, "global_logits")
+        ):
+            self.mixture_router.global_logits.requires_grad_(False)
+        self.mixture_router.to(self.args.device)
+        self.model.add_module("mixture_router", self.mixture_router)
+
+        self._set_active_adapter(self.policy_adapter_name)
+        self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
+
+    def _update_global_router_prior_from_gamma(self, gamma: torch.Tensor) -> None:
+        """Update the non-contextual router logits to the closed-form prior implied by gamma."""
+        if self.mixture_config.use_contextual_router:
+            return
+        if not getattr(self.mixture_config, "use_closed_form_router_prior_update", False):
+            return
+        router = self.mixture_head.router if self.mixture_reward_backend == "head" else self.mixture_router
+        if router is None or not hasattr(router, "global_logits"):
+            return
+
+        prior = gamma.mean(dim=0)
+        prior = prior / prior.sum().clamp_min(1e-12)
+        with torch.no_grad():
+            router.global_logits.copy_(torch.log(prior.clamp_min(1e-12)))
+
+    @staticmethod
+    def _preference_dimension_sort_key(dimension: str) -> tuple[int, int, str]:
+        match = re.fullmatch(r"cluster[_-]?(\d+)", str(dimension))
+        if match is not None:
+            return (0, int(match.group(1)), str(dimension))
+        return (1, 0, str(dimension))
+
+    def _infer_preference_dimension_to_cluster(self, *datasets) -> Dict[str, int]:
+        dimensions = set()
+        for dataset in datasets:
+            if dataset is None:
+                continue
+            column_names = getattr(dataset, "column_names", [])
+            if "preference_dimension" not in column_names:
+                continue
+            try:
+                dimensions.update(str(dimension) for dimension in dataset["preference_dimension"])
+            except Exception:
+                continue
+
+        sorted_dimensions = sorted(dimensions, key=self._preference_dimension_sort_key)
+        return {dimension: idx for idx, dimension in enumerate(sorted_dimensions)}
+
+    @staticmethod
+    def _observed_rankings(candidate_mask: torch.Tensor) -> torch.Tensor:
+        """Return the dataset-provided listwise order: response 0 is preferred to response 1, etc."""
+        batch_size, num_candidates = candidate_mask.shape
+        return torch.arange(num_candidates, device=candidate_mask.device).unsqueeze(0).expand(batch_size, -1)
+
+    def _pool_last_hidden_state(self, hidden_states: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+        attn_mask = attention_mask.unsqueeze(-1).float()
+        return (hidden_states * attn_mask).sum(dim=1) / attn_mask.sum(dim=1).clamp_min(1.0)
+
+    def _get_batch_mixture_output_head(
+        self,
+        model,
+        flat_input_ids: torch.Tensor,
+        flat_attention_mask: torch.Tensor,
+        batch: Dict[str, Any],
+        batch_size: int,
+        num_candidates: int,
+    ) -> Dict[str, torch.Tensor]:
+        model_output = model(
+            input_ids=flat_input_ids,
+            attention_mask=flat_attention_mask,
+            output_hidden_states=True,
+        )
+        pooled = self._pool_last_hidden_state(model_output.hidden_states[-1], flat_attention_mask)
+        pooled = pooled.view(batch_size, num_candidates, self.hidden_size)
+
+        mixture_param = next(self.mixture_head.parameters())
+        pooled_for_head = pooled.to(dtype=mixture_param.dtype)
+        router_logits, rewards = self.mixture_head(pooled_for_head, batch["candidate_mask"])
+
+        return {
+            "router_logits": router_logits,
+            "rewards": rewards,
+            "pooled": pooled,
+        }
+
+    def _get_batch_mixture_output_lora(
+        self,
+        model,
+        flat_input_ids: torch.Tensor,
+        flat_attention_mask: torch.Tensor,
+        flat_labels: torch.Tensor,
+        batch: Dict[str, Any],
+        batch_size: int,
+        num_candidates: int,
+    ) -> Dict[str, torch.Tensor]:
+        if self.policy_adapter_name is None or self.mixture_router is None:
+            raise RuntimeError("LoRA mixture backend was not initialized.")
+
+        self._set_active_adapter(self.policy_adapter_name)
+        if self.mixture_config.use_contextual_router:
+            context_output = model(
+                input_ids=flat_input_ids,
+                attention_mask=flat_attention_mask,
+                output_hidden_states=True,
+            )
+            pooled = self._pool_last_hidden_state(context_output.hidden_states[-1], flat_attention_mask)
+            pooled = pooled.view(batch_size, num_candidates, self.hidden_size)
+            weights = batch["candidate_mask"].to(dtype=pooled.dtype).unsqueeze(-1)
+            context = (pooled * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        else:
+            router_param = next(self.mixture_router.parameters())
+            pooled = None
+            context = torch.zeros(
+                batch_size,
+                self.hidden_size,
+                device=flat_input_ids.device,
+                dtype=router_param.dtype,
+            )
+
+        router_logits = self.mixture_router(context.to(dtype=next(self.mixture_router.parameters()).dtype))
+        ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
+
+        beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+        reward_tensors = []
+        for adapter_name in self.mixture_adapter_names:
+            self._set_active_adapter(adapter_name)
+            adapter_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
+            adapter_logps = self._sequence_logps(adapter_logits, flat_labels).view(batch_size, num_candidates)
+            reward_tensors.append(beta * (adapter_logps - ref_logps))
+
+        self._set_active_adapter(self.policy_adapter_name)
+        self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
+
+        return {
+            "router_logits": router_logits,
+            "rewards": torch.stack(reward_tensors, dim=1),
+            "pooled": pooled,
+        }
+
+    def get_batch_mixture_output(
+        self,
+        model,
+        batch: Dict[str, Any],
+    ) -> Dict[str, torch.Tensor]:
+        """
+        Compute mixture model outputs: router logits and component rewards.
+
+        Args:
+            model: language model
+            batch: batch dict with 'input_ids' and 'attention_mask'
+
+        Returns:
+            dict with 'router_logits' [B, K] and 'rewards' [B, K, M]
+        """
+        batch_size, num_candidates, seq_len = batch["input_ids"].shape
+        flat_input_ids = batch["input_ids"].view(batch_size * num_candidates, seq_len)
+        flat_attention_mask = batch["attention_mask"].view(batch_size * num_candidates, seq_len)
+        flat_labels = batch["labels"].view(batch_size * num_candidates, seq_len)
+
+        if self.mixture_reward_backend == "head":
+            return self._get_batch_mixture_output_head(
+                model,
+                flat_input_ids,
+                flat_attention_mask,
+                batch,
+                batch_size,
+                num_candidates,
+            )
+
+        return self._get_batch_mixture_output_lora(
+            model,
+            flat_input_ids,
+            flat_attention_mask,
+            flat_labels,
+            batch,
+            batch_size,
+            num_candidates,
+        )
+
+    def _cluster_assignment_metrics(
+        self,
+        mixture_output: Dict[str, torch.Tensor],
+        batch: Dict[str, Any],
+        assignment_scores: Optional[torch.Tensor] = None,
+        metric_prefix: str = "mixture/cluster",
+    ) -> Dict[str, float]:
+        """Compute raw and permutation-aligned cluster accuracy when labels are available."""
+        if not self.mixture_config.log_cluster_metrics or "preference_dimension" not in batch:
+            return {}
+
+        true_cluster_values = batch.get("preference_dimension", [])
+        if isinstance(true_cluster_values, torch.Tensor):
+            if true_cluster_values.numel() == 0:
+                return {}
+            true_clusters = true_cluster_values.to(device=mixture_output["router_logits"].device, dtype=torch.long)
+        else:
+            if not true_cluster_values:
+                return {}
+            if isinstance(true_cluster_values[0], str):
+                cluster_matches = [
+                    re.fullmatch(r"cluster[_-]?(\d+)", str(dimension)) for dimension in true_cluster_values
+                ]
+                if all(match is not None for match in cluster_matches):
+                    true_cluster_ids = [int(match.group(1)) for match in cluster_matches if match is not None]
+                else:
+                    configured_dimensions = (
+                        getattr(self.args, "preference_dimensions", None)
+                        or getattr(self.mixture_config, "preference_dimensions", None)
+                        or []
+                    )
+                    if configured_dimensions:
+                        dim_to_cluster = {dim: idx for idx, dim in enumerate(configured_dimensions)}
+                    elif self.preference_dimension_to_cluster:
+                        dim_to_cluster = self.preference_dimension_to_cluster
+                    else:
+                        dim_to_cluster = {dim: idx for idx, dim in enumerate(sorted(set(true_cluster_values)))}
+                    true_cluster_ids = [dim_to_cluster.get(dim, 0) for dim in true_cluster_values]
+            else:
+                true_cluster_ids = [int(cluster_id) for cluster_id in true_cluster_values]
+
+            true_clusters = torch.tensor(
+                true_cluster_ids,
+                device=mixture_output["router_logits"].device,
+                dtype=torch.long,
+            )
+
+        if assignment_scores is None:
+            assignment_scores = mixture_output["router_logits"]
+        pred_clusters = assignment_scores.argmax(dim=1).detach()
+        true_clusters = true_clusters.detach()
+        try:
+            pred_clusters = self.accelerator.gather_for_metrics(pred_clusters)
+            true_clusters = self.accelerator.gather_for_metrics(true_clusters)
+        except Exception:
+            pass
+
+        if pred_clusters.numel() == 0 or true_clusters.numel() == 0:
+            return {}
+
+        raw_cluster_acc = (pred_clusters == true_clusters).float().mean()
+
+        # Align predicted cluster ids to ground-truth ids using Hungarian matching.
+        num_clusters = int(
+            max(
+                self.num_clusters,
+                int(true_clusters.max().item()) + 1,
+                int(pred_clusters.max().item()) + 1,
+            )
+        )
+        confusion = torch.zeros((num_clusters, num_clusters), dtype=torch.long, device=pred_clusters.device)
+        for true_cluster, pred_cluster in zip(true_clusters.view(-1), pred_clusters.view(-1)):
+            confusion[true_cluster.long(), pred_cluster.long()] += 1
+
+        row_ind, col_ind = linear_sum_assignment((-confusion).cpu().numpy())
+        pred_to_true = {pred_idx: true_idx for true_idx, pred_idx in zip(row_ind, col_ind)}
+        aligned_pred_clusters = torch.tensor(
+            [pred_to_true.get(int(pred_cluster.item()), int(pred_cluster.item())) for pred_cluster in pred_clusters],
+            device=pred_clusters.device,
+        )
+        cluster_acc = (aligned_pred_clusters == true_clusters).float().mean()
+
+        cluster_acc_value = float(cluster_acc.item())
+        self.router_accs_buffer.append(cluster_acc_value)
+        return {
+            f"{metric_prefix}_acc": cluster_acc_value,
+            f"{metric_prefix}_acc_raw": float(raw_cluster_acc.item()),
+        }
+
+    def get_batch_mixture_em_loss_metrics(
+        self,
+        model,
+        batch: Dict[str, Any],
+        gamma: Optional[torch.Tensor] = None,
+        include_cluster_metrics: bool = True,
+    ) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, torch.Tensor], torch.Tensor]:
+        mixture_output = self.get_batch_mixture_output(model, batch)
+        candidate_mask = batch["candidate_mask"]
+        rankings = self._observed_rankings(candidate_mask).long()
+        valid_rows = candidate_mask.sum(dim=1) >= 2
+
+        mixture_nll, comp_logp = mixture_pl_nll(
+            mixture_output["router_logits"],
+            mixture_output["rewards"],
+            rankings,
+            candidate_mask=candidate_mask,
+        )
+        if gamma is None:
+            gamma = em_responsibilities(
+                mixture_output["router_logits"],
+                comp_logp,
+                temperature=self.mixture_config.em_temperature,
+            ).detach()
+
+        mixture_em_nll = em_expected_complete_nll(
+            mixture_output["router_logits"],
+            comp_logp,
+            gamma,
+            valid_mask=valid_rows,
+        )
+
+        metrics = {
+            "mixture/nll": float(mixture_nll.detach().item()),
+            "mixture/em_nll": float(mixture_em_nll.detach().item()),
+        }
+        if include_cluster_metrics:
+            metrics.update(
+                self._cluster_assignment_metrics(
+                    mixture_output,
+                    batch,
+                    assignment_scores=gamma,
+                    metric_prefix="mixture/cluster",
+                )
+            )
+            metrics.update(
+                self._cluster_assignment_metrics(
+                    mixture_output,
+                    batch,
+                    assignment_scores=mixture_output["router_logits"],
+                    metric_prefix="mixture/router_cluster",
+                )
+            )
+        return mixture_em_nll, metrics, mixture_output, gamma
+
+    def get_batch_loss_metrics_with_mixture(
+        self,
+        model,
+        batch: Dict[str, Any],
+        train_eval: Literal["train", "eval"] = "train",
+    ) -> Tuple[torch.Tensor, Dict[str, float], Optional[Dict[str, torch.Tensor]]]:
+        """
+        Compute DPO loss + mixture loss and all metrics.
+
+        Returns:
+            loss: hybrid loss (DPO + mixture)
+            metrics: dict of computed metrics
+            mixture_output: intermediate mixture outputs (for M-step caching)
+        """
+        if self.mixture_reward_backend == "lora":
+            self._set_active_adapter(self.policy_adapter_name)
+            self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
+
+        # ===== Compute DPO loss (listwise) =====
+        dpo_loss, dpo_metrics = self.get_batch_loss_metrics(model, batch, train_eval=train_eval)
+
+        # ===== Compute mixture loss (if applicable) =====
+        mixture_metrics = {}
+        mixture_output = None
+
+        if train_eval == "train" or self.mixture_config.log_cluster_metrics:
+            mixture_em_nll, mixture_metrics, mixture_output, gamma = self.get_batch_mixture_em_loss_metrics(model, batch)
+
+            if train_eval == "train":
+                self._update_global_router_prior_from_gamma(gamma)
+                if self.mixture_config.mixture_training_mode == "em_only":
+                    hybrid_loss = mixture_em_nll
+                else:
+                    hybrid_loss = dpo_loss + self.mixture_config.mixture_nll_weight * mixture_em_nll
+            else:
+                hybrid_loss = dpo_loss
+
+        else:
+            hybrid_loss = dpo_loss
+
+        # Combine metrics
+        all_metrics = {**dpo_metrics, **mixture_metrics}
+
+        return hybrid_loss, all_metrics, mixture_output
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Override to add mixture loss to DPO loss."""
+        del kwargs
+        compute_loss_context_manager = (
+            torch.autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+        )
+        with compute_loss_context_manager:
+            loss, metrics, _ = self.get_batch_loss_metrics_with_mixture(model, inputs, train_eval="train")
+
+        loss = loss.to(self.args.device)
+        self.store_metrics(metrics, train_eval="train")
+
+        if return_outputs:
+            return loss, metrics
+
+        return loss
+
+    def prediction_step(
+        self,
+        model,
+        inputs,
+        prediction_loss_only: bool,
+        ignore_keys: Optional[list[str]] = None,
+    ):
+        """Override to include mixture metrics in evaluation."""
+        del ignore_keys
+        prediction_context_manager = (
+            torch.autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+        )
+        with torch.no_grad(), prediction_context_manager:
+            loss, metrics, _ = self.get_batch_loss_metrics_with_mixture(model, inputs, train_eval="eval")
+
+        self.store_metrics(metrics, train_eval="eval")
+
+        if prediction_loss_only:
+            return (loss.detach(), None, None)
+
+        logits = torch.tensor(
+            [
+                metrics.get("eval_listwise/utility_first", 0.0),
+                metrics.get("eval_listwise/utility_last", 0.0),
+            ],
+            device=self.accelerator.device,
+        )
+        labels = torch.zeros(logits.shape[0], device=self.accelerator.device)
+
+        return (loss.detach(), logits, labels)
+
+    def save_model(self, output_dir: Optional[str] = None, _internal_call: bool = False):
+        super().save_model(output_dir=output_dir, _internal_call=_internal_call)
+        output_dir = output_dir if output_dir is not None else self.args.output_dir
+        if self.is_world_process_zero():
+            os.makedirs(output_dir, exist_ok=True)
+            if self.mixture_reward_backend == "head":
+                torch.save(self.mixture_head.state_dict(), os.path.join(output_dir, "mixture_pl_head.pt"))
+            else:
+                torch.save(self.mixture_router.state_dict(), os.path.join(output_dir, "mixture_router.pt"))
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        result = super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        if self.mixture_reward_backend == "head":
+            mixture_head_path = os.path.join(resume_from_checkpoint, "mixture_pl_head.pt")
+            if os.path.exists(mixture_head_path):
+                state_dict = torch.load(mixture_head_path, map_location=self.args.device)
+                self.mixture_head.load_state_dict(state_dict)
+        else:
+            mixture_router_path = os.path.join(resume_from_checkpoint, "mixture_router.pt")
+            if os.path.exists(mixture_router_path):
+                state_dict = torch.load(mixture_router_path, map_location=self.args.device)
+                self.mixture_router.load_state_dict(state_dict)
+        return result
+
+
+class MixtureEMDPOTrainer(MixtureDPOTrainer):
+    """Mixture trainer with a classic EM-style loop over the mixture objective only."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if self.mixture_config.mixture_training_mode != "em_only":
+            raise ValueError("MixtureEMDPOTrainer requires mixture_training_mode='em_only'")
+
+    def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):  # noqa: D401
+        del trial, ignore_keys_for_eval, kwargs
+        if resume_from_checkpoint is not None:
+            self._load_from_checkpoint(resume_from_checkpoint)
+
+        args = self.args
+        train_dataloader = self.get_train_dataloader()
+        m_step_updates = self.mixture_config.m_step_updates
+        steps_per_epoch = max(len(train_dataloader) * m_step_updates, 1)
+        if args.max_steps > 0:
+            max_steps = args.max_steps
+            num_train_epochs = math.ceil(max_steps / steps_per_epoch)
+        else:
+            num_train_epochs = math.ceil(args.num_train_epochs)
+            max_steps = math.ceil(args.num_train_epochs * steps_per_epoch)
+
+        self.create_optimizer_and_scheduler(num_training_steps=max_steps)
+        self.model, self.optimizer, train_dataloader, self.lr_scheduler = self.accelerator.prepare(
+            self.model,
+            self.optimizer,
+            train_dataloader,
+            self.lr_scheduler,
+        )
+        self.model_wrapped = self.model
+        self.optimizer.zero_grad()
+
+        self.state.max_steps = max_steps
+        self.state.num_train_epochs = num_train_epochs
+        self.state.global_step = 0
+
+        total_loss = 0.0
+        start_time = time.time()
+        stop_training = False
+
+        for epoch in range(num_train_epochs):
+            self.model.train()
+            for step, batch in enumerate(train_dataloader):
+                inputs = self._prepare_inputs(batch)
+
+                # E-step: infer gamma once with current parameters.
+                with torch.no_grad():
+                    _, _, _, gamma = self.get_batch_mixture_em_loss_metrics(
+                        self.model,
+                        inputs,
+                        include_cluster_metrics=False,
+                    )
+                self._update_global_router_prior_from_gamma(gamma)
+
+                # M-step: optimize only E_q[log p(z, ranking | x)] for fixed gamma.
+                for m_step in range(m_step_updates):
+                    self.model.train()
+                    should_log = args.logging_steps > 0 and (self.state.global_step + 1) % args.logging_steps == 0
+                    loss, metrics, _, _ = self.get_batch_mixture_em_loss_metrics(
+                        self.model,
+                        inputs,
+                        gamma=gamma,
+                    )
+                    metric_context_manager = (
+                        torch.autocast(self.accelerator.device.type)
+                        if self._peft_has_been_casted_to_bf16
+                        else nullcontext()
+                    )
+                    with torch.no_grad(), metric_context_manager:
+                        if self.mixture_reward_backend == "lora":
+                            self._set_active_adapter(self.policy_adapter_name)
+                        _, listwise_metrics = self.get_batch_loss_metrics(
+                            self.model,
+                            inputs,
+                            train_eval="train",
+                        )
+                    metrics.update(listwise_metrics)
+                    self.store_metrics(metrics, train_eval="train")
+
+                    self.accelerator.backward(loss)
+                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                        self.accelerator.clip_grad_norm_(self.model.parameters(), args.max_grad_norm)
+
+                    self.optimizer.step()
+                    if self.lr_scheduler is not None:
+                        self.lr_scheduler.step()
+                    self.optimizer.zero_grad()
+
+                    self.state.global_step += 1
+                    total_loss += float(loss.detach().item())
+
+                    if should_log:
+                        self.log(
+                            {
+                                "loss": float(loss.detach().item()),
+                                "em/e_step_epoch": float(epoch),
+                                "em/m_step": float(m_step + 1),
+                            }
+                        )
+
+                    if self.state.global_step >= max_steps:
+                        stop_training = True
+                        break
+
+                if stop_training:
+                    break
+
+            if stop_training:
+                break
+
+        runtime = time.time() - start_time
+        train_loss = total_loss / max(self.state.global_step, 1)
+        metrics = {
+            "train_runtime": runtime,
+            "train_samples_per_second": self.state.global_step * args.train_batch_size / max(runtime, 1e-12),
+            "train_steps_per_second": self.state.global_step / max(runtime, 1e-12),
+            "train_loss": train_loss,
+        }
+        return TrainOutput(self.state.global_step, train_loss, metrics)

@@ -57,7 +57,17 @@ import transformers
 from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
-from alignment import DPOConfig, ListwiseDPOTrainer, ScriptArguments, get_dataset, get_model, get_tokenizer
+from alignment import (
+    DPOConfig,
+    ListwiseDPOTrainer,
+    MixtureDPOTrainer,
+    MixtureEMDPOTrainer,
+    MixturePLConfig,
+    ScriptArguments,
+    get_dataset,
+    get_model,
+    get_tokenizer,
+)
 from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
 
 
@@ -133,9 +143,24 @@ def main(script_args, training_args, model_args):
     # When using PEFT adapters with DPO, don't pass a separate ref_model.
     # DPOTrainer will handle creating the reference model internally.
     use_listwise = script_args.dataset_format == "listwise" or training_args.listwise
-    trainer_cls = ListwiseDPOTrainer if use_listwise else DPOTrainer
-    if use_listwise:
+    use_mixture = training_args.use_mixture if hasattr(training_args, "use_mixture") else False
+
+    # Select trainer class
+    if use_mixture:
+        trainer_cls = MixtureEMDPOTrainer if training_args.mixture_training_mode == "em_only" else MixtureDPOTrainer
+        logger.info(
+            "Using Mixture DPO trainer with %d clusters, mode=%s, reward_backend=%s, mixture_nll_weight=%.4f",
+            training_args.num_clusters,
+            training_args.mixture_training_mode,
+            training_args.mixture_reward_backend,
+            training_args.mixture_nll_weight,
+        )
+    elif use_listwise:
+        trainer_cls = ListwiseDPOTrainer
         logger.info("Using listwise DPO trainer for dimensions '%s'", script_args.preference_dimensions)
+    else:
+        trainer_cls = DPOTrainer
+        logger.info("Using standard pairwise DPO trainer")
 
     trainer_kwargs = dict(
         model=model,
@@ -146,6 +171,8 @@ def main(script_args, training_args, model_args):
         processing_class=tokenizer,
         peft_config=peft_config,
     )
+    if use_mixture:
+        trainer_kwargs["mixture_config"] = training_args
     if use_listwise:
         trainer_kwargs["listwise_beta"] = training_args.listwise_beta
 
@@ -176,6 +203,6 @@ def main(script_args, training_args, model_args):
 
 
 if __name__ == "__main__":
-    parser = TrlParser((ScriptArguments, DPOConfig, ModelConfig))
+    parser = TrlParser((ScriptArguments, MixturePLConfig, ModelConfig))
     script_args, training_args, model_args = parser.parse_args_and_config()
     main(script_args, training_args, model_args)
