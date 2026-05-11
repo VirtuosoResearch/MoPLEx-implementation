@@ -54,7 +54,7 @@ import sys
 import datasets
 import torch
 import transformers
-from transformers import set_seed
+from transformers import TrainerCallback, set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from alignment import (
@@ -65,13 +65,48 @@ from alignment import (
     MixturePLConfig,
     ScriptArguments,
     get_dataset,
+    get_ranking_dataset,
     get_model,
     get_tokenizer,
 )
+from alignment.ranking_eval import _dimension_mapping, evaluate_ranking_split, evaluate_ranking_splits
 from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
 
 
 logger = logging.getLogger(__name__)
+
+
+class RankingEvaluationCallback(TrainerCallback):
+    """Log full ranking metrics on the configured evaluation split during Trainer.evaluate()."""
+
+    def __init__(self, ranking_dataset, tokenizer, script_args, training_args):
+        self.ranking_dataset = ranking_dataset
+        self.tokenizer = tokenizer
+        self.script_args = script_args
+        self.training_args = training_args
+        self.eval_split = script_args.dataset_test_split
+        self.dimension_to_id = _dimension_mapping(script_args.preference_dimensions, ranking_dataset)
+        self.trainer = None
+
+    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
+        del args, state, control, kwargs
+        if self.trainer is None or self.eval_split not in self.ranking_dataset:
+            return
+
+        split_metrics, _ = evaluate_ranking_split(
+            trainer=self.trainer,
+            split_dataset=self.ranking_dataset[self.eval_split],
+            tokenizer=self.tokenizer,
+            training_args=self.training_args,
+            dimension_to_id=self.dimension_to_id,
+            cluster_alignment=None,
+        )
+        logged_metrics = {f"ranking_{self.eval_split}/{key}": value for key, value in split_metrics.items()}
+        best_model_aliases = {f"eval_{key}": value for key, value in logged_metrics.items()}
+        if metrics is not None:
+            metrics.update(logged_metrics)
+            metrics.update(best_model_aliases)
+        self.trainer.log(logged_metrics)
 
 
 def main(script_args, training_args, model_args):
@@ -122,9 +157,13 @@ def main(script_args, training_args, model_args):
     # Dataset
     #########
     dataset = get_dataset(script_args)
+    ranking_dataset = get_ranking_dataset(script_args) if script_args.run_ranking_eval else None
     # print dataset sizes
     for split in dataset:
         logger.info(f"Loaded {len(dataset[split])} examples from the '{split}' split.")
+    if ranking_dataset is not None:
+        for split in ranking_dataset:
+            logger.info(f"Loaded {len(ranking_dataset[split])} ranking examples from the '{split}' split.")
     
     # print a few examples from the dataset for sanity check
     for split in dataset:
@@ -177,6 +216,20 @@ def main(script_args, training_args, model_args):
         trainer_kwargs["listwise_beta"] = training_args.listwise_beta
 
     trainer = trainer_cls(**trainer_kwargs)
+    if (
+        ranking_dataset is not None
+        and script_args.ranking_eval_during_training
+        and training_args.eval_strategy != "no"
+        and script_args.dataset_test_split in ranking_dataset
+    ):
+        ranking_callback = RankingEvaluationCallback(
+            ranking_dataset=ranking_dataset,
+            tokenizer=tokenizer,
+            script_args=script_args,
+            training_args=training_args,
+        )
+        ranking_callback.trainer = trainer
+        trainer.add_callback(ranking_callback)
 
     logger.info("*** Train ***")
     checkpoint = None
@@ -195,6 +248,20 @@ def main(script_args, training_args, model_args):
         metrics = trainer.evaluate()
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
+
+    if ranking_dataset is not None:
+        logger.info("*** Ranking evaluation on available ranking splits ***")
+        ranking_results = evaluate_ranking_splits(
+            trainer=trainer,
+            ranking_dataset=ranking_dataset,
+            tokenizer=tokenizer,
+            script_args=script_args,
+            training_args=training_args,
+        )
+        for split_name, split_metrics in ranking_results.items():
+            trainer.log({f"ranking_{split_name}/{key}": value for key, value in split_metrics.items()})
+            trainer.log_metrics(f"ranking_{split_name}", split_metrics)
+            trainer.save_metrics(f"ranking_{split_name}", split_metrics)
 
     # Save and push to hub
     trainer.save_model(training_args.output_dir)

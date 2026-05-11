@@ -140,6 +140,34 @@ class ScriptArguments(trl.ScriptArguments):
             )
         },
     )
+    pairwise_from_listwise_strategy: str = field(
+        default="extreme",
+        metadata={
+            "help": (
+                "When dataset_format='pairwise' and the loaded dataset has listwise ranking columns, "
+                "convert each ranking row to pairwise DPO rows. Choices: 'extreme' uses top vs bottom; "
+                "'all_pairs' emits every ordered pair from the observed ranking."
+            )
+        },
+    )
+    run_ranking_eval: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If True and ranking/listwise splits are available, run offline ranking evaluation on "
+                "train/validation/test after training."
+            )
+        },
+    )
+    ranking_eval_during_training: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "If True, run ranking/listwise evaluation on the configured eval split each time "
+                "Trainer.evaluate() runs, so ranking accuracy is visible during training."
+            )
+        },
+    )
 
     def __post_init__(self):
         if self.dataset_name is None and self.dataset_mixture is None:
@@ -147,6 +175,8 @@ class ScriptArguments(trl.ScriptArguments):
 
         if self.dataset_format not in {"pairwise", "listwise"}:
             raise ValueError("`dataset_format` must be either 'pairwise' or 'listwise'")
+        if self.pairwise_from_listwise_strategy not in {"extreme", "all_pairs"}:
+            raise ValueError("`pairwise_from_listwise_strategy` must be either 'extreme' or 'all_pairs'")
         if self.dataset_format == "listwise" and self.preference_dimensions is None:
             raise ValueError("`preference_dimensions` is required when dataset_format='listwise'")
         if self.listwise_num_responses < 2:

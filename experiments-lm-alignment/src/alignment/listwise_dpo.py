@@ -813,6 +813,53 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             f"{metric_prefix}_acc_raw": float(raw_cluster_acc.item()),
         }
 
+    def _mixture_posterior_ranking_metrics(
+        self,
+        mixture_output: Dict[str, torch.Tensor],
+        gamma: torch.Tensor,
+        batch: Dict[str, Any],
+    ) -> Dict[str, float]:
+        rewards = mixture_output.get("rewards")
+        if rewards is None:
+            return {}
+
+        candidate_mask = batch["candidate_mask"]
+        preference_dimensions = batch.get("preference_dimension")
+        pred_clusters = gamma.argmax(dim=1)
+        row_indices = torch.arange(rewards.shape[0], device=rewards.device)
+        posterior_rewards = rewards[row_indices, pred_clusters, :]
+
+        metric_tensors = self._listwise_metrics(posterior_rewards, candidate_mask)
+        metrics = {
+            f"mixture_posterior/{name.removeprefix('listwise/')}": self.accelerator.gather_for_metrics(
+                value.detach()
+            ).mean().item()
+            for name, value in metric_tensors.items()
+            if name in {"listwise/top1_acc", "listwise/pairwise_acc"}
+        }
+
+        if preference_dimensions is not None:
+            dim_to_indices: dict[str, list[int]] = {}
+            for idx, dimension in enumerate(preference_dimensions):
+                dim_key = self._metric_dimension_key(dimension)
+                dim_to_indices.setdefault(dim_key, []).append(idx)
+
+            for dim_key, indices in dim_to_indices.items():
+                dim_index_tensor = torch.tensor(indices, device=posterior_rewards.device, dtype=torch.long)
+                dim_metrics = self._listwise_metrics(
+                    posterior_rewards.index_select(0, dim_index_tensor),
+                    candidate_mask.index_select(0, dim_index_tensor),
+                )
+                for metric_name, metric_value in dim_metrics.items():
+                    if metric_name not in {"listwise/top1_acc", "listwise/pairwise_acc"}:
+                        continue
+                    suffix = metric_name.removeprefix("listwise/")
+                    metrics[f"mixture_posterior/by_dimension/{dim_key}/{suffix}"] = self.accelerator.gather_for_metrics(
+                        metric_value.detach()
+                    ).mean().item()
+
+        return metrics
+
     def get_batch_mixture_em_loss_metrics(
         self,
         model,
@@ -866,6 +913,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
                     metric_prefix="mixture/router_cluster",
                 )
             )
+            metrics.update(self._mixture_posterior_ranking_metrics(mixture_output, gamma, batch))
         return mixture_em_nll, metrics, mixture_output, gamma
 
     def get_batch_loss_metrics_with_mixture(
@@ -971,18 +1019,21 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             else:
                 torch.save(self.mixture_router.state_dict(), os.path.join(output_dir, "mixture_router.pt"))
 
-    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
-        result = super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+    def _load_mixture_state_from_checkpoint(self, checkpoint_dir: str) -> None:
         if self.mixture_reward_backend == "head":
-            mixture_head_path = os.path.join(resume_from_checkpoint, "mixture_pl_head.pt")
+            mixture_head_path = os.path.join(checkpoint_dir, "mixture_pl_head.pt")
             if os.path.exists(mixture_head_path):
                 state_dict = torch.load(mixture_head_path, map_location=self.args.device)
                 self.mixture_head.load_state_dict(state_dict)
         else:
-            mixture_router_path = os.path.join(resume_from_checkpoint, "mixture_router.pt")
+            mixture_router_path = os.path.join(checkpoint_dir, "mixture_router.pt")
             if os.path.exists(mixture_router_path):
                 state_dict = torch.load(mixture_router_path, map_location=self.args.device)
                 self.mixture_router.load_state_dict(state_dict)
+
+    def _load_from_checkpoint(self, resume_from_checkpoint, model=None):
+        result = super()._load_from_checkpoint(resume_from_checkpoint, model=model)
+        self._load_mixture_state_from_checkpoint(resume_from_checkpoint)
         return result
 
 
@@ -994,8 +1045,59 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
         if self.mixture_config.mixture_training_mode != "em_only":
             raise ValueError("MixtureEMDPOTrainer requires mixture_training_mode='em_only'")
 
+    @staticmethod
+    def _strategy_value(strategy) -> str:
+        return str(getattr(strategy, "value", strategy)).lower()
+
+    @classmethod
+    def _strategy_is(cls, strategy, expected: str) -> bool:
+        value = cls._strategy_value(strategy)
+        return value == expected or value.endswith(f".{expected}")
+
+    @staticmethod
+    def _positive_interval(value) -> int:
+        if value is None:
+            return 0
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return 0
+
+    def _maybe_evaluate_and_save_em(self, trial=None, force_epoch: bool = False):
+        args = self.args
+        eval_strategy = getattr(args, "eval_strategy", getattr(args, "evaluation_strategy", "no"))
+        save_strategy = getattr(args, "save_strategy", "no")
+        eval_metrics = None
+
+        should_eval = False
+        if force_epoch:
+            should_eval = self._strategy_is(eval_strategy, "epoch")
+        elif self._strategy_is(eval_strategy, "steps"):
+            eval_steps = self._positive_interval(getattr(args, "eval_steps", 0))
+            should_eval = eval_steps > 0 and self.state.global_step % eval_steps == 0
+
+        if should_eval and self.eval_dataset is not None:
+            eval_metrics = self.evaluate()
+
+        should_save = False
+        if force_epoch:
+            should_save = self._strategy_is(save_strategy, "epoch")
+        elif self._strategy_is(save_strategy, "steps"):
+            save_steps = self._positive_interval(getattr(args, "save_steps", 0))
+            should_save = save_steps > 0 and self.state.global_step % save_steps == 0
+
+        if should_save:
+            if (
+                eval_metrics is None
+                and getattr(args, "metric_for_best_model", None) is not None
+                and self.eval_dataset is not None
+            ):
+                eval_metrics = self.evaluate()
+            self._save_checkpoint(self.model, trial=trial, metrics=eval_metrics)
+            self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):  # noqa: D401
-        del trial, ignore_keys_for_eval, kwargs
+        del ignore_keys_for_eval, kwargs
         if resume_from_checkpoint is not None:
             self._load_from_checkpoint(resume_from_checkpoint)
 
@@ -1088,6 +1190,8 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                             }
                         )
 
+                    self._maybe_evaluate_and_save_em(trial=trial)
+
                     if self.state.global_step >= max_steps:
                         stop_training = True
                         break
@@ -1095,8 +1199,16 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                 if stop_training:
                     break
 
+            if not stop_training:
+                self.state.epoch = float(epoch + 1)
+                self._maybe_evaluate_and_save_em(trial=trial, force_epoch=True)
+
             if stop_training:
                 break
+
+        if getattr(args, "load_best_model_at_end", False) and self.state.best_model_checkpoint is not None:
+            self._load_best_model()
+            self._load_mixture_state_from_checkpoint(self.state.best_model_checkpoint)
 
         runtime = time.time() - start_time
         train_loss = total_loss / max(self.state.global_step, 1)

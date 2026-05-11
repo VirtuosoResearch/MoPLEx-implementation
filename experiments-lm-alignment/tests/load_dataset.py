@@ -3,11 +3,10 @@
 from datasets import load_from_disk
 dimensions = ["instruction_following", "helpfulness", "truthfulness", "honesty"]
 
-for i in range(4):
-    for j in range(i + 1, 4):
-        path = f'../data/cyclic_ultrafeedback_m2_{dimensions[i]}_{dimensions[j]}'
-        ds = load_from_disk(path)
-        print(i, j, len(ds['train']))
+# for i in range(4):
+#     for j in range(i + 1, 4):
+path = f'../data/cyclic_ultrafeedback_merged'
+ds = load_from_disk(path)
 # %%
 
 import logging

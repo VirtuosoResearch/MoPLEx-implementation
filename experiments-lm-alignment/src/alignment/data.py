@@ -80,6 +80,51 @@ def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) 
     return Dataset.from_list(rows)
 
 
+def _pairwise_from_listwise_split(dataset: Dataset, args: ScriptArguments) -> Dataset:
+    rows: list[dict[str, Any]] = []
+    allowed_dimensions = set(args.preference_dimensions) if args.preference_dimensions is not None else None
+    strategy = args.pairwise_from_listwise_strategy
+
+    for row in dataset:
+        row_dimension = row.get("preference_dimension")
+        if allowed_dimensions is not None and row_dimension not in allowed_dimensions:
+            continue
+
+        responses = row.get("responses")
+        scores = row.get("scores")
+        if not isinstance(responses, list) or not isinstance(scores, list):
+            continue
+
+        n = min(len(responses), len(scores))
+        if n < 2:
+            continue
+
+        trimmed_responses = [str(response) for response in responses[:n]]
+        trimmed_scores = [float(score) for score in scores[:n]]
+        pair_indices = [(0, n - 1)] if strategy == "extreme" else list(combinations(range(n), 2))
+
+        for chosen_idx, rejected_idx in pair_indices:
+            pairwise_row = {
+                "prompt": row["prompt"],
+                "chosen": trimmed_responses[chosen_idx],
+                "rejected": trimmed_responses[rejected_idx],
+                "chosen_score": trimmed_scores[chosen_idx],
+                "rejected_score": trimmed_scores[rejected_idx],
+                "preference_dimension": row_dimension,
+            }
+            for metadata_key in ("source_index", "source_dataset"):
+                if metadata_key in row:
+                    pairwise_row[metadata_key] = row[metadata_key]
+            rows.append(pairwise_row)
+
+    if not rows:
+        raise ValueError(
+            "No pairwise examples could be built from listwise rankings. "
+            "Check pairwise_from_listwise_strategy, preference_dimensions, and dataset columns."
+        )
+    return Dataset.from_list(rows)
+
+
 def _to_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -308,6 +353,56 @@ def _maybe_convert_to_listwise(dataset_dict: DatasetDict, args: ScriptArguments)
     return DatasetDict(converted)
 
 
+def _maybe_convert_to_pairwise(dataset_dict: DatasetDict, args: ScriptArguments) -> DatasetDict:
+    if args.dataset_format != "pairwise":
+        return dataset_dict
+
+    converted = {}
+    for split_name, split_data in dataset_dict.items():
+        if not _is_preformatted_listwise_split(split_data):
+            converted[split_name] = split_data
+            continue
+
+        logger.info(
+            "Split '%s' has listwise ranking columns but dataset_format='pairwise'; converting with strategy='%s'.",
+            split_name,
+            args.pairwise_from_listwise_strategy,
+        )
+        converted[split_name] = _pairwise_from_listwise_split(split_data, args)
+        logger.info("Built %d pairwise examples for split '%s'", len(converted[split_name]), split_name)
+    return DatasetDict(converted)
+
+
+def _load_named_dataset(args: ScriptArguments) -> DatasetDict:
+    logger.info(f"Loading dataset: {args.dataset_name}")
+    if os.path.isdir(args.dataset_name):
+        logger.info("Detected local dataset directory, trying datasets.load_from_disk")
+        dataset = datasets.load_from_disk(args.dataset_name)
+        if isinstance(dataset, Dataset):
+            dataset = DatasetDict({"train": dataset})
+    else:
+        dataset = datasets.load_dataset(args.dataset_name, args.dataset_config)
+    return dataset
+
+
+def get_ranking_dataset(args: ScriptArguments) -> DatasetDict | None:
+    """Load ranking-shaped splits for offline ranking evaluation, if available."""
+    if args.dataset_name is None or args.dataset_mixture is not None:
+        return None
+
+    dataset = _load_named_dataset(args)
+    if all(_is_preformatted_listwise_split(split_data) for split_data in dataset.values()):
+        return DatasetDict(
+            {
+                split_name: _limit_preformatted_listwise_split(split_data, args)
+                for split_name, split_data in dataset.items()
+            }
+        )
+    if args.dataset_format == "listwise":
+        return _maybe_convert_to_listwise(dataset, args)
+    return None
+
+
 def get_dataset(args: ScriptArguments) -> DatasetDict:
     """Load a dataset or a mixture of datasets based on the configuration.
 
@@ -318,15 +413,9 @@ def get_dataset(args: ScriptArguments) -> DatasetDict:
         DatasetDict: The loaded datasets.
     """
     if args.dataset_name and not args.dataset_mixture:
-        logger.info(f"Loading dataset: {args.dataset_name}")
-        if os.path.isdir(args.dataset_name):
-            logger.info("Detected local dataset directory, trying datasets.load_from_disk")
-            dataset = datasets.load_from_disk(args.dataset_name)
-            if isinstance(dataset, Dataset):
-                dataset = DatasetDict({"train": dataset})
-        else:
-            dataset = datasets.load_dataset(args.dataset_name, args.dataset_config)
-        return _maybe_convert_to_listwise(dataset, args)
+        dataset = _load_named_dataset(args)
+        dataset = _maybe_convert_to_listwise(dataset, args)
+        return _maybe_convert_to_pairwise(dataset, args)
     elif args.dataset_mixture:
         logger.info(f"Creating dataset mixture with {len(args.dataset_mixture.datasets)} datasets")
         seed = args.dataset_mixture.seed
@@ -383,9 +472,11 @@ def get_dataset(args: ScriptArguments) -> DatasetDict:
                 logger.info(
                     f"Split dataset into train and test sets with test size: {args.dataset_mixture.test_split_size}"
                 )
-                return _maybe_convert_to_listwise(combined_dataset, args)
+                combined_dataset = _maybe_convert_to_listwise(combined_dataset, args)
+                return _maybe_convert_to_pairwise(combined_dataset, args)
             else:
-                return _maybe_convert_to_listwise(DatasetDict({"train": combined_dataset}), args)
+                combined_dataset = _maybe_convert_to_listwise(DatasetDict({"train": combined_dataset}), args)
+                return _maybe_convert_to_pairwise(combined_dataset, args)
         else:
             raise ValueError("No datasets were loaded from the mixture configuration")
 
