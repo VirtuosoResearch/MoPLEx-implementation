@@ -1063,6 +1063,26 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
         except (TypeError, ValueError):
             return 0
 
+    def _update_best_metric_for_legacy_checkpointing(self, metrics: Optional[dict[str, float]]) -> None:
+        """Update TrainerState best fields for Trainer versions whose _save_checkpoint lacks metrics=."""
+        if not metrics:
+            return
+        metric_name = getattr(self.args, "metric_for_best_model", None)
+        if metric_name is None:
+            return
+
+        metric_value = metrics.get(metric_name)
+        if metric_value is None and not str(metric_name).startswith("eval_"):
+            metric_value = metrics.get(f"eval_{metric_name}")
+        if metric_value is None:
+            return
+
+        operator = float.__gt__ if getattr(self.args, "greater_is_better", False) else float.__lt__
+        current_best = self.state.best_metric
+        if current_best is None or operator(float(metric_value), float(current_best)):
+            self.state.best_metric = float(metric_value)
+            self.state.best_global_step = self.state.global_step
+
     def _maybe_evaluate_and_save_em(self, trial=None, force_epoch: bool = False):
         args = self.args
         eval_strategy = getattr(args, "eval_strategy", getattr(args, "evaluation_strategy", "no"))
@@ -1093,7 +1113,13 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                 and self.eval_dataset is not None
             ):
                 eval_metrics = self.evaluate()
-            self._save_checkpoint(self.model, trial=trial, metrics=eval_metrics)
+            try:
+                self._save_checkpoint(self.model, trial=trial, metrics=eval_metrics)
+            except TypeError as exc:
+                if "unexpected keyword argument 'metrics'" not in str(exc):
+                    raise
+                self._update_best_metric_for_legacy_checkpointing(eval_metrics)
+                self._save_checkpoint(self.model, trial=trial)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
 
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):  # noqa: D401
