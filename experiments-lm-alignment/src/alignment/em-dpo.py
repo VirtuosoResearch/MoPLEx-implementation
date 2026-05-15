@@ -1,3 +1,4 @@
+
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, Tuple
 from pathlib import Path
@@ -86,11 +87,11 @@ class ScriptArguments:
     max_length: Optional[int] = field(default=4096)
     use_lora: Optional[bool] = field(default=False)
     base_model: Optional[str] = field(default='Skywork/Skywork-Reward-Llama-3.1-8B-v0.2')
-    wandb_name: Optional[str] = field(default="maxmin_em")
+    wandb_name: Optional[str] = field(default="em_dpo")
     log_dir: Optional[str] = field(default='./output_models')
     loss_type: Optional[str] = field(
-        default='maxmin_em',
-        metadata={"help": "Loss type: 'origin' (single BT), 'multi_linear' (sum of BT), 'maxmin_em' (hard-EM)."},
+        default='em_dpo',
+        metadata={"help": "Loss type: 'origin', 'multi_linear', 'em_dpo' (soft EM), 'hard_em_dpo' (hard EM)."},
     )
     use_smallset: Optional[bool] = field(default=False)
     freeze_pretrained: Optional[bool] = field(default=True)
@@ -102,6 +103,14 @@ class ScriptArguments:
     save_strategy: Optional[str] = field(default='steps')
     downsample_rate: Optional[float] = field(default=0.1)
     eval_only: Optional[bool] = field(default=False)
+    em_temperature: Optional[float] = field(
+        default=1.0,
+        metadata={"help": "Temperature for EM-DPO responsibilities. Lower values make assignments sharper."},
+    )
+    em_prior_smoothing: Optional[float] = field(
+        default=1e-3,
+        metadata={"help": "Smoothing added when updating logged mixture-prior estimates."},
+    )
 
 
 parser = HfArgumentParser(ScriptArguments)
@@ -110,6 +119,8 @@ torch.manual_seed(script_args.manual_seed)
 
 if script_args.downsample_rate is None or script_args.downsample_rate <= 0 or script_args.downsample_rate > 1:
     raise ValueError("`downsample_rate` must be in (0, 1].")
+if script_args.em_temperature is None or script_args.em_temperature <= 0:
+    raise ValueError("`em_temperature` must be > 0.")
 
 if accelerator.is_main_process:
     print('Arguments:')
@@ -777,18 +788,17 @@ class RewardDataCollatorWithPadding:
 
 
 # ---------------------------------------------------------------------------
-# MaxMin-RLHF Trainer
+# EM-DPO Trainer
 # ---------------------------------------------------------------------------
-class MaxMinRewardTrainer(RewardTrainer):
+class EMDPORewardTrainer(RewardTrainer):
     """
-    Reward trainer implementing MaxMin-RLHF's EM-based mixture learning.
+    Reward trainer implementing an EM-DPO-style mixture objective.
 
     Supported loss_type values:
       - 'origin':       Standard single-head BT loss.
       - 'multi_linear': Sum of per-head BT losses (shared-base ensemble / HyRe-like).
-      - 'maxmin_em':    Hard-assignment EM.
-                        E-step: assign each sample to the head with highest BT likelihood.
-                        M-step: BT loss only on the assigned head.
+      - 'em_dpo':       Soft EM-DPO: responsibility-weighted preference loss.
+      - 'hard_em_dpo':  Hard EM-DPO: loss only on the highest-responsibility head.
     """
 
     def _prepare_dataset(self, dataset, processing_class, args, dataset_name):
@@ -823,30 +833,51 @@ class MaxMinRewardTrainer(RewardTrainer):
             loss = -nn.functional.logsigmoid(rewards_j - rewards_k).sum(dim=-1).mean()
             train_score_diff = (rewards_j - rewards_k).sum(dim=-1)
 
-        # ---- MaxMin-RLHF: hard-assignment EM ----
-        elif script_args.loss_type == 'maxmin_em':
-            diff = rewards_j - rewards_k              # (B, K)
+        # ---- EM-DPO mixture objective over preference heads ----
+        elif script_args.loss_type in ['em_dpo', 'hard_em_dpo']:
+            diff = rewards_j - rewards_k                     # (B, K)
+            per_head_log_likelihood = nn.functional.logsigmoid(diff)
+            per_head_loss = -per_head_log_likelihood
 
-            # E-step: assign each sample to head with highest BT probability.
-            # Detach so argmax does not participate in the backward graph.
             with torch.no_grad():
-                bt_probs = torch.sigmoid(diff)        # (B, K)
-                assignments = bt_probs.argmax(dim=-1) # (B,)
-
-            # M-step: BT loss on the assigned head only.
-            assigned_diff = diff.gather(1, assignments.unsqueeze(1)).squeeze(1)  # (B,)
-            loss = -nn.functional.logsigmoid(assigned_diff).mean()
-
-            train_score_diff = assigned_diff
-
-            # Log cluster utilisation for debugging.
-            if model.training and accelerator.is_main_process and wandb.run is not None:
-                for k in range(script_args.num_heads):
-                    frac = (assignments == k).float().mean().item()
-                    wandb.log(
-                        {f"cluster/head_{k}_frac": frac},
-                        step=self.state.global_step,
+                prior = getattr(self, "component_prior", None)
+                if prior is None or prior.numel() != diff.shape[1]:
+                    prior = torch.full(
+                        (diff.shape[1],),
+                        1.0 / diff.shape[1],
+                        device=diff.device,
+                        dtype=diff.dtype,
                     )
+                else:
+                    prior = prior.to(device=diff.device, dtype=diff.dtype)
+
+                log_responsibilities = (
+                    per_head_log_likelihood / script_args.em_temperature
+                    + torch.log(prior.clamp_min(1e-8)).unsqueeze(0)
+                )
+
+                if script_args.loss_type == 'hard_em_dpo':
+                    assignments = log_responsibilities.argmax(dim=-1)
+                    responsibilities = torch.zeros_like(diff)
+                    responsibilities.scatter_(1, assignments.unsqueeze(1), 1.0)
+                else:
+                    responsibilities = log_responsibilities.softmax(dim=-1)
+                    assignments = responsibilities.argmax(dim=-1)
+
+                batch_prior = responsibilities.mean(dim=0)
+                smoothed_prior = batch_prior + script_args.em_prior_smoothing
+                smoothed_prior = smoothed_prior / smoothed_prior.sum()
+                self.component_prior = smoothed_prior.detach().cpu()
+
+            loss = (responsibilities * per_head_loss).sum(dim=-1).mean()
+            train_score_diff = (responsibilities * diff).sum(dim=-1)
+
+            if model.training and accelerator.is_main_process and wandb.run is not None:
+                log_payload = {}
+                for k in range(diff.shape[1]):
+                    log_payload[f"em/head_{k}_responsibility"] = responsibilities[:, k].mean().float().cpu().item()
+                    log_payload[f"em/head_{k}_hard_frac"] = (assignments == k).float().mean().cpu().item()
+                wandb.log(log_payload, step=self.state.global_step)
 
         else:
             raise NotImplementedError(f"Unknown loss_type: {script_args.loss_type}")
@@ -895,7 +926,7 @@ class MaxMinRewardTrainer(RewardTrainer):
         reward_scores = torch.stack(reward_scores)        # (2, B, K)
         _, batch_size, num_heads = reward_scores.shape
 
-        if num_heads > 1 and script_args.loss_type == 'maxmin_em':
+        if num_heads > 1 and script_args.loss_type in ['em_dpo', 'hard_em_dpo']:
             # Main eval metric uses the uniform average head. Per-head metrics
             # are appended below and parsed by compute_metrics. We deliberately
             # avoid choosing the best head per sample because that leaks the
@@ -927,7 +958,7 @@ class MaxMinRewardTrainer(RewardTrainer):
 # ---------------------------------------------------------------------------
 # Train
 # ---------------------------------------------------------------------------
-trainer = MaxMinRewardTrainer(
+trainer = EMDPORewardTrainer(
     model=model,
     args=training_args,
     processing_class=tokenizer,
