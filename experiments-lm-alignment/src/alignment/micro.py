@@ -23,6 +23,8 @@ import jsonlines
 from trl import RewardConfig, RewardTrainer
 from transformers.utils import PaddingStrategy
 from safetensors.torch import load_file as load_safetensors
+import pyarrow as pa
+import pyarrow.ipc as ipc
 torch.backends.cuda.matmul.allow_tf32 = True
 # os.environ["HF_TOKEN"] = ''
 # os.environ['CUDA_VISIBLE_DEVICES'] = '7'
@@ -47,6 +49,12 @@ ATTRIBUTE_ALIASES = {
     "truthfulness": "ultrafeedback-truthfulness",
     "honesty": "ultrafeedback-honesty",
     "helpfulness": "helpfulness",
+}
+CYCLIC_ULTRAFEEDBACK_ATTRIBUTE_ALIASES = {
+    "helpfulness": "ultrafeedback-helpfulness",
+    "honesty": "ultrafeedback-honesty",
+    "instruction_following": "ultrafeedback-instruction-following",
+    "truthfulness": "ultrafeedback-truthfulness",
 }
 
 RPR_CATEGORY_LIST = ['rpr-clarity-and-conciseness',
@@ -181,6 +189,43 @@ def resolve_local_dataset_dir(dataset_name: str) -> str:
         f"Could not find local dataset directory for '{dataset_name}'. Tried: "
         + ", ".join(str(path) for path in candidates)
     )
+
+
+def load_cyclic_ultrafeedback_pairwise_split(split: str) -> Dataset:
+    dataset_dir = Path(resolve_local_dataset_dir("cyclic_ultrafeedback_all_pairs")) / split
+    rows = []
+    for shard_path in sorted(dataset_dir.glob("data-*.arrow")):
+        with pa.memory_map(str(shard_path), "r") as source:
+            reader = ipc.open_stream(source)
+            for batch in reader:
+                for example in batch.to_pylist():
+                    responses = example["responses"]
+                    scores = example["scores"]
+                    attribute = CYCLIC_ULTRAFEEDBACK_ATTRIBUTE_ALIASES.get(
+                        example["preference_dimension"],
+                        example["preference_dimension"],
+                    )
+                    for i in range(len(responses) - 1):
+                        for j in range(i + 1, len(responses)):
+                            if scores[i] == scores[j]:
+                                continue
+                            if scores[i] > scores[j]:
+                                chosen_idx, rejected_idx = i, j
+                            else:
+                                chosen_idx, rejected_idx = j, i
+                            rows.append(
+                                {
+                                    "prompt": example["prompt"],
+                                    "chosen": responses[chosen_idx],
+                                    "rejected": responses[rejected_idx],
+                                    "attribute": attribute,
+                                    "chosen_rating": float(scores[chosen_idx]),
+                                    "rejected_rating": float(scores[rejected_idx]),
+                                }
+                            )
+    if not rows:
+        raise ValueError(f"No pairwise rows built from {dataset_dir}")
+    return Dataset.from_list(rows)
 
 def build_dataset_mix(ds, tokenizer, size=None):    
     # ds = ds.select(range(0, len(ds), 5))
@@ -413,8 +458,12 @@ def build_dataset_rpr(ds, tokenizer, size=None):
     return ds
 
 # initialize wandb
-# if accelerator.is_main_process:
-#     wandb.init(project='MultiRewardLearning', name=script_args.wandb_name)
+if accelerator.is_main_process:
+    wandb.init(
+        project='MultiRewardLearning',
+        name=script_args.wandb_name,
+        config=vars(script_args),
+    )
 
 # Define the training args. Needs to be done before the model is loaded if you are using deepspeed.
 model_name_split = model_name.split("/")[-1]
@@ -444,7 +493,7 @@ training_args = RewardConfig(
     lr_scheduler_type=script_args.lr_scheduler_type,
     run_name=script_args.wandb_name,
     # max_grad_norm=5.0,
-    report_to='none',
+    report_to='wandb',
     gradient_checkpointing_kwargs={"use_reentrant": False},
     ddp_find_unused_parameters=False,
     # load_best_model_at_end=True,
@@ -485,6 +534,21 @@ for data_path in data_paths:
         dataset = build_dataset_helpsteer(dataset, tokenizer)
         dataset_split = dataset.train_test_split(test_size=0.01)
         train_dataset, eval_dataset = dataset_split['train'], dataset_split['test']
+    elif 'cyclic_ultrafeedback_all_pairs' in data_path:
+        train_dataset = load_cyclic_ultrafeedback_pairwise_split('train')
+        eval_split = 'validation'
+        try:
+            eval_dataset = load_cyclic_ultrafeedback_pairwise_split(eval_split)
+        except (FileNotFoundError, ValueError):
+            eval_split = 'test'
+            eval_dataset = load_cyclic_ultrafeedback_pairwise_split(eval_split)
+        if accelerator.is_main_process:
+            print(
+                "Loaded cyclic_ultrafeedback_all_pairs as pairwise data: "
+                f"train_rows={len(train_dataset)}, eval_split={eval_split}, eval_rows={len(eval_dataset)}"
+            )
+        train_dataset = build_dataset_helpsteer(train_dataset, tokenizer)
+        eval_dataset = build_dataset_helpsteer(eval_dataset, tokenizer)
     elif 'rpr_per_category_pairwise_add_criterion' in data_path:
         dataset = load_from_disk(resolve_local_dataset_dir('rpr_per_category_pairwise_add_criterion'))['train']
         dataset = build_dataset_rpr(dataset, tokenizer)
@@ -514,11 +578,6 @@ for data_path in data_paths:
         dataset_split = dataset.train_test_split(test_size=0.005)
         train_dataset, eval_dataset = dataset_split['train'], dataset_split['test']
     elif 'hh-rlhf' in data_path:
-        # harmless_ds = load_dataset("Anthropic/hh-rlhf", data_dir="harmless-base")['train']
-        # helpful_ds = load_dataset("Anthropic/hh-rlhf", data_dir="helpful-base")['train']
-        # dataset = concatenate_datasets([harmless_ds, helpful_ds]).shuffle(seed=42)
-        # dataset = build_dataset_mix(dataset, tokenizer)
-
         dataset = data_process.load_hh_rlhf_ds_chat()
         if script_args.sanity_check:
             dataset = dataset.select(range(0, 100))
@@ -615,31 +674,52 @@ class CombinedScoreHead(nn.Module):
         return y_theta + y_p
 
 
-def maybe_restore_custom_score_head(model: nn.Module, checkpoint_path: str, device: int):
+def attach_router(model: nn.Module, hidden_size: int, num_heads: int, device: str):
+    if script_args.use_router:
+        router = nn.Linear(hidden_size, num_heads, bias=False)
+        router.to(device=device, dtype=torch.bfloat16)
+        model.router = router
+    else:
+        model.router = nn.Parameter(torch.zeros(num_heads, device=device, dtype=torch.bfloat16))
+
+
+def maybe_restore_custom_modules(model: nn.Module, checkpoint_path: str, device: str):
     ckpt_file = Path(checkpoint_path) / "model.safetensors"
     if not ckpt_file.exists():
         return
     state_dict = load_safetensors(str(ckpt_file))
-    if "score.learnable_net.weight" not in state_dict or "score.prior_net.weight" not in state_dict:
-        return
-    learnable_w = state_dict["score.learnable_net.weight"]
-    prior_w = state_dict["score.prior_net.weight"]
-    custom_head = CombinedScoreHead(learnable_w.shape[1], learnable_w.shape[0])
-    with torch.no_grad():
-        custom_head.learnable_net.weight.copy_(learnable_w)
-        custom_head.prior_net.weight.copy_(prior_w)
-    custom_head.to(device)
-    model.score = custom_head
+    if "score.learnable_net.weight" in state_dict and "score.prior_net.weight" in state_dict:
+        learnable_w = state_dict["score.learnable_net.weight"]
+        prior_w = state_dict["score.prior_net.weight"]
+        custom_head = CombinedScoreHead(learnable_w.shape[1], learnable_w.shape[0])
+        with torch.no_grad():
+            custom_head.learnable_net.weight.copy_(learnable_w)
+            custom_head.prior_net.weight.copy_(prior_w)
+        custom_head.to(device)
+        model.score = custom_head
+
+    if "router.weight" in state_dict:
+        router_w = state_dict["router.weight"]
+        router = nn.Linear(router_w.shape[1], router_w.shape[0], bias=False)
+        with torch.no_grad():
+            router.weight.copy_(router_w)
+        router.to(device=device, dtype=router_w.dtype)
+        model.router = router
+    elif "router" in state_dict:
+        model.router = nn.Parameter(state_dict["router"].to(device))
 
 ##########################
 if script_args.eval_only:
-    # When evaluating saved checkpoints, restore the custom score head if present.
-    maybe_restore_custom_score_head(model, model_name, device)
+    # When evaluating saved checkpoints, restore custom modules ignored by AutoModel loading.
+    maybe_restore_custom_modules(model, model_name, device)
 elif script_args.freeze_pretrained:
     mlp_layer = CombinedScoreHead(model.config.hidden_size, script_args.num_heads)
     mlp_layer.to(device)
     freeze_trainable_parameters(model)
     model.score = mlp_layer
+
+if script_args.num_heads > 1 and script_args.loss_type in ['mixture_reward', 'mixture_BT'] and not hasattr(model, "router"):
+    attach_router(model, model.config.hidden_size, script_args.num_heads, device)
 
 model.resize_token_embeddings(len(tokenizer))
 print_trainable_parameters(model)
@@ -731,17 +811,21 @@ class RewardTrainer_new(RewardTrainer):
         kidx = jidx + 1
         rewards_j = rewards[jidx]
         rewards_k = rewards[kidx]
+        train_score_diff = None
         ###################################
         if script_args.loss_type == 'origin':
             loss = - nn.functional.logsigmoid(rewards_j - rewards_k).mean()
+            train_score_diff = (rewards_j - rewards_k).mean(dim=-1)
             # if accelerator.is_main_process:
             #     wandb.log({'origin BT loss': loss})
         elif script_args.loss_type == 'margin':
             loss = -nn.functional.logsigmoid(rewards_j - rewards_k - torch.tensor(inputs["margin"], device=inputs["margin"][0].device).view(-1,1)).mean()
+            train_score_diff = (rewards_j - rewards_k).mean(dim=-1)
             if accelerator.is_main_process:
                 wandb.log({'margin BT loss': loss})
         elif script_args.loss_type == 'labelsmooth':
             loss = - 0.9 * nn.functional.logsigmoid(rewards_j - rewards_k).mean() - 0.1 * nn.functional.logsigmoid(rewards_k - rewards_j).mean() 
+            train_score_diff = (rewards_j - rewards_k).mean(dim=-1)
             if accelerator.is_main_process:
                 wandb.log({'labelsmooth BT loss': loss})
         elif script_args.loss_type == 'mixture_reward':
@@ -755,10 +839,12 @@ class RewardTrainer_new(RewardTrainer):
                 router_weights_j = router_weights[jidx]
                 router_weights_k = router_weights[kidx]
 
-                BTloss = - nn.functional.logsigmoid(((rewards_j * router_weights_j.softmax(dim=-1) - rewards_k * router_weights_k.softmax(dim=-1))).sum(dim=1)).mean()
+                train_score_diff = ((rewards_j * router_weights_j.softmax(dim=-1) - rewards_k * router_weights_k.softmax(dim=-1))).sum(dim=1)
+                BTloss = - nn.functional.logsigmoid(train_score_diff).mean()
             else:
                 router_weights = model.router
                 load_balance_loss = (router_weights.softmax(dim=-1)).var(dim=0)
+                train_score_diff = ((rewards_j - rewards_k) * router_weights.softmax(dim=-1)).sum(dim=-1)
                 BTloss = - torch.log((nn.functional.sigmoid(rewards_j - rewards_k) * model.router.softmax(dim=-1)).sum(dim=-1)).mean()
             
             orthogonal_loss = 0
@@ -791,9 +877,11 @@ class RewardTrainer_new(RewardTrainer):
                 prompt_out = torch.stack([outputs.hidden_states[-1][jidx[idx], lengths[idx], :] for idx in range(len(jidx))])
                 unwrap_model = self.accelerator.unwrap_model(self.model)
                 router_weights = unwrap_model.router(prompt_out.bfloat16())
+                train_score_diff = ((rewards_j - rewards_k) * router_weights.softmax(dim=-1)).sum(dim=-1)
                 BTloss = - torch.log((nn.functional.sigmoid(rewards_j - rewards_k) * router_weights.softmax(dim=-1)).sum(dim=-1)).mean()
             else:
                 router_weights = model.router
+                train_score_diff = ((rewards_j - rewards_k) * router_weights.softmax(dim=-1)).sum(dim=-1)
                 BTloss = - torch.log((nn.functional.sigmoid(rewards_j - rewards_k) * router_weights.softmax(dim=-1)).sum(dim=-1)).mean()
             
             load_balance_loss = 0
@@ -829,8 +917,19 @@ class RewardTrainer_new(RewardTrainer):
             #                'corr_loss': corr_loss, 'load_balance_loss': load_balance_loss, 'total_loss': loss})
         elif script_args.loss_type == 'multi_linear':
             loss = - nn.functional.logsigmoid(rewards_j - rewards_k).sum(dim=-1).mean()
+            train_score_diff = (rewards_j - rewards_k).sum(dim=-1)
         else:
             raise NotImplementedError
+
+        if model.training and train_score_diff is not None and accelerator.is_main_process and wandb.run is not None:
+            train_accuracy = (train_score_diff.detach() > 0).float().mean()
+            wandb.log(
+                {
+                    "train/loss": loss.detach().float().cpu().item(),
+                    "train/accuracy": train_accuracy.float().cpu().item(),
+                },
+                step=self.state.global_step,
+            )
 
         if return_outputs:
             if script_args.num_heads > 1 and script_args.use_router and script_args.loss_type in ['mixture_reward', 'mixture_BT']:
@@ -917,5 +1016,5 @@ else:
 
     trainer.save_model(output_name)
 
-# if accelerator.is_main_process:
-#     wandb.finish()
+if accelerator.is_main_process:
+    wandb.finish()
