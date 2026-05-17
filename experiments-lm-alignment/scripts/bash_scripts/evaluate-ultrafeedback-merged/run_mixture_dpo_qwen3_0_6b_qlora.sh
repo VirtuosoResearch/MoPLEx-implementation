@@ -10,11 +10,13 @@ DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/cyclic_ultrafeedback_merged}"
 CONFIG_PATH="${CONFIG_PATH:-recipes/qwen3-1b/dpo/ultrafeedback_merged/config_mixture_qlora.yaml}"
 SEED="${SEED:-42}"
 MAX_STEPS="${MAX_STEPS:-1000}"
-MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-hybrid_dpo_em}"
+MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-em_only}"
 MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-head}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-0.5 1.0 1.5}"
+MIXED_PRECISION="${MIXED_PRECISION:-fp16}"
+TORCH_DTYPE="${TORCH_DTYPE:-float16}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -30,6 +32,20 @@ fi
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 
+RUNTIME_CONFIG_PATH="${RUNTIME_CONFIG_PATH:-}"
+if [[ -z "${RUNTIME_CONFIG_PATH}" ]]; then
+  RUNTIME_CONFIG_PATH="$(mktemp /tmp/mmpo_mixture_qlora_XXXXXX.yaml)"
+  trap 'rm -f "${RUNTIME_CONFIG_PATH}"' EXIT
+  sed \
+    -e "/^torch_dtype:/d" \
+    -e "/^max_prompt_length:/d" \
+    -e "s/^bf16: true$/bf16: false/" \
+    "${CONFIG_PATH}" > "${RUNTIME_CONFIG_PATH}"
+  if ! grep -q '^fp16:' "${RUNTIME_CONFIG_PATH}"; then
+    printf '\nfp16: true\n' >> "${RUNTIME_CONFIG_PATH}"
+  fi
+fi
+
 for temperature in ${EM_TEMPERATURES}; do
 temp_tag="${temperature//./p}"
 run_name="${BASE_WANDB_NAME}-temp${temp_tag}"
@@ -37,9 +53,12 @@ output_dir="${BASE_OUTPUT_DIR}-temp${temp_tag}"
 
 ACCELERATE_LOG_LEVEL=info accelerate launch \
   --config_file recipes/accelerate_configs/single.yaml \
+  --mixed_precision "${MIXED_PRECISION}" \
   --num_processes="${NUM_PROCESSES:-1}" \
   scripts/dpo.py \
-  --config "${CONFIG_PATH}" \
+  --config "${RUNTIME_CONFIG_PATH}" \
+  --bf16 false \
+  --fp16 true \
   --dataset_name "./data/cyclic_ultrafeedback_merged" \
   --output_dir "${output_dir}" \
   --run_name "${run_name}" \
