@@ -63,13 +63,31 @@ def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) 
             new_row = dict(row)
             new_row["responses"] = trimmed_responses
             new_row["scores"] = trimmed_scores
+            if "ranked_prefix_length" in new_row:
+                new_row["ranked_prefix_length"] = int(new_row["ranked_prefix_length"])
             rows.append(new_row)
             continue
 
-        for idxs in combinations(range(n), effective_k):
+        ranked_prefix_length = row.get("ranked_prefix_length")
+        if ranked_prefix_length is not None:
+            ranked_prefix_length = max(0, min(int(ranked_prefix_length), n))
+            if ranked_prefix_length > effective_k:
+                continue
+            prefix_indices = tuple(range(ranked_prefix_length))
+            tail_needed = effective_k - ranked_prefix_length
+            subset_indices_iter = (
+                prefix_indices + tuple(tail_indices)
+                for tail_indices in combinations(range(ranked_prefix_length, n), tail_needed)
+            )
+        else:
+            subset_indices_iter = combinations(range(n), effective_k)
+
+        for idxs in subset_indices_iter:
             new_row = dict(row)
             new_row["responses"] = [trimmed_responses[i] for i in idxs]
             new_row["scores"] = [trimmed_scores[i] for i in idxs]
+            if ranked_prefix_length is not None:
+                new_row["ranked_prefix_length"] = ranked_prefix_length
             rows.append(new_row)
 
     if not rows:
@@ -101,7 +119,16 @@ def _pairwise_from_listwise_split(dataset: Dataset, args: ScriptArguments) -> Da
 
         trimmed_responses = [str(response) for response in responses[:n]]
         trimmed_scores = [float(score) for score in scores[:n]]
-        pair_indices = [(0, n - 1)] if strategy == "extreme" else list(combinations(range(n), 2))
+        ranked_prefix_length = row.get("ranked_prefix_length")
+        if ranked_prefix_length is not None:
+            ranked_prefix_length = max(0, min(int(ranked_prefix_length), n))
+            pair_indices = [
+                (chosen_idx, rejected_idx)
+                for chosen_idx in range(ranked_prefix_length)
+                for rejected_idx in range(chosen_idx + 1, n)
+            ]
+        else:
+            pair_indices = [(0, n - 1)] if strategy == "extreme" else list(combinations(range(n), 2))
 
         for chosen_idx, rejected_idx in pair_indices:
             pairwise_row = {
@@ -112,7 +139,14 @@ def _pairwise_from_listwise_split(dataset: Dataset, args: ScriptArguments) -> Da
                 "rejected_score": trimmed_scores[rejected_idx],
                 "preference_dimension": row_dimension,
             }
-            for metadata_key in ("source_index", "source_dataset"):
+            for metadata_key in (
+                "source_index",
+                "source_dataset",
+                "persona_id",
+                "persona_text",
+                "instruction",
+                "ranked_prefix_length",
+            ):
                 if metadata_key in row:
                     pairwise_row[metadata_key] = row[metadata_key]
             rows.append(pairwise_row)

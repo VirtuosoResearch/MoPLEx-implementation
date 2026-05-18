@@ -57,6 +57,35 @@ class TestPlLogProb(unittest.TestCase):
         # All should be negative log-probs (< 0)
         self.assertTrue(torch.all(logp_canonical <= 0.0))
 
+    def test_pl_log_prob_top1_partial_ranking(self):
+        """Verify top-1 partial PL only scores the first item against all candidates."""
+        rewards = torch.tensor([[3.0, 2.0, 1.0]], dtype=torch.float32)
+        rankings = torch.tensor([[0, 1, 2]], dtype=torch.long)
+        ranked_prefix_lengths = torch.tensor([1], dtype=torch.long)
+
+        logp = pl_log_prob(rewards, rankings, ranked_prefix_lengths=ranked_prefix_lengths)
+        expected = rewards[:, 0] - torch.logsumexp(rewards, dim=1)
+
+        self.assertTrue(torch.allclose(logp, expected))
+
+    def test_pl_log_prob_top1_ignores_negative_order(self):
+        """Verify permuting unordered negatives does not change top-1 partial likelihood."""
+        rewards = torch.tensor([[3.0, 2.0, 1.0]], dtype=torch.float32)
+        ranked_prefix_lengths = torch.tensor([1], dtype=torch.long)
+
+        first = pl_log_prob(
+            rewards,
+            torch.tensor([[0, 1, 2]], dtype=torch.long),
+            ranked_prefix_lengths=ranked_prefix_lengths,
+        )
+        second = pl_log_prob(
+            rewards,
+            torch.tensor([[0, 2, 1]], dtype=torch.long),
+            ranked_prefix_lengths=ranked_prefix_lengths,
+        )
+
+        self.assertTrue(torch.allclose(first, second))
+
 
 class TestMixturePLNLL(unittest.TestCase):
     """Test mixture PL NLL computation."""
@@ -87,6 +116,24 @@ class TestMixturePLNLL(unittest.TestCase):
 
         self.assertIsNotNone(router_logits.grad)
         self.assertIsNotNone(rewards.grad)
+
+    def test_mixture_pl_nll_top1_partial(self):
+        """Verify mixture PL accepts top-1 partial rankings."""
+        router_logits = torch.zeros(1, 2)
+        rewards = torch.tensor([[[3.0, 2.0, 1.0], [1.0, 3.0, 2.0]]], dtype=torch.float32)
+        rankings = torch.tensor([[0, 1, 2]], dtype=torch.long)
+        ranked_prefix_lengths = torch.tensor([1], dtype=torch.long)
+
+        nll, comp_logp = mixture_pl_nll(
+            router_logits,
+            rewards,
+            rankings,
+            ranked_prefix_lengths=ranked_prefix_lengths,
+        )
+
+        self.assertEqual(nll.shape, ())
+        self.assertEqual(comp_logp.shape, (1, 2))
+        self.assertTrue(torch.isfinite(nll))
 
 
 class TestEMResponsibilities(unittest.TestCase):

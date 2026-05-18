@@ -81,6 +81,7 @@ class ListwiseDPODataCollator:
         batch_labels = []
         batch_candidate_mask = []
         batch_preference_dimensions = []
+        batch_ranked_prefix_lengths = []
 
         max_candidates = max(len(feature["responses"]) for feature in features)
 
@@ -88,6 +89,9 @@ class ListwiseDPODataCollator:
             prompt = feature["prompt"]
             responses = feature["responses"]
             batch_preference_dimensions.append(feature.get("preference_dimension", "unknown"))
+            ranked_prefix_length = feature.get("ranked_prefix_length", len(responses))
+            ranked_prefix_length = max(0, min(int(ranked_prefix_length), len(responses)))
+            batch_ranked_prefix_lengths.append(ranked_prefix_length)
 
             item_input_ids = []
             item_attention_mask = []
@@ -131,6 +135,7 @@ class ListwiseDPODataCollator:
             "labels": torch.tensor(batch_labels, dtype=torch.long),
             "candidate_mask": torch.tensor(batch_candidate_mask, dtype=torch.bool),
             "preference_dimension": batch_preference_dimensions,
+            "ranked_prefix_length": torch.tensor(batch_ranked_prefix_lengths, dtype=torch.long),
         }
 
 
@@ -169,6 +174,7 @@ class ListwiseDPOTrainer(DPOTrainer):
                 "attention_mask",
                 "labels",
                 "candidate_mask",
+                "ranked_prefix_length",
             ]
 
     def _prepare_dataset(
@@ -225,16 +231,28 @@ class ListwiseDPOTrainer(DPOTrainer):
         return self._sequence_logps(ref_logits, labels)
 
     @staticmethod
-    def _pl_negative_log_likelihood(utilities: torch.Tensor, candidate_mask: torch.Tensor) -> torch.Tensor:
+    def _pl_negative_log_likelihood(
+        utilities: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        ranked_prefix_lengths: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         # Mask padded candidates and compute suffix logsumexp in parallel.
         masked_utilities = utilities.masked_fill(~candidate_mask, float("-inf"))
         suffix_lse = torch.flip(torch.logcumsumexp(torch.flip(masked_utilities, dims=[1]), dim=1), dims=[1])
 
         # Per-position PL term: -(u_k - logsumexp(u_k, ..., u_m)), only on valid candidates.
-        diff = torch.where(candidate_mask, masked_utilities - suffix_lse, torch.zeros_like(utilities))
+        if ranked_prefix_lengths is None:
+            ranked_prefix_lengths = candidate_mask.long().sum(dim=1)
+        else:
+            ranked_prefix_lengths = ranked_prefix_lengths.to(device=utilities.device, dtype=torch.long)
+            ranked_prefix_lengths = ranked_prefix_lengths.clamp(min=0, max=utilities.shape[1])
+
+        positions = torch.arange(utilities.shape[1], device=utilities.device).unsqueeze(0)
+        observed_rank_mask = candidate_mask & (positions < ranked_prefix_lengths.unsqueeze(1))
+        diff = torch.where(observed_rank_mask, masked_utilities - suffix_lse, torch.zeros_like(utilities))
         row_losses = (-diff).sum(dim=1)
 
-        valid_rows = candidate_mask.sum(dim=1) >= 2
+        valid_rows = (candidate_mask.sum(dim=1) >= 2) & (ranked_prefix_lengths >= 1)
         if not torch.any(valid_rows):
             return utilities.new_zeros(())
         return row_losses[valid_rows].mean()
@@ -245,17 +263,35 @@ class ListwiseDPOTrainer(DPOTrainer):
         return normalized or "unknown"
 
     @staticmethod
-    def _listwise_metrics(utilities: torch.Tensor, candidate_mask: torch.Tensor) -> dict[str, torch.Tensor]:
-        pred_order = torch.argsort(utilities, dim=1, descending=True)
+    def _listwise_metrics(
+        utilities: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        ranked_prefix_lengths: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
+        masked_utilities = utilities.masked_fill(~candidate_mask, float("-inf"))
+        pred_order = torch.argsort(masked_utilities, dim=1, descending=True)
         top1_acc = (pred_order[:, 0] == 0).float().mean()
 
         num_candidates = utilities.shape[1]
+        if ranked_prefix_lengths is None:
+            ranked_prefix_lengths = candidate_mask.long().sum(dim=1)
+        else:
+            ranked_prefix_lengths = ranked_prefix_lengths.to(device=utilities.device, dtype=torch.long)
+            ranked_prefix_lengths = ranked_prefix_lengths.clamp(min=0, max=num_candidates)
+
+        positions = torch.arange(num_candidates, device=utilities.device)
+        observed_left = positions.unsqueeze(0) < ranked_prefix_lengths.unsqueeze(1)
         upper_tri = torch.triu(
             torch.ones((num_candidates, num_candidates), dtype=torch.bool, device=utilities.device),
             diagonal=1,
         )
-        valid_pairs = candidate_mask.unsqueeze(2) & candidate_mask.unsqueeze(1) & upper_tri.unsqueeze(0)
-        pairwise_correct = (utilities.unsqueeze(2) > utilities.unsqueeze(1)) & valid_pairs
+        valid_pairs = (
+            candidate_mask.unsqueeze(2)
+            & candidate_mask.unsqueeze(1)
+            & upper_tri.unsqueeze(0)
+            & observed_left.unsqueeze(2)
+        )
+        pairwise_correct = (masked_utilities.unsqueeze(2) > masked_utilities.unsqueeze(1)) & valid_pairs
 
         total_pairs = valid_pairs.sum(dim=(1, 2))
         correct_pairs = pairwise_correct.sum(dim=(1, 2))
@@ -296,6 +332,7 @@ class ListwiseDPOTrainer(DPOTrainer):
         attention_mask = batch["attention_mask"]
         labels = batch["labels"]
         candidate_mask = batch["candidate_mask"]
+        ranked_prefix_lengths = batch.get("ranked_prefix_length")
         preference_dimensions = batch.get("preference_dimension")
 
         batch_size, num_candidates, seq_len = input_ids.shape
@@ -309,9 +346,9 @@ class ListwiseDPOTrainer(DPOTrainer):
 
         beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
         utilities = beta * (policy_logps - ref_logps)
-        loss = self._pl_negative_log_likelihood(utilities, candidate_mask)
+        loss = self._pl_negative_log_likelihood(utilities, candidate_mask, ranked_prefix_lengths)
 
-        metric_tensors = self._listwise_metrics(utilities, candidate_mask)
+        metric_tensors = self._listwise_metrics(utilities, candidate_mask, ranked_prefix_lengths)
 
         if preference_dimensions is not None:
             dim_to_indices: dict[str, list[int]] = {}
@@ -324,6 +361,9 @@ class ListwiseDPOTrainer(DPOTrainer):
                 dim_metrics = self._listwise_metrics(
                     utilities.index_select(0, dim_index_tensor),
                     candidate_mask.index_select(0, dim_index_tensor),
+                    ranked_prefix_lengths.index_select(0, dim_index_tensor)
+                    if ranked_prefix_lengths is not None
+                    else None,
                 )
                 for metric_name, metric_value in dim_metrics.items():
                     suffix = metric_name.removeprefix("listwise/")
@@ -824,12 +864,13 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             return {}
 
         candidate_mask = batch["candidate_mask"]
+        ranked_prefix_lengths = batch.get("ranked_prefix_length")
         preference_dimensions = batch.get("preference_dimension")
         pred_clusters = gamma.argmax(dim=1)
         row_indices = torch.arange(rewards.shape[0], device=rewards.device)
         posterior_rewards = rewards[row_indices, pred_clusters, :]
 
-        metric_tensors = self._listwise_metrics(posterior_rewards, candidate_mask)
+        metric_tensors = self._listwise_metrics(posterior_rewards, candidate_mask, ranked_prefix_lengths)
         metrics = {
             f"mixture_posterior/{name.removeprefix('listwise/')}": self.accelerator.gather_for_metrics(
                 value.detach()
@@ -849,6 +890,9 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
                 dim_metrics = self._listwise_metrics(
                     posterior_rewards.index_select(0, dim_index_tensor),
                     candidate_mask.index_select(0, dim_index_tensor),
+                    ranked_prefix_lengths.index_select(0, dim_index_tensor)
+                    if ranked_prefix_lengths is not None
+                    else None,
                 )
                 for metric_name, metric_value in dim_metrics.items():
                     if metric_name not in {"listwise/top1_acc", "listwise/pairwise_acc"}:
@@ -869,14 +913,18 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
     ) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, torch.Tensor], torch.Tensor]:
         mixture_output = self.get_batch_mixture_output(model, batch)
         candidate_mask = batch["candidate_mask"]
+        ranked_prefix_lengths = batch.get("ranked_prefix_length")
         rankings = self._observed_rankings(candidate_mask).long()
-        valid_rows = candidate_mask.sum(dim=1) >= 2
+        if ranked_prefix_lengths is None:
+            ranked_prefix_lengths = candidate_mask.long().sum(dim=1)
+        valid_rows = (candidate_mask.sum(dim=1) >= 2) & (ranked_prefix_lengths >= 1)
 
         mixture_nll, comp_logp = mixture_pl_nll(
             mixture_output["router_logits"],
             mixture_output["rewards"],
             rankings,
             candidate_mask=candidate_mask,
+            ranked_prefix_lengths=ranked_prefix_lengths,
         )
         if gamma is None:
             gamma = em_responsibilities(

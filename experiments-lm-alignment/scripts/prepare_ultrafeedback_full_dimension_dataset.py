@@ -3,7 +3,8 @@
 
 The raw OpenBMB UltraFeedback split contains scored completions. This helper
 turns one preference dimension into either preformatted listwise rows or
-pairwise rows, then writes a deterministic 80/10/10 DatasetDict to disk.
+pairwise rows, then writes a deterministic train/validation/test DatasetDict
+to disk. The default split is 98/1/1.
 """
 
 from __future__ import annotations
@@ -34,9 +35,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--format", choices=("listwise", "pairwise"), required=True)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--train_ratio", type=float, default=0.8)
-    parser.add_argument("--validation_ratio", type=float, default=0.1)
-    parser.add_argument("--test_ratio", type=float, default=0.1)
+    parser.add_argument("--train_ratio", type=float, default=0.98)
+    parser.add_argument("--validation_ratio", type=float, default=0.01)
+    parser.add_argument("--test_ratio", type=float, default=0.01)
     parser.add_argument("--listwise_num_responses", type=int, default=4)
     parser.add_argument("--listwise_min_responses", type=int, default=2)
     parser.add_argument("--pairwise_strategy", choices=("all_pairs", "extreme"), default="all_pairs")

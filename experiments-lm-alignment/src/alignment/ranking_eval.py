@@ -29,9 +29,18 @@ class RankingMetricAccumulator:
         self.pairwise_total = 0
         self.by_dimension = defaultdict(lambda: {"rows": 0, "top1": 0, "pairwise_correct": 0, "pairwise_total": 0})
 
-    def add_batch(self, utilities: torch.Tensor, candidate_mask: torch.Tensor, dimensions: list[str]) -> None:
+    def add_batch(
+        self,
+        utilities: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        dimensions: list[str],
+        ranked_prefix_lengths: torch.Tensor | None = None,
+    ) -> None:
         utilities = utilities.detach().float().cpu()
         candidate_mask = candidate_mask.detach().bool().cpu()
+        if ranked_prefix_lengths is None:
+            ranked_prefix_lengths = candidate_mask.long().sum(dim=1)
+        ranked_prefix_lengths = ranked_prefix_lengths.detach().long().cpu()
 
         for row_idx, dimension in enumerate(dimensions):
             valid_indices = torch.where(candidate_mask[row_idx])[0].tolist()
@@ -44,7 +53,10 @@ class RankingMetricAccumulator:
 
             pairwise_correct = 0
             pairwise_total = 0
+            ranked_prefix_length = int(ranked_prefix_lengths[row_idx].item())
             for left_pos, left_idx in enumerate(valid_indices):
+                if left_pos >= ranked_prefix_length:
+                    break
                 for right_idx in valid_indices[left_pos + 1 :]:
                     pairwise_total += 1
                     if row_utilities[left_idx] > row_utilities[right_idx]:
@@ -278,10 +290,11 @@ def evaluate_ranking_split(
             inputs = trainer._prepare_inputs(batch)
             dimensions = [str(dimension) for dimension in inputs["preference_dimension"]]
             candidate_mask = inputs["candidate_mask"]
+            ranked_prefix_lengths = inputs.get("ranked_prefix_length")
 
             utilities = _policy_utilities(trainer, inputs, beta=beta)
             if not collect_only_cluster_state:
-                policy_acc.add_batch(utilities, candidate_mask, dimensions)
+                policy_acc.add_batch(utilities, candidate_mask, dimensions, ranked_prefix_lengths)
 
             if not hasattr(trainer, "get_batch_mixture_output"):
                 continue
@@ -293,6 +306,7 @@ def evaluate_ranking_split(
                 mixture_output["rewards"],
                 rankings,
                 candidate_mask=candidate_mask,
+                ranked_prefix_lengths=ranked_prefix_lengths,
             )
             gamma = em_responsibilities(
                 mixture_output["router_logits"],
@@ -315,7 +329,7 @@ def evaluate_ranking_split(
 
             row_indices = torch.arange(gamma.shape[0], device=device)
             posterior_rewards = mixture_output["rewards"][row_indices, posterior_pred, :]
-            posterior_acc.add_batch(posterior_rewards, candidate_mask, dimensions)
+            posterior_acc.add_batch(posterior_rewards, candidate_mask, dimensions, ranked_prefix_lengths)
 
             if cluster_alignment is not None:
                 aligned_components = [
@@ -324,7 +338,7 @@ def evaluate_ranking_split(
                 ]
                 aligned_components_tensor = torch.tensor(aligned_components, dtype=torch.long, device=device)
                 aligned_rewards = mixture_output["rewards"][row_indices, aligned_components_tensor, :]
-                aligned_acc.add_batch(aligned_rewards, candidate_mask, dimensions)
+                aligned_acc.add_batch(aligned_rewards, candidate_mask, dimensions, ranked_prefix_lengths)
 
     cluster_state = {
         "true_labels": true_labels,

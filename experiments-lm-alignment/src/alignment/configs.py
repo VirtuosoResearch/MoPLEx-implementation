@@ -177,8 +177,6 @@ class ScriptArguments(trl.ScriptArguments):
             raise ValueError("`dataset_format` must be either 'pairwise' or 'listwise'")
         if self.pairwise_from_listwise_strategy not in {"extreme", "all_pairs"}:
             raise ValueError("`pairwise_from_listwise_strategy` must be either 'extreme' or 'all_pairs'")
-        if self.dataset_format == "listwise" and self.preference_dimensions is None:
-            raise ValueError("`preference_dimensions` is required when dataset_format='listwise'")
         if self.listwise_num_responses < 2:
             raise ValueError("`listwise_num_responses` must be >= 2")
         if self.listwise_min_responses < 2:
@@ -186,8 +184,8 @@ class ScriptArguments(trl.ScriptArguments):
         if self.preference_dimensions is not None:
             if not isinstance(self.preference_dimensions, list):
                 raise ValueError("`preference_dimensions` must be a list when provided")
-            if len(self.preference_dimensions) < 1 or len(self.preference_dimensions) > 4:
-                raise ValueError("`preference_dimensions` must contain 1 to 4 dimensions")
+            if len(self.preference_dimensions) < 1:
+                raise ValueError("`preference_dimensions` must contain at least 1 dimension")
             if len(set(self.preference_dimensions)) != len(self.preference_dimensions):
                 raise ValueError("`preference_dimensions` must not contain duplicates")
 
@@ -267,6 +265,10 @@ class MixturePLConfig(DPOConfig):
     use_mixture: bool = field(
         default=False,
         metadata={"help": "Enable mixture of Plackett-Luce (MoPL) clustering during DPO training."},
+    )
+    mixture_objective: str = field(
+        default="pl",
+        metadata={"help": "Mixture objective to use when use_mixture=True. Choices: 'pl' or 'bt'."},
     )
     num_clusters: Optional[int] = field(
         default=None,
@@ -352,6 +354,8 @@ class MixturePLConfig(DPOConfig):
                 pass
             elif self.num_clusters < 1:
                 raise ValueError("`num_clusters` must be >= 1 when use_mixture=True")
+            if self.mixture_objective not in {"pl", "bt"}:
+                raise ValueError("`mixture_objective` must be either 'pl' or 'bt'")
 
             if self.em_temperature <= 0:
                 raise ValueError("`em_temperature` must be positive")
