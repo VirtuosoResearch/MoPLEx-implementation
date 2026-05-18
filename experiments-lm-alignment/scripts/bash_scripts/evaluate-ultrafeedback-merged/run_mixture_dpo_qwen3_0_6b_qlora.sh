@@ -47,9 +47,16 @@ if [[ -z "${RUNTIME_CONFIG_PATH}" ]]; then
 fi
 
 for temperature in ${EM_TEMPERATURES}; do
+for m_step_updates in ${M_STEP_UPDATES}; do
+for learning_rate in ${LEARNING_RATES}; do
 temp_tag="${temperature//./p}"
-run_name="${BASE_WANDB_NAME}-temp${temp_tag}"
-output_dir="${BASE_OUTPUT_DIR}-temp${temp_tag}"
+lr_tag="${learning_rate//./p}"
+lr_tag="${lr_tag//-/m}"
+m_tag="${m_step_updates//./p}"
+run_name="${BASE_WANDB_NAME}-temp${temp_tag}-m${m_tag}-lr${lr_tag}"
+output_dir="${BASE_OUTPUT_DIR}-temp${temp_tag}-m${m_tag}-lr${lr_tag}"
+
+echo "Launching mixture DPO: temperature=${temperature}, m_step_updates=${m_step_updates}, learning_rate=${learning_rate}"
 
 ACCELERATE_LOG_LEVEL=info accelerate launch \
   --config_file recipes/accelerate_configs/single.yaml \
@@ -68,5 +75,9 @@ ACCELERATE_LOG_LEVEL=info accelerate launch \
   --mixture_training_mode "${MIXTURE_TRAINING_MODE}" \
   --mixture_reward_backend "${MIXTURE_REWARD_BACKEND}" \
   --em_temperature "${temperature}" \
+  --m_step_updates "${m_step_updates}" \
+  --learning_rate "${learning_rate}" \
   "$@"
+done
+done
 done

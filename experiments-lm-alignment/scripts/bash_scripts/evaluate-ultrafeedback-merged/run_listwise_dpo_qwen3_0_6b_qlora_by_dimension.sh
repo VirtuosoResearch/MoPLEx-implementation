@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+BASH_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+SCRIPTS_DIR="$(cd "${BASH_SCRIPTS_DIR}/.." && pwd)"
+REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
+
+DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/cyclic_ultrafeedback_merged}"
+CONFIG_PATH="${CONFIG_PATH:-recipes/qwen3-1b/dpo/ultrafeedback_merged/config_listwise_qlora.yaml}"
+SEEDS="${SEEDS:-42 43}"
+MAX_STEPS="${MAX_STEPS:-1000}"
+DIMENSIONS="${DIMENSIONS:-instruction_following helpfulness honesty truthfulness}"
+
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
+export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
+export WANDB_MODE="${WANDB_MODE:-online}"
+BASE_WANDB_NAME="${WANDB_NAME:-qwen3-0.6b-listwise-dpo-qlora-ultrafeedback-merged-s${SEEDS}}"
+BASE_OUTPUT_DIR="${OUTPUT_DIR:-outputs/ultrafeedback-merged/listwise-dpo-by-dimension/qwen3-0.6b-s${SEEDS}}"
+
+if [[ ! -d "${DATASET_DIR}" ]]; then
+  echo "Missing merged dataset directory: ${DATASET_DIR}" >&2
+  echo "Run scripts/bash_scripts/merge_dataset.sh or scripts/merge_cyclic_ultrafeedback_datasets.py first." >&2
+  exit 1
+fi
+
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
+
+for dimension in ${DIMENSIONS}; do
+for seed in ${SEEDS}; do
+  dim_tag="${dimension//[^a-zA-Z0-9]/_}"
+  run_name="${BASE_WANDB_NAME}-${dim_tag}-s${seed}"
+  output_dir="${BASE_OUTPUT_DIR}-${dim_tag}-s${seed}"
+
+  echo "Launching ListDPO for preference_dimension=${dimension}"
+
+  ACCELERATE_LOG_LEVEL=info accelerate launch \
+    --config_file recipes/accelerate_configs/single.yaml \
+    --num_processes="${NUM_PROCESSES:-1}" \
+    scripts/dpo.py \
+    --config "${CONFIG_PATH}" \
+    --dataset_name "./data/cyclic_ultrafeedback_merged" \
+    --preference_dimensions "${dimension}" \
+    --output_dir "${output_dir}" \
+    --run_name "${run_name}" \
+    --report_to wandb \
+    --seed "${seed}" \
+    --max_steps "${MAX_STEPS}" \
+    "$@"
+done
+done

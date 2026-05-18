@@ -17,6 +17,8 @@ import torch.nn.functional as F
 import wandb
 from accelerate import Accelerator
 from datasets import Dataset
+from peft import LoraConfig, TaskType, get_peft_model
+from peft.tuners.tuners_utils import BaseTunerLayer
 from scipy.optimize import linear_sum_assignment
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser, PreTrainedModel
 from transformers.trainer_pt_utils import nested_detach
@@ -58,6 +60,7 @@ class ScriptArguments:
     max_length: int = 1024
     max_prompt_length: int = 512
     base_model: str = "Qwen/Qwen3-0.6B"
+    reference_model: Optional[str] = None
     wandb_name: str = "mmpo_em_only"
     log_dir: str = "./output_models"
     freeze_pretrained: bool = True
@@ -80,16 +83,28 @@ class ScriptArguments:
     use_closed_form_router_prior_update: bool = True
     use_wandb: bool = True
     save_checkpoint: bool = True
+    beta: float = 0.1
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_target_modules: str = "q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj"
 
 
 parser = HfArgumentParser(ScriptArguments)
 script_args = parser.parse_args_into_dataclasses()[0]
 torch.manual_seed(script_args.manual_seed)
 
+# Normalize save flags early so downstream Trainer/EM hooks cannot save checkpoints.
+if not script_args.save_checkpoint:
+    script_args.save_strategy = "no"
+    script_args.save_steps = 0
+
 if script_args.downsample_rate <= 0 or script_args.downsample_rate > 1:
     raise ValueError("`downsample_rate` must be in (0, 1].")
 if script_args.em_temperature <= 0:
     raise ValueError("`em_temperature` must be positive.")
+if script_args.beta <= 0:
+    raise ValueError("`beta` must be positive.")
 if script_args.m_step_updates < 1:
     raise ValueError("`m_step_updates` must be >= 1.")
 
@@ -146,6 +161,13 @@ def _prompt_to_messages(prompt: Any) -> List[Dict[str, str]]:
     return [{"role": "user", "content": str(prompt)}]
 
 
+def _parse_lora_target_modules(raw: str) -> List[str]:
+    modules = [item.strip() for item in str(raw).split(",") if item.strip()]
+    if not modules:
+        raise ValueError("`lora_target_modules` must contain at least one module name.")
+    return modules
+
+
 def _tokenize_listwise_example(example: Dict[str, Any], tokenizer: AutoTokenizer) -> Dict[str, Any]:
     prompt_messages = _prompt_to_messages(example["prompt"])
     prompt_template = tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
@@ -160,26 +182,32 @@ def _tokenize_listwise_example(example: Dict[str, Any], tokenizer: AutoTokenizer
 
     candidate_input_ids: List[List[int]] = []
     candidate_attention_masks: List[List[int]] = []
+    candidate_response_masks: List[List[int]] = []
     for response in responses:
         response_text = _response_to_text(response)
         response_ids = tokenizer(response_text, add_special_tokens=False)["input_ids"]
         eos_id = tokenizer.eos_token_id
         if eos_id is not None and (not response_ids or response_ids[-1] != eos_id):
             response_ids = response_ids + [eos_id]
+        response_start = len(prompt_ids)
         input_ids = prompt_ids + response_ids
         if len(input_ids) > script_args.max_length:
             overflow = len(input_ids) - script_args.max_length
             if overflow < len(prompt_ids):
                 new_prompt = prompt_ids[overflow:]
                 input_ids = new_prompt + response_ids
+                response_start = len(new_prompt)
             else:
                 input_ids = response_ids[overflow - len(prompt_ids) :]
+                response_start = 0
         candidate_input_ids.append(input_ids)
         candidate_attention_masks.append([1] * len(input_ids))
+        candidate_response_masks.append([0] * response_start + [1] * (len(input_ids) - response_start))
 
     return {
         "candidate_input_ids": candidate_input_ids,
         "candidate_attention_mask": candidate_attention_masks,
+        "candidate_response_mask": candidate_response_masks,
         "preference_dimension": example.get("preference_dimension"),
         "attribute_id": attribute_to_id(CYCLIC_ULTRAFEEDBACK_ATTRIBUTE_ALIASES.get(example.get("preference_dimension"))),
     }
@@ -199,7 +227,8 @@ def load_cyclic_ultrafeedback_listwise_split(split: str, tokenizer: AutoTokenize
     dataset = dataset.map(lambda ex: _tokenize_listwise_example(ex, tokenizer), batched=False, num_proc=10)
     dataset = dataset.filter(
         lambda x: len(x["candidate_input_ids"]) >= 2
-        and all(len(ids) <= script_args.max_length for ids in x["candidate_input_ids"]),
+        and all(len(ids) <= script_args.max_length for ids in x["candidate_input_ids"])
+        and all(sum(mask) > 0 for mask in x["candidate_response_mask"]),
         num_proc=10,
     )
     if script_args.downsample_rate < 1.0 and split == "train":
@@ -227,6 +256,7 @@ class ListwiseRewardCollator:
         candidate_mask_rows: List[List[int]] = []
         batch_ids: List[List[List[int]]] = []
         batch_attn: List[List[List[int]]] = []
+        batch_resp: List[List[List[int]]] = []
 
         max_seq_len = 1
         for feature in features:
@@ -236,23 +266,29 @@ class ListwiseRewardCollator:
         for feature in features:
             ids_list = list(feature["candidate_input_ids"])
             attn_list = list(feature["candidate_attention_mask"])
+            resp_list = list(feature["candidate_response_mask"])
             valid_count = len(ids_list)
             candidate_mask_rows.append([1] * valid_count + [0] * (max_candidates - valid_count))
             for _ in range(max_candidates - valid_count):
                 ids_list.append([])
                 attn_list.append([])
+                resp_list.append([])
             padded_item_ids: List[List[int]] = []
             padded_item_attn: List[List[int]] = []
-            for ids, attn in zip(ids_list, attn_list):
+            padded_item_resp: List[List[int]] = []
+            for ids, attn, resp in zip(ids_list, attn_list, resp_list):
                 pad_len = max_seq_len - len(ids)
                 padded_item_ids.append(ids + [pad_id] * pad_len)
                 padded_item_attn.append(attn + [0] * pad_len)
+                padded_item_resp.append(resp + [0] * pad_len)
             batch_ids.append(padded_item_ids)
             batch_attn.append(padded_item_attn)
+            batch_resp.append(padded_item_resp)
 
         return {
             "input_ids": torch.tensor(batch_ids, dtype=torch.long),
             "attention_mask": torch.tensor(batch_attn, dtype=torch.long),
+            "response_mask": torch.tensor(batch_resp, dtype=torch.long),
             "candidate_mask": torch.tensor(candidate_mask_rows, dtype=torch.bool),
             "attribute_id": torch.tensor([f.get("attribute_id", -1) for f in features], dtype=torch.long),
             "preference_dimension": [f.get("preference_dimension", "unknown") for f in features],
@@ -664,47 +700,99 @@ class MMPOTrainer(RewardTrainer):
     def _prepare_dataset(self, dataset, processing_class, args, dataset_name):
         return dataset
 
+    def _set_active_adapter_no_toggle(self, model, adapter_name: str) -> None:
+        """Switch active adapter without touching requires_grad flags."""
+        unwrapped = self.accelerator.unwrap_model(model)
+        if hasattr(unwrapped, "active_adapter"):
+            unwrapped.active_adapter = adapter_name
+        for module in unwrapped.modules():
+            if isinstance(module, BaseTunerLayer):
+                module._active_adapter = [adapter_name]
+
+    def _adapter_grad_sums(self, model) -> Dict[str, float]:
+        unwrapped = self.accelerator.unwrap_model(model)
+        adapter_names = getattr(unwrapped, "mixture_adapter_names", [])
+        grad_sums: Dict[str, float] = {name: 0.0 for name in adapter_names}
+        for param_name, param in unwrapped.named_parameters():
+            if param.grad is None:
+                continue
+            for adapter_name in adapter_names:
+                if f".{adapter_name}." in param_name:
+                    grad_sums[adapter_name] += float(param.grad.detach().abs().sum().item())
+        return grad_sums
+
+    @staticmethod
+    def _sequence_logp_from_logits(
+        logits: torch.Tensor,
+        input_ids: torch.Tensor,
+        response_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        # Causal LM token log-probability over response tokens only (no length normalization).
+        shift_logits = logits[:, :-1, :].float()
+        shift_labels = input_ids[:, 1:]
+        shift_mask = response_mask[:, 1:].to(dtype=shift_logits.dtype)
+        token_logp = torch.log_softmax(shift_logits, dim=-1).gather(-1, shift_labels.unsqueeze(-1)).squeeze(-1)
+        seq_logp = (token_logp * shift_mask).sum(dim=1)
+        return seq_logp
+
     def _get_batch_mixture_output(self, model, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         input_ids = batch["input_ids"]
         attention_mask = batch["attention_mask"]
+        response_mask = batch["response_mask"]
         candidate_mask = batch["candidate_mask"]
         batch_size, num_candidates, seq_len = input_ids.shape
 
         flat_input_ids = input_ids.view(batch_size * num_candidates, seq_len)
         flat_attention_mask = attention_mask.view(batch_size * num_candidates, seq_len)
-        outputs = model(
-            input_ids=flat_input_ids,
-            attention_mask=flat_attention_mask,
-            output_hidden_states=True,
-        )
-        hidden = outputs.hidden_states[-1]
-        last_indices = flat_attention_mask.long().sum(dim=1).clamp_min(1) - 1
-        pooled = hidden[torch.arange(hidden.shape[0], device=hidden.device), last_indices]
-        mixture_score = getattr(self.accelerator.unwrap_model(model), "mixture_score")
-        pooled_for_head = pooled.to(dtype=next(mixture_score.parameters()).dtype)
-        rewards_flat = mixture_score(pooled_for_head)
-        rewards = rewards_flat.view(batch_size, num_candidates, script_args.num_heads).transpose(1, 2)
+        flat_response_mask = response_mask.view(batch_size * num_candidates, seq_len)
+        unwrapped = self.accelerator.unwrap_model(model)
+        adapter_names = getattr(unwrapped, "mixture_adapter_names")
+        reference_model = getattr(self, "reference_model", None)
+        if reference_model is None:
+            raise RuntimeError("reference_model is required for log-prob ratio reward.")
+        with torch.no_grad():
+            ref_outputs = reference_model(
+                input_ids=flat_input_ids,
+                attention_mask=flat_attention_mask,
+                output_hidden_states=False,
+            )
+            ref_logp = self._sequence_logp_from_logits(ref_outputs.logits, flat_input_ids, flat_response_mask)
+
+        reward_list: List[torch.Tensor] = []
+        pooled_for_router: Optional[torch.Tensor] = None
+        need_context = script_args.use_contextual_router
+        for adapter_idx, adapter_name in enumerate(adapter_names):
+            self._set_active_adapter_no_toggle(model, adapter_name)
+            outputs = model(
+                input_ids=flat_input_ids,
+                attention_mask=flat_attention_mask,
+                output_hidden_states=(need_context and adapter_idx == 0),
+            )
+            seq_logp = self._sequence_logp_from_logits(outputs.logits, flat_input_ids, flat_response_mask)
+            reward = script_args.beta * (seq_logp - ref_logp)
+            reward_list.append(reward.view(batch_size, num_candidates))
+            if need_context and adapter_idx == 0:
+                hidden = outputs.hidden_states[-1]
+                last_indices = flat_attention_mask.long().sum(dim=1).clamp_min(1) - 1
+                pooled_for_router = hidden[torch.arange(hidden.shape[0], device=hidden.device), last_indices]
+        self._set_active_adapter_no_toggle(model, adapter_names[0])
+
+        rewards = torch.stack(reward_list, dim=1)
 
         if script_args.use_contextual_router:
-            pooled = pooled.view(batch_size, num_candidates, -1)
+            if pooled_for_router is None:
+                raise RuntimeError("Contextual router requires hidden states, but none were collected.")
+            pooled = pooled_for_router.view(batch_size, num_candidates, -1)
             weights = candidate_mask.to(dtype=pooled.dtype).unsqueeze(-1)
             context = (pooled * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
-            mixture_router = getattr(self.accelerator.unwrap_model(model), "mixture_router")
+            context = context.detach()
+            mixture_router = getattr(unwrapped, "mixture_router")
             router_logits = mixture_router(context.to(dtype=next(mixture_router.parameters()).dtype))
         else:
-            global_logits = getattr(self.accelerator.unwrap_model(model), "mixture_router_logits")
+            global_logits = getattr(unwrapped, "mixture_router_logits")
             router_logits = global_logits.unsqueeze(0).expand(batch_size, -1)
 
         return {"router_logits": router_logits, "rewards": rewards}
-
-    def _update_global_router_prior_from_gamma(self, model, gamma: torch.Tensor) -> None:
-        if script_args.use_contextual_router or not script_args.use_closed_form_router_prior_update:
-            return
-        router = getattr(self.accelerator.unwrap_model(model), "mixture_router_logits")
-        prior = gamma.mean(dim=0)
-        prior = prior / prior.sum().clamp_min(1e-12)
-        with torch.no_grad():
-            router.copy_(torch.log(prior.clamp_min(1e-12)).to(dtype=router.dtype, device=router.device))
 
     def _compute_em_loss_metrics(
         self,
@@ -760,6 +848,130 @@ class MMPOTrainer(RewardTrainer):
             )
         return em_nll, metrics, mixture_output, gamma
 
+    def _m_step_backward_fixed_gamma(
+        self,
+        model,
+        batch: Dict[str, torch.Tensor],
+        gamma: torch.Tensor,
+        include_cluster_metrics: bool = True,
+    ) -> Tuple[float, Dict[str, float]]:
+        """Run memory-efficient M-step: per-adapter forward/backward with fixed gamma."""
+        input_ids = batch["input_ids"]
+        attention_mask = batch["attention_mask"]
+        response_mask = batch["response_mask"]
+        candidate_mask = batch["candidate_mask"]
+        batch_size, num_candidates, seq_len = input_ids.shape
+        rankings = torch.arange(num_candidates, device=candidate_mask.device).unsqueeze(0).expand_as(candidate_mask).long()
+        valid_rows = candidate_mask.sum(dim=1) >= 2
+
+        flat_input_ids = input_ids.view(batch_size * num_candidates, seq_len)
+        flat_attention_mask = attention_mask.view(batch_size * num_candidates, seq_len)
+        flat_response_mask = response_mask.view(batch_size * num_candidates, seq_len)
+
+        unwrapped = self.accelerator.unwrap_model(model)
+        adapter_names = getattr(unwrapped, "mixture_adapter_names")
+        reference_model = getattr(self, "reference_model", None)
+        if reference_model is None:
+            raise RuntimeError("reference_model is required for log-prob ratio reward.")
+
+        with torch.no_grad():
+            ref_outputs = reference_model(
+                input_ids=flat_input_ids,
+                attention_mask=flat_attention_mask,
+                output_hidden_states=False,
+            )
+            ref_logp = self._sequence_logp_from_logits(ref_outputs.logits, flat_input_ids, flat_response_mask)
+
+        if script_args.use_contextual_router:
+            self._set_active_adapter_no_toggle(model, adapter_names[0])
+            context_outputs = model(
+                input_ids=flat_input_ids,
+                attention_mask=flat_attention_mask,
+                output_hidden_states=True,
+            )
+            hidden = context_outputs.hidden_states[-1]
+            last_indices = flat_attention_mask.long().sum(dim=1).clamp_min(1) - 1
+            pooled = hidden[torch.arange(hidden.shape[0], device=hidden.device), last_indices]
+            pooled = pooled.view(batch_size, num_candidates, -1)
+            weights = candidate_mask.to(dtype=pooled.dtype).unsqueeze(-1)
+            context = (pooled * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+            context = context.detach()  # router should not backprop through adapter activations
+            mixture_router = getattr(unwrapped, "mixture_router")
+            router_logits = mixture_router(context.to(dtype=next(mixture_router.parameters()).dtype))
+            del context_outputs, hidden, pooled, context
+        else:
+            global_logits = getattr(unwrapped, "mixture_router_logits")
+            router_logits = global_logits.unsqueeze(0).expand(batch_size, -1)
+
+        log_alpha = F.log_softmax(router_logits, dim=1)
+        router_term = -(gamma * log_alpha).sum(dim=1)
+        if torch.any(valid_rows):
+            router_term = router_term[valid_rows].mean()
+        else:
+            router_term = router_logits.new_zeros(())
+        if router_term.requires_grad:
+            self.accelerator.backward(router_term)
+
+        comp_logp_detached: List[torch.Tensor] = []
+        rewards_detached: List[torch.Tensor] = []
+        for head_idx, adapter_name in enumerate(adapter_names):
+            self._set_active_adapter_no_toggle(model, adapter_name)
+            outputs = model(
+                input_ids=flat_input_ids,
+                attention_mask=flat_attention_mask,
+                output_hidden_states=False,
+            )
+            seq_logp = self._sequence_logp_from_logits(outputs.logits, flat_input_ids, flat_response_mask)
+            reward = script_args.beta * (seq_logp - ref_logp)
+            reward_matrix = reward.view(batch_size, num_candidates)
+            comp_logp_c = pl_log_prob(reward_matrix, rankings, candidate_mask=candidate_mask)
+            comp_term = -(gamma[:, head_idx] * comp_logp_c)
+            if torch.any(valid_rows):
+                comp_term = comp_term[valid_rows].mean()
+            else:
+                comp_term = router_logits.new_zeros(())
+            if comp_term.requires_grad:
+                self.accelerator.backward(comp_term)
+
+            comp_logp_detached.append(comp_logp_c.detach())
+            rewards_detached.append(reward_matrix.detach())
+            del outputs, seq_logp, reward, reward_matrix, comp_logp_c, comp_term
+
+        self._set_active_adapter_no_toggle(model, adapter_names[0])
+
+        comp_logp = torch.stack(comp_logp_detached, dim=1)
+        rewards = torch.stack(rewards_detached, dim=1)
+        mix_logp = torch.logsumexp(log_alpha.detach() + comp_logp, dim=1)
+        if torch.any(valid_rows):
+            mixture_nll = -mix_logp[valid_rows].mean()
+            em_nll = -((gamma * (log_alpha.detach() + comp_logp)).sum(dim=1)[valid_rows]).mean()
+        else:
+            mixture_nll = router_logits.new_zeros(())
+            em_nll = router_logits.new_zeros(())
+
+        posterior_pred = gamma.argmax(dim=1)
+        row_indices = torch.arange(gamma.shape[0], device=gamma.device)
+        posterior_rewards = rewards[row_indices, posterior_pred, :]
+        lm = listwise_metrics(posterior_rewards, candidate_mask)
+        metrics: Dict[str, float] = {
+            "mixture/nll": float(mixture_nll.detach().item()),
+            "mixture/em_nll": float(em_nll.detach().item()),
+            "listwise/top1_acc": float(lm["listwise/top1_acc"].detach().item()),
+            "listwise/pairwise_acc": float(lm["listwise/pairwise_acc"].detach().item()),
+            "listwise/utility_first": float(lm["listwise/utility_first"].detach().item()),
+            "listwise/utility_last": float(lm["listwise/utility_last"].detach().item()),
+            "listwise/utility_mean": float(lm["listwise/utility_mean"].detach().item()),
+        }
+        if include_cluster_metrics:
+            metrics.update(
+                compute_cluster_assignment_metrics(
+                    assignment_scores=gamma,
+                    attribute_ids=batch.get("attribute_id", torch.full((gamma.shape[0],), -1, device=gamma.device)),
+                    num_clusters=script_args.num_heads,
+                )
+            )
+        return float(em_nll.detach().item()), metrics
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         del num_items_in_batch
         loss, metrics, output, gamma = self._compute_em_loss_metrics(model, inputs, gamma=None, include_cluster_metrics=True)
@@ -810,6 +1022,7 @@ class MMPOTrainer(RewardTrainer):
         return loss.detach(), logits, labels
 
     def _maybe_evaluate_and_save_em(self) -> None:
+        was_training = self.model.training
         eval_steps = int(getattr(self.args, "eval_steps", 0) or 0)
         if eval_steps > 0 and self.state.global_step % eval_steps == 0:
             metrics = safe_trainer_evaluate(self)
@@ -819,6 +1032,8 @@ class MMPOTrainer(RewardTrainer):
         if script_args.save_checkpoint and save_steps > 0 and self.state.global_step % save_steps == 0:
             checkpoint_dir = os.path.join(self.args.output_dir, f"checkpoint-{self.state.global_step}")
             _safe_save_checkpoint(self, checkpoint_dir)
+        if was_training:
+            self.model.train()
 
     def _full_dataset_e_step(self, train_dataloader) -> Tuple[List[Dict], List[torch.Tensor]]:
         """Iterate entire training set once to compute per-batch gamma (E-step).
@@ -909,9 +1124,6 @@ class MMPOTrainer(RewardTrainer):
                 print(f"\nEpoch {epoch + 1}/{num_train_epochs}: running full-dataset E-step...")
             epoch_batches, epoch_gammas = self._full_dataset_e_step(train_dataloader)
 
-            # Update global router prior using the full-epoch gamma aggregate.
-            self._epoch_router_prior_update(epoch_gammas)
-
             # ----------------------------------------------------------------
             # M-step: iterate over cached batches with fixed gamma.
             # ----------------------------------------------------------------
@@ -926,24 +1138,22 @@ class MMPOTrainer(RewardTrainer):
 
                 for m_step in range(m_step_updates):
                     should_log = args.logging_steps > 0 and (self.state.global_step + 1) % args.logging_steps == 0
-                    loss, metrics, _, _ = self._compute_em_loss_metrics(
+                    loss_val, metrics = self._m_step_backward_fixed_gamma(
                         self.model,
                         inputs,
                         gamma=gamma,
                         include_cluster_metrics=True,
                     )
-                    self.accelerator.backward(loss)
                     if args.max_grad_norm is not None and args.max_grad_norm > 0:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), args.max_grad_norm)
+                    grad_sums = self._adapter_grad_sums(self.model) if should_log else {}
                     self.optimizer.step()
                     if self.lr_scheduler is not None:
                         self.lr_scheduler.step()
                     self.optimizer.zero_grad()
 
                     self.state.global_step += 1
-                    total_loss += float(loss.detach().item())
-
-                    loss_val = float(loss.detach().item())
+                    total_loss += float(loss_val)
                     pairwise_acc = float(metrics.get("listwise/pairwise_acc", 0.0))
                     pbar.set_postfix({
                         "epoch": f"{epoch + 1}/{num_train_epochs}",
@@ -961,9 +1171,14 @@ class MMPOTrainer(RewardTrainer):
                             "train/epoch": epoch + batch_idx / max(len(epoch_batches), 1),
                         }
                         log_payload.update({f"train/{k}": float(v) for k, v in metrics.items()})
+                        for adapter_name, grad_sum in grad_sums.items():
+                            log_payload[f"train/grad_sum_{adapter_name}"] = grad_sum
                         wandb.log(log_payload, step=self.state.global_step)
 
                     self._maybe_evaluate_and_save_em()
+
+            # Closed-form router prior update at epoch end, after using fixed E-step gamma in M-step.
+            self._epoch_router_prior_update(epoch_gammas)
 
         pbar.close()
 
@@ -1044,6 +1259,7 @@ def safe_trainer_evaluate(trainer: RewardTrainer) -> Dict[str, float]:
 def _manual_evaluate(trainer: RewardTrainer) -> Dict[str, float]:
     """Run evaluation by directly calling prediction_step, bypassing DeepSpeed inference context."""
     model = trainer.model
+    was_training = model.training
     model.eval()
     eval_dataloader = trainer.get_eval_dataloader()
 
@@ -1063,7 +1279,8 @@ def _manual_evaluate(trainer: RewardTrainer) -> Dict[str, float]:
                 total_loss += float(loss.item())
                 num_batches += 1
 
-    model.train()
+    if was_training:
+        model.train()
 
     if not all_logits:
         return {}
@@ -1081,6 +1298,8 @@ def _manual_evaluate(trainer: RewardTrainer) -> Dict[str, float]:
 
 def _safe_save_checkpoint(trainer: RewardTrainer, checkpoint_dir: str) -> None:
     """Save model checkpoint without going through DeepSpeed's get_state_dict path."""
+    if not script_args.save_checkpoint:
+        return
     if not accelerator.is_main_process:
         return
     os.makedirs(checkpoint_dir, exist_ok=True)
@@ -1132,6 +1351,12 @@ except Exception:
 eval_split = "validation" if "validation" in ranking_dataset else ("test" if "test" in ranking_dataset else "train")
 eval_dataset = ranking_dataset[eval_split]
 
+if accelerator.is_main_process and eval_split == "test" and not script_args.eval_only:
+    print(
+        "Warning: validation split not found, using test split for in-training evaluation. "
+        "This may leak test information into model selection."
+    )
+
 if accelerator.is_main_process:
     print(
         f"Loaded listwise cyclic UltraFeedback: train={len(train_dataset)} "
@@ -1148,7 +1373,7 @@ training_args = RewardConfig(
     num_train_epochs=script_args.num_train_epochs,
     eval_strategy=script_args.eval_strategy,
     eval_steps=script_args.eval_steps,
-    save_strategy="no" if not script_args.save_checkpoint else script_args.save_strategy,
+    save_strategy=script_args.save_strategy,
     save_steps=script_args.save_steps,
     save_total_limit=1,
     gradient_accumulation_steps=script_args.gradient_accumulation_steps,
@@ -1173,6 +1398,20 @@ local_rank = int(os.environ.get("LOCAL_RANK", 0))
 device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
 print(device)
 
+reference_model_name = script_args.reference_model or script_args.base_model
+reference_model = AutoModelForCausalLM.from_pretrained(
+    reference_model_name,
+    torch_dtype=torch.bfloat16,
+    attn_implementation="sdpa",
+)
+reference_model.config.pad_token_id = tokenizer.pad_token_id
+reference_model.resize_token_embeddings(len(tokenizer))
+reference_model.config.use_cache = False
+reference_model.eval()
+for param in reference_model.parameters():
+    param.requires_grad = False
+reference_model.to(device)
+
 model = AutoModelForCausalLM.from_pretrained(
     script_args.base_model,
     torch_dtype=torch.bfloat16,
@@ -1182,19 +1421,33 @@ model.config.pad_token_id = tokenizer.pad_token_id
 model.resize_token_embeddings(len(tokenizer))
 # RewardTrainer checks model.config.num_labels == 1; patch it so causal LM passes that guard
 model.config.num_labels = 1
-model.mixture_score = nn.Linear(model.config.hidden_size, script_args.num_heads, bias=False).to(device, dtype=torch.bfloat16)
+model.config.use_cache = False
 
-if script_args.freeze_pretrained:
-    for _, param in model.named_parameters():
-        param.requires_grad = False
-    for param in model.mixture_score.parameters():
+lora_config = LoraConfig(
+    r=script_args.lora_r,
+    lora_alpha=script_args.lora_alpha,
+    lora_dropout=script_args.lora_dropout,
+    target_modules=_parse_lora_target_modules(script_args.lora_target_modules),
+    bias="none",
+    task_type=TaskType.CAUSAL_LM,
+)
+model = get_peft_model(model, lora_config, adapter_name="expert_0")
+for head_idx in range(1, script_args.num_heads):
+    model.add_adapter(f"expert_{head_idx}", lora_config)
+model.mixture_adapter_names = [f"expert_{idx}" for idx in range(script_args.num_heads)]
+model.set_adapter(model.mixture_adapter_names[0])
+
+# Keep all expert adapters trainable; we'll switch active adapter without toggling grad flags.
+for name, param in model.named_parameters():
+    if any(f".{adapter_name}." in name for adapter_name in model.mixture_adapter_names):
         param.requires_grad = True
+if hasattr(model, "enable_input_require_grads"):
+    model.enable_input_require_grads()
+if accelerator.is_main_process:
+    model.print_trainable_parameters()
 
 if script_args.use_contextual_router:
     model.mixture_router = nn.Linear(model.config.hidden_size, script_args.num_heads, bias=False).to(device, dtype=torch.bfloat16)
-    if script_args.freeze_pretrained:
-        for param in model.mixture_router.parameters():
-            param.requires_grad = True
 else:
     model.mixture_router_logits = nn.Parameter(torch.zeros(script_args.num_heads, dtype=torch.bfloat16, device=device))
     if script_args.use_closed_form_router_prior_update:
@@ -1209,6 +1462,7 @@ trainer = MMPOTrainer(
     compute_metrics=compute_metrics,
     data_collator=ListwiseRewardCollator(tokenizer=tokenizer, max_length=script_args.max_length),
 )
+trainer.reference_model = reference_model
 trainer.ranking_dataset = ranking_dataset
 trainer.ranking_eval_split_name = eval_split
 trainer.dimension_to_id = _dimension_mapping(ranking_dataset)
