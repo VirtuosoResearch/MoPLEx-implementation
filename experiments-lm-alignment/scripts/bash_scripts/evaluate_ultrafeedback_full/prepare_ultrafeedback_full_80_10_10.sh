@@ -8,10 +8,13 @@ REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 
 SOURCE_DATASET="${SOURCE_DATASET:-openbmb/UltraFeedback}"
 SOURCE_SPLIT="${SOURCE_SPLIT:-train}"
-DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/ultrafeedback_full_80_10_10}"
+DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/ultrafeedback_full_98_1_1}"
 DIMENSIONS="${DIMENSIONS:-instruction_following helpfulness honesty truthfulness}"
 FORMATS="${FORMATS:-listwise pairwise}"
 SPLIT_SEED="${SPLIT_SEED:-42}"
+TRAIN_RATIO="${TRAIN_RATIO:-0.98}"
+VALIDATION_RATIO="${VALIDATION_RATIO:-0.01}"
+TEST_RATIO="${TEST_RATIO:-0.01}"
 LISTWISE_NUM_RESPONSES="${LISTWISE_NUM_RESPONSES:-4}"
 LISTWISE_MIN_RESPONSES="${LISTWISE_MIN_RESPONSES:-2}"
 PAIRWISE_STRATEGY="${PAIRWISE_STRATEGY:-all_pairs}"
@@ -53,6 +56,9 @@ for dimension in ${DIMENSIONS}; do
       --output_dir "${dataset_dir}" \
       --format "${format}" \
       --seed "${SPLIT_SEED}" \
+      --train_ratio "${TRAIN_RATIO}" \
+      --validation_ratio "${VALIDATION_RATIO}" \
+      --test_ratio "${TEST_RATIO}" \
       --listwise_num_responses "${LISTWISE_NUM_RESPONSES}" \
       --listwise_min_responses "${LISTWISE_MIN_RESPONSES}" \
       "${extra_args[@]}"

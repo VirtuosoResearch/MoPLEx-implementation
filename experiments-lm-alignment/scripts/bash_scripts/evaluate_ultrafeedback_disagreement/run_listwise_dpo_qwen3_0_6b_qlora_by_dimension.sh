@@ -7,49 +7,32 @@ SCRIPTS_DIR="$(cd "${BASH_SCRIPTS_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 
 CONFIG_PATH="${CONFIG_PATH:-recipes/qwen3-1b/dpo/ultrafeedback_merged/config_listwise_qlora.yaml}"
-SOURCE_DATASET="${SOURCE_DATASET:-openbmb/UltraFeedback}"
-SOURCE_SPLIT="${SOURCE_SPLIT:-train}"
-DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/ultrafeedback_full_98_1_1}"
+DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_disagreement}"
 DIMENSIONS="${DIMENSIONS:-instruction_following helpfulness honesty truthfulness}"
 SEEDS="${SEEDS:-42}"
-SPLIT_SEED="${SPLIT_SEED:-42}"
-TRAIN_RATIO="${TRAIN_RATIO:-0.98}"
-VALIDATION_RATIO="${VALIDATION_RATIO:-0.01}"
-TEST_RATIO="${TEST_RATIO:-0.01}"
-MAX_STEPS="${MAX_STEPS:-2000}"
+MAX_STEPS="${MAX_STEPS:-1000}"
 LISTWISE_NUM_RESPONSES="${LISTWISE_NUM_RESPONSES:-4}"
-PYTHON="${PYTHON:-python}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 
+if [[ ! -d "${DATASET_DIR}" ]]; then
+  echo "Missing disagreement dataset directory: ${DATASET_DIR}" >&2
+  echo "Run scripts/bash_scripts/generate_disagreement_ultrafeedback_dataset.sh first." >&2
+  exit 1
+fi
+
 cd "${REPO_ROOT}"
 export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
 
 for dimension in ${DIMENSIONS}; do
   dim_tag="${dimension//[^a-zA-Z0-9]/_}"
-  dataset_dir="${DATA_ROOT}/listwise-${dim_tag}-split-s${SPLIT_SEED}-k${LISTWISE_NUM_RESPONSES}"
-
-  if [[ ! -d "${dataset_dir}" ]]; then
-    echo "Preparing full UltraFeedback listwise dataset for preference_dimension=${dimension}"
-    "${PYTHON}" scripts/prepare_ultrafeedback_full_dimension_dataset.py \
-      --dataset_name "${SOURCE_DATASET}" \
-      --source_split "${SOURCE_SPLIT}" \
-      --dimension "${dimension}" \
-      --output_dir "${dataset_dir}" \
-      --format listwise \
-      --seed "${SPLIT_SEED}" \
-      --train_ratio "${TRAIN_RATIO}" \
-      --validation_ratio "${VALIDATION_RATIO}" \
-      --test_ratio "${TEST_RATIO}" \
-      --listwise_num_responses "${LISTWISE_NUM_RESPONSES}"
-  fi
 
   for seed in ${SEEDS}; do
-    run_name="${WANDB_NAME:-qwen3-0.6b-listwise-dpo-qlora-ultrafeedback-full}-${dim_tag}-s${seed}"
-    output_dir="${OUTPUT_DIR:-outputs/ultrafeedback-full/listwise-dpo-by-dimension/qwen3-0.6b}-${dim_tag}-s${seed}"
+    run_name="${WANDB_NAME:-qwen3-0.6b-listwise-dpo-qlora-ultrafeedback-disagreement}-${dim_tag}-s${seed}"
+    output_dir="${OUTPUT_DIR:-outputs/ultrafeedback-disagreement/listwise-dpo-by-dimension/qwen3-0.6b}-${dim_tag}-s${seed}"
 
     echo "Launching ListDPO for preference_dimension=${dimension}, seed=${seed}"
 
@@ -58,7 +41,7 @@ for dimension in ${DIMENSIONS}; do
       --num_processes="${NUM_PROCESSES:-1}" \
       scripts/dpo.py \
       --config "${CONFIG_PATH}" \
-      --dataset_name "${dataset_dir}" \
+      --dataset_name "${DATASET_DIR}" \
       --dataset_format listwise \
       --dataset_train_split train \
       --dataset_test_split validation \
