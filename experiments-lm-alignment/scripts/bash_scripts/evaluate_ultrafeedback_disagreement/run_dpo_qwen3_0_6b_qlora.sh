@@ -10,7 +10,7 @@ CONFIG_PATH="${CONFIG_PATH:-recipes/qwen3-1b/dpo/ultrafeedback_merged/config_dpo
 DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_disagreement}"
 DIMENSIONS="${DIMENSIONS:-instruction_following helpfulness honesty truthfulness}"
 SEEDS="${SEEDS:-42}"
-MAX_STEPS="${MAX_STEPS:-1000}"
+MAX_STEPS="${MAX_STEPS:-2000}"
 LISTWISE_NUM_RESPONSES="${LISTWISE_NUM_RESPONSES:-4}"
 PAIRWISE_STRATEGY="${PAIRWISE_STRATEGY:-all_pairs}"
 

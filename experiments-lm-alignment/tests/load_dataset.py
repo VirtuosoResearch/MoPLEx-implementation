@@ -5,7 +5,7 @@ dimensions = ["instruction_following", "helpfulness", "truthfulness", "honesty"]
 
 # for i in range(4):
 #     for j in range(i + 1, 4):
-path = f'../data/cyclic_ultrafeedback_merged'
+path = f'../data/ultrafeedback_disagreement_allow_ties'
 ds = load_from_disk(path)
 # %%
 
