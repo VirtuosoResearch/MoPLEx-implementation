@@ -63,6 +63,24 @@ def parse_args() -> argparse.Namespace:
             "and tied responses are emitted adjacent using source candidate order as a deterministic tie-breaker."
         ),
     )
+    parser.add_argument(
+        "--max_ties_per_dimension",
+        type=int,
+        default=None,
+        help=(
+            "Optional cap on tied score pairs per criterion when --allow_ties is set. "
+            "Use 1 to allow only one tied response pair among the four scores, e.g. [4, 3, 3, 1]."
+        ),
+    )
+    parser.add_argument(
+        "--min_distinct_rankings",
+        type=int,
+        default=2,
+        help=(
+            "Minimum number of distinct criterion rankings required among the selected dimensions. "
+            "Use 3 to require at least three different rankings across the four UltraFeedback criteria."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -99,6 +117,8 @@ def main() -> None:
         max_source_rows=args.max_source_rows,
         max_examples=args.max_examples,
         allow_ties=args.allow_ties,
+        max_ties_per_dimension=args.max_ties_per_dimension,
+        min_distinct_rankings=args.min_distinct_rankings,
     )
 
     if not rows:
@@ -127,6 +147,8 @@ def main() -> None:
         "valid_score_rows": stats.valid_score_rows,
         "valid_ranking_rows": stats.valid_ranking_rows,
         "valid_strict_ranking_rows": stats.valid_strict_ranking_rows,
+        "tie_limited_rows": stats.tie_limited_rows,
+        "distinct_ranking_rows": stats.distinct_ranking_rows,
         "disagreement_source_rows": stats.disagreement_rows,
         "emitted_listwise_rows": len(rows),
         "train_rows": len(dataset_dict["train"]),
@@ -136,12 +158,16 @@ def main() -> None:
         "max_source_rows": args.max_source_rows,
         "max_examples": args.max_examples,
         "allow_ties": args.allow_ties,
+        "max_ties_per_dimension": args.max_ties_per_dimension,
+        "min_distinct_rankings": args.min_distinct_rankings,
         "ranking_filter": filter_name,
     }
     metrics["eligible_ratio"] = metrics["eligible_rows"] / max(metrics["total_rows"], 1)
     metrics["strict_ranking_ratio"] = metrics["valid_strict_ranking_rows"] / max(metrics["valid_score_rows"], 1)
     metrics["ranking_ratio"] = metrics["valid_ranking_rows"] / max(metrics["valid_score_rows"], 1)
-    metrics["disagreement_ratio"] = metrics["disagreement_source_rows"] / max(metrics["valid_ranking_rows"], 1)
+    metrics["tie_limited_ratio"] = metrics["tie_limited_rows"] / max(metrics["valid_score_rows"], 1)
+    metrics["distinct_ranking_ratio"] = metrics["distinct_ranking_rows"] / max(metrics["tie_limited_rows"], 1)
+    metrics["disagreement_ratio"] = metrics["disagreement_source_rows"] / max(metrics["distinct_ranking_rows"], 1)
 
     metrics_path = os.path.join(args.output_dir, "stats.json")
     with open(metrics_path, "w", encoding="utf-8") as f:
