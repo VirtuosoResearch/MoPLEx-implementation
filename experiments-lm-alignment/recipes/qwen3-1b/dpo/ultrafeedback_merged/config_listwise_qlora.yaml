@@ -70,6 +70,6 @@ report_to:
 run_name: qwen3-0.6b-listwise-dpo-qlora-ultrafeedback-merged
 save_strategy: steps
 save_steps: 50
-save_total_limit: 1
+save_total_limit: 3
 seed: 42
 warmup_ratio: 0.1

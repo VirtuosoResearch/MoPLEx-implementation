@@ -150,6 +150,37 @@ class ScriptArguments(trl.ScriptArguments):
             )
         },
     )
+    dataset_downsample_ratio: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Deterministically downsample loaded dataset splits before listwise/pairwise conversion. "
+                "Use values in (0, 1]; default 1 keeps all rows."
+            )
+        },
+    )
+    dataset_downsample_seed: int = field(
+        default=0,
+        metadata={"help": "Seed for deterministic dataset downsampling."},
+    )
+    dataset_downsample_splits: Optional[list[str]] = field(
+        default_factory=lambda: ["train", "validation", "test"],
+        metadata={
+            "help": (
+                "Splits to downsample when dataset_downsample_ratio < 1. "
+                "Use ['all'] to downsample every split."
+            )
+        },
+    )
+    dataset_downsample_group_key: str = field(
+        default="source_index",
+        metadata={
+            "help": (
+                "Column used for grouped downsampling when present. "
+                "Default source_index keeps all rows derived from one prompt together."
+            )
+        },
+    )
     run_ranking_eval: bool = field(
         default=True,
         metadata={
@@ -177,17 +208,28 @@ class ScriptArguments(trl.ScriptArguments):
             raise ValueError("`dataset_format` must be either 'pairwise' or 'listwise'")
         if self.pairwise_from_listwise_strategy not in {"extreme", "all_pairs"}:
             raise ValueError("`pairwise_from_listwise_strategy` must be either 'extreme' or 'all_pairs'")
-        if self.dataset_format == "listwise" and self.preference_dimensions is None:
-            raise ValueError("`preference_dimensions` is required when dataset_format='listwise'")
         if self.listwise_num_responses < 2:
             raise ValueError("`listwise_num_responses` must be >= 2")
         if self.listwise_min_responses < 2:
             raise ValueError("`listwise_min_responses` must be >= 2")
+        if self.dataset_downsample_ratio <= 0 or self.dataset_downsample_ratio > 1:
+            raise ValueError("`dataset_downsample_ratio` must be in (0, 1].")
+        if isinstance(self.dataset_downsample_splits, str):
+            self.dataset_downsample_splits = [
+                split.strip()
+                for split in self.dataset_downsample_splits.split(",")
+                if split.strip()
+            ]
+        if self.dataset_downsample_splits is not None:
+            if not isinstance(self.dataset_downsample_splits, list):
+                raise ValueError("`dataset_downsample_splits` must be a list when provided")
+            if any(not isinstance(split, str) or not split for split in self.dataset_downsample_splits):
+                raise ValueError("`dataset_downsample_splits` entries must be non-empty strings")
         if self.preference_dimensions is not None:
             if not isinstance(self.preference_dimensions, list):
                 raise ValueError("`preference_dimensions` must be a list when provided")
-            if len(self.preference_dimensions) < 1 or len(self.preference_dimensions) > 4:
-                raise ValueError("`preference_dimensions` must contain 1 to 4 dimensions")
+            if len(self.preference_dimensions) < 1:
+                raise ValueError("`preference_dimensions` must contain at least 1 dimension")
             if len(set(self.preference_dimensions)) != len(self.preference_dimensions):
                 raise ValueError("`preference_dimensions` must not contain duplicates")
 
@@ -267,6 +309,10 @@ class MixturePLConfig(DPOConfig):
     use_mixture: bool = field(
         default=False,
         metadata={"help": "Enable mixture of Plackett-Luce (MoPL) clustering during DPO training."},
+    )
+    mixture_objective: str = field(
+        default="pl",
+        metadata={"help": "Mixture objective to use when use_mixture=True. Choices: 'pl' or 'bt'."},
     )
     num_clusters: Optional[int] = field(
         default=None,
@@ -352,6 +398,8 @@ class MixturePLConfig(DPOConfig):
                 pass
             elif self.num_clusters < 1:
                 raise ValueError("`num_clusters` must be >= 1 when use_mixture=True")
+            if self.mixture_objective not in {"pl", "bt"}:
+                raise ValueError("`mixture_objective` must be either 'pl' or 'bt'")
 
             if self.em_temperature <= 0:
                 raise ValueError("`em_temperature` must be positive")

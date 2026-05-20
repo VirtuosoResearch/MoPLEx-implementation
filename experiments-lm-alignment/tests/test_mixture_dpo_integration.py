@@ -229,6 +229,25 @@ def test_mixture_config():
         return False
 
 
+def test_cluster_metrics_by_dimension_aligns_permutation():
+    """Test per-dimension clustering metrics use Hungarian-aligned labels."""
+    from alignment.ranking_eval import _cluster_alignment, _cluster_metrics_by_dimension
+
+    true_labels = [0, 0, 1, 1]
+    pred_labels = [1, 1, 0, 0]
+    dimensions = ["helpfulness", "helpfulness", "truthfulness", "truthfulness"]
+    alignment = _cluster_alignment(true_labels, pred_labels, num_clusters=2)
+
+    metrics = _cluster_metrics_by_dimension(true_labels, pred_labels, dimensions, alignment)
+
+    assert metrics["mixture/by_dimension/helpfulness/num_examples"] == 2.0
+    assert metrics["mixture/by_dimension/helpfulness/cluster_acc_raw"] == 0.0
+    assert metrics["mixture/by_dimension/helpfulness/cluster_acc"] == 1.0
+    assert metrics["mixture/by_dimension/truthfulness/num_examples"] == 2.0
+    assert metrics["mixture/by_dimension/truthfulness/cluster_acc_raw"] == 0.0
+    assert metrics["mixture/by_dimension/truthfulness/cluster_acc"] == 1.0
+
+
 if __name__ == "__main__":
     print("\n" + "=" * 80)
     print("MIXTURE DPO - SIMPLIFIED INTEGRATION TESTS")

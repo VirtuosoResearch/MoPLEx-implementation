@@ -19,6 +19,7 @@ def pl_log_prob(
     rewards: torch.Tensor,
     rankings: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
+    ranked_prefix_lengths: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute log probability under Plackett-Luce model.
@@ -27,23 +28,34 @@ def pl_log_prob(
         rewards: [B, M] tensor of item scores
         rankings: [B, M] tensor of ranking indices
         candidate_mask: optional [B, M] mask for valid items
+        ranked_prefix_lengths: optional [B] tensor. If provided, only the
+            first N ranked positions contribute to the PL likelihood for each
+            row. This supports top-1 partial rankings where negatives are
+            unordered.
 
     Returns:
         [B] tensor of log probabilities
     """
+    m_items = rewards.shape[1]
     ranked = rewards.gather(1, rankings)
     if candidate_mask is None:
         ranked_mask = torch.ones_like(ranked, dtype=torch.bool)
     else:
         ranked_mask = candidate_mask.gather(1, rankings).bool()
 
+    if ranked_prefix_lengths is None:
+        ranked_prefix_lengths = ranked_mask.long().sum(dim=1)
+    else:
+        ranked_prefix_lengths = ranked_prefix_lengths.to(device=rewards.device, dtype=torch.long)
+        ranked_prefix_lengths = ranked_prefix_lengths.clamp(min=0, max=m_items)
+
     out = torch.zeros(rewards.shape[0], device=rewards.device)
-    m_items = rewards.shape[1]
-    for t in range(m_items - 1):
+    for t in range(m_items):
         suffix_mask = ranked_mask[:, t:]
         logits = ranked[:, t:].masked_fill(~suffix_mask, float("-inf"))
         term = ranked[:, t] - torch.logsumexp(logits, dim=1)
-        out = out + torch.where(ranked_mask[:, t], term, torch.zeros_like(term))
+        contributes = ranked_mask[:, t] & (ranked_prefix_lengths > t)
+        out = out + torch.where(contributes, term, torch.zeros_like(term))
     return out
 
 
@@ -52,6 +64,7 @@ def mixture_pl_nll(
     rewards: torch.Tensor,
     rankings: torch.Tensor,
     candidate_mask: Optional[torch.Tensor] = None,
+    ranked_prefix_lengths: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Compute mixture of Plackett-Luce negative log-likelihood and component log-probs.
@@ -61,6 +74,8 @@ def mixture_pl_nll(
         rewards: [B, K, M] scores per component per item
         rankings: [B, M] ranking indices
         candidate_mask: optional [B, M] mask for valid items
+        ranked_prefix_lengths: optional [B] tensor limiting how many observed
+            ranked positions contribute per row.
 
     Returns:
         nll: scalar negative log-likelihood
@@ -70,11 +85,20 @@ def mixture_pl_nll(
     bsz, k_clusters, _ = rewards.shape
     comp_logp = []
     for c in range(k_clusters):
-        comp_logp.append(pl_log_prob(rewards[:, c, :], rankings, candidate_mask=candidate_mask))
+        comp_logp.append(
+            pl_log_prob(
+                rewards[:, c, :],
+                rankings,
+                candidate_mask=candidate_mask,
+                ranked_prefix_lengths=ranked_prefix_lengths,
+            )
+        )
     comp_logp = torch.stack(comp_logp, dim=1)
     mix_logp = torch.logsumexp(log_alpha + comp_logp, dim=1)
     if candidate_mask is not None:
         valid_rows = candidate_mask.sum(dim=1) >= 2
+        if ranked_prefix_lengths is not None:
+            valid_rows = valid_rows & (ranked_prefix_lengths.to(candidate_mask.device) >= 1)
         if not torch.any(valid_rows):
             return rewards.new_zeros(()), comp_logp
         mix_logp = mix_logp[valid_rows]

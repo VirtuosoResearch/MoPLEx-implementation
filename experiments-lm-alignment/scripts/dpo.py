@@ -60,6 +60,7 @@ from transformers.trainer_utils import get_last_checkpoint
 from alignment import (
     DPOConfig,
     ListwiseDPOTrainer,
+    MixtureBTTrainer,
     MixtureDPOTrainer,
     MixtureEMDPOTrainer,
     MixturePLConfig,
@@ -198,9 +199,13 @@ def main(script_args, training_args, model_args):
 
     # Select trainer class
     if use_mixture:
-        trainer_cls = MixtureEMDPOTrainer if training_args.mixture_training_mode == "em_only" else MixtureDPOTrainer
+        if getattr(training_args, "mixture_objective", "pl") == "bt":
+            trainer_cls = MixtureBTTrainer
+        else:
+            trainer_cls = MixtureEMDPOTrainer if training_args.mixture_training_mode == "em_only" else MixtureDPOTrainer
         logger.info(
-            "Using Mixture DPO trainer with %d clusters, mode=%s, reward_backend=%s, mixture_nll_weight=%.4f",
+            "Using Mixture DPO trainer with objective=%s, %d clusters, mode=%s, reward_backend=%s, mixture_nll_weight=%.4f",
+            getattr(training_args, "mixture_objective", "pl"),
             training_args.num_clusters,
             training_args.mixture_training_mode,
             training_args.mixture_reward_backend,

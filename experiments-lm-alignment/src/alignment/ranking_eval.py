@@ -29,9 +29,18 @@ class RankingMetricAccumulator:
         self.pairwise_total = 0
         self.by_dimension = defaultdict(lambda: {"rows": 0, "top1": 0, "pairwise_correct": 0, "pairwise_total": 0})
 
-    def add_batch(self, utilities: torch.Tensor, candidate_mask: torch.Tensor, dimensions: list[str]) -> None:
+    def add_batch(
+        self,
+        utilities: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        dimensions: list[str],
+        ranked_prefix_lengths: torch.Tensor | None = None,
+    ) -> None:
         utilities = utilities.detach().float().cpu()
         candidate_mask = candidate_mask.detach().bool().cpu()
+        if ranked_prefix_lengths is None:
+            ranked_prefix_lengths = candidate_mask.long().sum(dim=1)
+        ranked_prefix_lengths = ranked_prefix_lengths.detach().long().cpu()
 
         for row_idx, dimension in enumerate(dimensions):
             valid_indices = torch.where(candidate_mask[row_idx])[0].tolist()
@@ -44,7 +53,10 @@ class RankingMetricAccumulator:
 
             pairwise_correct = 0
             pairwise_total = 0
+            ranked_prefix_length = int(ranked_prefix_lengths[row_idx].item())
             for left_pos, left_idx in enumerate(valid_indices):
+                if left_pos >= ranked_prefix_length:
+                    break
                 for right_idx in valid_indices[left_pos + 1 :]:
                     pairwise_total += 1
                     if row_utilities[left_idx] > row_utilities[right_idx]:
@@ -170,6 +182,41 @@ def _cluster_alignment(true_labels: list[int], pred_labels: list[int], num_clust
     return ClusterAlignment(true_to_pred=true_to_pred, pred_to_true=pred_to_true)
 
 
+def _cluster_metrics_by_dimension(
+    true_labels: list[int],
+    pred_labels: list[int],
+    dimensions: list[str],
+    alignment: ClusterAlignment,
+    *,
+    prefix: str = "mixture/by_dimension",
+) -> dict[str, float]:
+    if not true_labels or not pred_labels or not dimensions:
+        return {}
+
+    metrics: dict[str, float] = {}
+    dim_to_indices: dict[str, list[int]] = defaultdict(list)
+    for idx, dimension in enumerate(dimensions[: len(true_labels)]):
+        dim_to_indices[str(dimension)].append(idx)
+
+    for dimension, indices in sorted(dim_to_indices.items()):
+        raw_correct = 0
+        aligned_correct = 0
+        for idx in indices:
+            true_label = true_labels[idx]
+            pred_label = pred_labels[idx]
+            aligned_label = alignment.pred_to_true.get(pred_label, pred_label)
+            raw_correct += int(pred_label == true_label)
+            aligned_correct += int(aligned_label == true_label)
+
+        dim_key = _metric_dimension_key(dimension)
+        denom = max(len(indices), 1)
+        metrics[f"{prefix}/{dim_key}/num_examples"] = float(len(indices))
+        metrics[f"{prefix}/{dim_key}/cluster_acc"] = aligned_correct / denom
+        metrics[f"{prefix}/{dim_key}/cluster_acc_raw"] = raw_correct / denom
+
+    return metrics
+
+
 def _comb2(value: int) -> float:
     return value * (value - 1) / 2.0
 
@@ -267,6 +314,7 @@ def evaluate_ranking_split(
 
     true_labels: list[int] = []
     posterior_pred_labels: list[int] = []
+    dimension_labels: list[str] = []
     gamma_entropy_sum = 0.0
     gamma_count = 0
     mixture_nll_sum = 0.0
@@ -278,10 +326,11 @@ def evaluate_ranking_split(
             inputs = trainer._prepare_inputs(batch)
             dimensions = [str(dimension) for dimension in inputs["preference_dimension"]]
             candidate_mask = inputs["candidate_mask"]
+            ranked_prefix_lengths = inputs.get("ranked_prefix_length")
 
             utilities = _policy_utilities(trainer, inputs, beta=beta)
             if not collect_only_cluster_state:
-                policy_acc.add_batch(utilities, candidate_mask, dimensions)
+                policy_acc.add_batch(utilities, candidate_mask, dimensions, ranked_prefix_lengths)
 
             if not hasattr(trainer, "get_batch_mixture_output"):
                 continue
@@ -293,6 +342,7 @@ def evaluate_ranking_split(
                 mixture_output["rewards"],
                 rankings,
                 candidate_mask=candidate_mask,
+                ranked_prefix_lengths=ranked_prefix_lengths,
             )
             gamma = em_responsibilities(
                 mixture_output["router_logits"],
@@ -304,6 +354,7 @@ def evaluate_ranking_split(
 
             true_labels.extend(int(label) for label in true_cluster.detach().cpu().tolist())
             posterior_pred_labels.extend(int(label) for label in posterior_pred.detach().cpu().tolist())
+            dimension_labels.extend(dimensions)
             gamma_entropy = -(gamma * torch.log(gamma.clamp_min(1e-12))).sum(dim=1)
             gamma_entropy_sum += float(gamma_entropy.sum().detach().cpu().item())
             gamma_count += int(gamma_entropy.numel())
@@ -315,7 +366,7 @@ def evaluate_ranking_split(
 
             row_indices = torch.arange(gamma.shape[0], device=device)
             posterior_rewards = mixture_output["rewards"][row_indices, posterior_pred, :]
-            posterior_acc.add_batch(posterior_rewards, candidate_mask, dimensions)
+            posterior_acc.add_batch(posterior_rewards, candidate_mask, dimensions, ranked_prefix_lengths)
 
             if cluster_alignment is not None:
                 aligned_components = [
@@ -324,11 +375,12 @@ def evaluate_ranking_split(
                 ]
                 aligned_components_tensor = torch.tensor(aligned_components, dtype=torch.long, device=device)
                 aligned_rewards = mixture_output["rewards"][row_indices, aligned_components_tensor, :]
-                aligned_acc.add_batch(aligned_rewards, candidate_mask, dimensions)
+                aligned_acc.add_batch(aligned_rewards, candidate_mask, dimensions, ranked_prefix_lengths)
 
     cluster_state = {
         "true_labels": true_labels,
         "posterior_pred_labels": posterior_pred_labels,
+        "dimension_labels": dimension_labels,
     }
     if collect_only_cluster_state:
         return {}, cluster_state
@@ -361,6 +413,7 @@ def evaluate_ranking_split(
                 len(posterior_pred_labels),
                 1,
             )
+        metrics.update(_cluster_metrics_by_dimension(true_labels, posterior_pred_labels, dimension_labels, alignment))
 
     return metrics, cluster_state
 
