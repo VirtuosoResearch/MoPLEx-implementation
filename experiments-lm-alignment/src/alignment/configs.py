@@ -150,6 +150,37 @@ class ScriptArguments(trl.ScriptArguments):
             )
         },
     )
+    dataset_downsample_ratio: float = field(
+        default=1.0,
+        metadata={
+            "help": (
+                "Deterministically downsample loaded dataset splits before listwise/pairwise conversion. "
+                "Use values in (0, 1]; default 1 keeps all rows."
+            )
+        },
+    )
+    dataset_downsample_seed: int = field(
+        default=0,
+        metadata={"help": "Seed for deterministic dataset downsampling."},
+    )
+    dataset_downsample_splits: Optional[list[str]] = field(
+        default_factory=lambda: ["train", "validation", "test"],
+        metadata={
+            "help": (
+                "Splits to downsample when dataset_downsample_ratio < 1. "
+                "Use ['all'] to downsample every split."
+            )
+        },
+    )
+    dataset_downsample_group_key: str = field(
+        default="source_index",
+        metadata={
+            "help": (
+                "Column used for grouped downsampling when present. "
+                "Default source_index keeps all rows derived from one prompt together."
+            )
+        },
+    )
     run_ranking_eval: bool = field(
         default=True,
         metadata={
@@ -181,6 +212,19 @@ class ScriptArguments(trl.ScriptArguments):
             raise ValueError("`listwise_num_responses` must be >= 2")
         if self.listwise_min_responses < 2:
             raise ValueError("`listwise_min_responses` must be >= 2")
+        if self.dataset_downsample_ratio <= 0 or self.dataset_downsample_ratio > 1:
+            raise ValueError("`dataset_downsample_ratio` must be in (0, 1].")
+        if isinstance(self.dataset_downsample_splits, str):
+            self.dataset_downsample_splits = [
+                split.strip()
+                for split in self.dataset_downsample_splits.split(",")
+                if split.strip()
+            ]
+        if self.dataset_downsample_splits is not None:
+            if not isinstance(self.dataset_downsample_splits, list):
+                raise ValueError("`dataset_downsample_splits` must be a list when provided")
+            if any(not isinstance(split, str) or not split for split in self.dataset_downsample_splits):
+                raise ValueError("`dataset_downsample_splits` entries must be non-empty strings")
         if self.preference_dimensions is not None:
             if not isinstance(self.preference_dimensions, list):
                 raise ValueError("`preference_dimensions` must be a list when provided")

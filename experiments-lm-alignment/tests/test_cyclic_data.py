@@ -1,13 +1,17 @@
 # coding=utf-8
 
+import pytest
 from datasets import Dataset
 
 from alignment.cyclic_data import (
     build_cyclic_rows,
     build_disagreement_rows,
+    build_pattern_rows,
+    format_rank_pattern,
     has_ranking_disagreement,
     has_strict_ranking_disagreement,
     has_strict_rotated_cycle,
+    parse_rank_pattern,
     split_rows_to_dataset_dict,
     split_rows_to_grouped_dataset_dict,
 )
@@ -479,6 +483,203 @@ def test_build_disagreement_rows_is_deterministic_for_same_seed():
     assert stats_1 == stats_2
 
 
+def test_parse_rank_pattern_accepts_supported_forms():
+    assert parse_rank_pattern("ABCD") == (0, 1, 2, 3)
+    assert parse_rank_pattern("B>A>D>C") == (1, 0, 3, 2)
+    assert parse_rank_pattern("b, a, d, c") == (1, 0, 3, 2)
+    assert format_rank_pattern((1, 0, 3, 2)) == "B>A>D>C"
+
+
+def test_parse_rank_pattern_rejects_invalid_patterns():
+    for pattern in ("", "ABC", "AABC", "ABCE"):
+        with pytest.raises(ValueError):
+            parse_rank_pattern(pattern)
+
+
+def test_build_pattern_rows_accepts_exact_pattern_without_ties():
+    dataset = Dataset.from_list(
+        [
+            {
+                "instruction": "p-pattern",
+                "completions": [
+                    _make_cyclic_completion("A", 4, 0, 0, 3),
+                    _make_cyclic_completion("B", 3, 0, 0, 4),
+                    _make_cyclic_completion("C", 2, 0, 0, 1),
+                    _make_cyclic_completion("D", 1, 0, 0, 2),
+                ],
+            }
+        ]
+    )
+
+    rows, stats = build_pattern_rows(
+        dataset,
+        dimension_pair=("instruction_following", "helpfulness"),
+        rank_patterns=("ABCD", "BADC"),
+        seed=0,
+    )
+
+    assert stats.total_rows == 1
+    assert stats.eligible_rows == 1
+    assert stats.valid_score_rows == 1
+    assert stats.tie_limited_rows == 1
+    assert stats.pattern_match_rows == 1
+    assert len(rows) == 2
+    assert rows[0]["preference_dimension"] == "instruction_following"
+    assert rows[0]["responses"] == ["A", "B", "C", "D"]
+    assert rows[0]["scores"] == [4.0, 3.0, 2.0, 1.0]
+    assert rows[1]["preference_dimension"] == "helpfulness"
+    assert rows[1]["responses"] == ["B", "A", "D", "C"]
+    assert rows[1]["scores"] == [4.0, 3.0, 2.0, 1.0]
+
+
+def test_build_pattern_rows_accepts_one_tie_resolved_by_original_placement():
+    dataset = Dataset.from_list(
+        [
+            {
+                "instruction": "p-tie-pattern",
+                "completions": [
+                    _make_cyclic_completion("A", 4, 0, 0, 3),
+                    _make_cyclic_completion("B", 4, 0, 0, 4),
+                    _make_cyclic_completion("C", 2, 0, 0, 1),
+                    _make_cyclic_completion("D", 1, 0, 0, 3),
+                ],
+            }
+        ]
+    )
+
+    rows, stats = build_pattern_rows(
+        dataset,
+        dimension_pair=("instruction_following", "helpfulness"),
+        rank_patterns=("ABCD", "BADC"),
+        seed=0,
+        max_ties_per_dimension=1,
+    )
+
+    assert stats.pattern_match_rows == 1
+    assert len(rows) == 2
+    assert rows[0]["responses"] == ["A", "B", "C", "D"]
+    assert rows[0]["scores"] == [4.0, 4.0, 2.0, 1.0]
+    assert rows[1]["responses"] == ["B", "A", "D", "C"]
+    assert rows[1]["scores"] == [4.0, 3.0, 3.0, 1.0]
+
+
+def test_build_pattern_rows_rejects_tie_resolved_to_wrong_pattern():
+    dataset = Dataset.from_list(
+        [
+            {
+                "instruction": "p-wrong-tie",
+                "completions": [
+                    _make_cyclic_completion("A", 4, 0, 0, 3),
+                    _make_cyclic_completion("B", 4, 0, 0, 4),
+                    _make_cyclic_completion("C", 2, 0, 0, 1),
+                    _make_cyclic_completion("D", 1, 0, 0, 2),
+                ],
+            }
+        ]
+    )
+
+    rows, stats = build_pattern_rows(
+        dataset,
+        dimension_pair=("instruction_following", "helpfulness"),
+        rank_patterns=("BACD", "BADC"),
+        seed=0,
+        max_ties_per_dimension=1,
+    )
+
+    assert stats.tie_limited_rows == 1
+    assert stats.pattern_match_rows == 0
+    assert rows == []
+
+
+def test_build_pattern_rows_rejects_more_than_one_tie_pair():
+    dataset = Dataset.from_list(
+        [
+            {
+                "instruction": "p-two-ties",
+                "completions": [
+                    _make_cyclic_completion("A", 4, 0, 0, 3),
+                    _make_cyclic_completion("B", 4, 0, 0, 4),
+                    _make_cyclic_completion("C", 2, 0, 0, 1),
+                    _make_cyclic_completion("D", 2, 0, 0, 2),
+                ],
+            }
+        ]
+    )
+
+    rows, stats = build_pattern_rows(
+        dataset,
+        dimension_pair=("instruction_following", "helpfulness"),
+        rank_patterns=("ABCD", "BADC"),
+        seed=0,
+        max_ties_per_dimension=1,
+    )
+
+    assert stats.valid_score_rows == 1
+    assert stats.tie_limited_rows == 0
+    assert stats.pattern_match_rows == 0
+    assert rows == []
+
+
+def test_build_pattern_rows_rejects_non_matching_dimension():
+    dataset = Dataset.from_list(
+        [
+            {
+                "instruction": "p-non-match",
+                "completions": [
+                    _make_cyclic_completion("A", 4, 0, 0, 4),
+                    _make_cyclic_completion("B", 3, 0, 0, 3),
+                    _make_cyclic_completion("C", 2, 0, 0, 2),
+                    _make_cyclic_completion("D", 1, 0, 0, 1),
+                ],
+            }
+        ]
+    )
+
+    rows, stats = build_pattern_rows(
+        dataset,
+        dimension_pair=("instruction_following", "helpfulness"),
+        rank_patterns=("ABCD", "BADC"),
+        seed=0,
+    )
+
+    assert stats.pattern_match_rows == 0
+    assert rows == []
+
+
+def test_build_pattern_rows_is_deterministic_for_same_seed():
+    dataset = Dataset.from_list(
+        [
+            {
+                "instruction": "p-many-pattern",
+                "completions": [
+                    _make_cyclic_completion("X", 0, 0, 0, 0),
+                    _make_cyclic_completion("Y", 0, 0, 0, 0),
+                    _make_cyclic_completion("A", 4, 0, 0, 3),
+                    _make_cyclic_completion("B", 3, 0, 0, 4),
+                    _make_cyclic_completion("C", 2, 0, 0, 1),
+                    _make_cyclic_completion("D", 1, 0, 0, 2),
+                ],
+            }
+        ]
+    )
+
+    rows_1, stats_1 = build_pattern_rows(
+        dataset,
+        dimension_pair=("instruction_following", "helpfulness"),
+        rank_patterns=("ABCD", "BADC"),
+        seed=11,
+    )
+    rows_2, stats_2 = build_pattern_rows(
+        dataset,
+        dimension_pair=("instruction_following", "helpfulness"),
+        rank_patterns=("ABCD", "BADC"),
+        seed=11,
+    )
+
+    assert rows_1 == rows_2
+    assert stats_1 == stats_2
+
+
 def test_split_rows_is_deterministic_for_same_seed():
     rows = [
         {
@@ -521,6 +722,33 @@ def test_grouped_split_keeps_source_indices_in_one_split():
     assert len(dataset_dict["train"]) == 32
     assert len(dataset_dict["validation"]) == 4
     assert len(dataset_dict["test"]) == 4
+
+    source_to_split = {}
+    for split_name, split_data in dataset_dict.items():
+        for source_index in split_data["source_index"]:
+            previous = source_to_split.setdefault(source_index, split_name)
+            assert previous == split_name
+
+
+def test_grouped_split_keeps_pattern_rows_together():
+    rows = []
+    for source_index in range(10):
+        for dimension in ("instruction_following", "helpfulness"):
+            rows.append(
+                {
+                    "prompt": f"p{source_index}",
+                    "responses": ["A", "B", "C", "D"],
+                    "scores": [4.0, 3.0, 2.0, 1.0],
+                    "preference_dimension": dimension,
+                    "source_index": source_index,
+                }
+            )
+
+    dataset_dict = split_rows_to_grouped_dataset_dict(rows, seed=7)
+
+    assert len(dataset_dict["train"]) == 16
+    assert len(dataset_dict["validation"]) == 2
+    assert len(dataset_dict["test"]) == 2
 
     source_to_split = {}
     for split_name, split_data in dataset_dict.items():

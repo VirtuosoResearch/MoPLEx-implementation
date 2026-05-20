@@ -14,6 +14,7 @@
 
 import logging
 import os
+import random
 from itertools import combinations
 from typing import Any
 
@@ -30,6 +31,93 @@ logger = logging.getLogger(__name__)
 def _is_preformatted_listwise_split(dataset: Dataset) -> bool:
     required = {"prompt", "responses", "scores", "preference_dimension"}
     return required.issubset(set(dataset.column_names))
+
+
+def _split_seed(seed: int, split_name: str) -> int:
+    return seed + sum((idx + 1) * ord(ch) for idx, ch in enumerate(split_name))
+
+
+def _hashable_group_value(value: Any) -> Any:
+    try:
+        hash(value)
+        return value
+    except TypeError:
+        return repr(value)
+
+
+def _should_downsample_split(split_name: str, args: ScriptArguments) -> bool:
+    ratio = getattr(args, "dataset_downsample_ratio", 1.0)
+    if ratio >= 1.0:
+        return False
+    split_names = getattr(args, "dataset_downsample_splits", None)
+    if split_names is None:
+        return True
+    return "all" in split_names or split_name in split_names
+
+
+def _downsample_split(dataset: Dataset, args: ScriptArguments, split_name: str) -> Dataset:
+    ratio = getattr(args, "dataset_downsample_ratio", 1.0)
+    if len(dataset) == 0 or ratio >= 1.0:
+        return dataset
+
+    seed = _split_seed(getattr(args, "dataset_downsample_seed", 0), split_name)
+    group_key = getattr(args, "dataset_downsample_group_key", "source_index")
+    if group_key and group_key in dataset.column_names:
+        group_values = []
+        seen = set()
+        for value in dataset[group_key]:
+            key = _hashable_group_value(value)
+            if key in seen:
+                continue
+            seen.add(key)
+            group_values.append(key)
+
+        keep_group_count = max(1, int(len(group_values) * ratio))
+        if keep_group_count >= len(group_values):
+            return dataset
+
+        rng = random.Random(seed)
+        rng.shuffle(group_values)
+        selected_groups = set(group_values[:keep_group_count])
+        selected_positions = [
+            idx
+            for idx, value in enumerate(dataset[group_key])
+            if _hashable_group_value(value) in selected_groups
+        ]
+        logger.info(
+            "Downsampled split '%s' by group '%s': kept %d/%d groups and %d/%d rows.",
+            split_name,
+            group_key,
+            keep_group_count,
+            len(group_values),
+            len(selected_positions),
+            len(dataset),
+        )
+        return dataset.select(selected_positions)
+
+    keep_count = max(1, int(len(dataset) * ratio))
+    if keep_count >= len(dataset):
+        return dataset
+    logger.info(
+        "Downsampled split '%s' row-wise: kept %d/%d rows.",
+        split_name,
+        keep_count,
+        len(dataset),
+    )
+    return dataset.shuffle(seed=seed).select(range(keep_count))
+
+
+def _maybe_downsample_dataset_dict(dataset_dict: DatasetDict, args: ScriptArguments) -> DatasetDict:
+    if getattr(args, "dataset_downsample_ratio", 1.0) >= 1.0:
+        return dataset_dict
+    return DatasetDict(
+        {
+            split_name: _downsample_split(split_data, args, split_name)
+            if _should_downsample_split(split_name, args)
+            else split_data
+            for split_name, split_data in dataset_dict.items()
+        }
+    )
 
 
 def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) -> Dataset:
@@ -425,6 +513,7 @@ def get_ranking_dataset(args: ScriptArguments) -> DatasetDict | None:
         return None
 
     dataset = _load_named_dataset(args)
+    dataset = _maybe_downsample_dataset_dict(dataset, args)
     if all(_is_preformatted_listwise_split(split_data) for split_data in dataset.values()):
         return DatasetDict(
             {
@@ -448,6 +537,7 @@ def get_dataset(args: ScriptArguments) -> DatasetDict:
     """
     if args.dataset_name and not args.dataset_mixture:
         dataset = _load_named_dataset(args)
+        dataset = _maybe_downsample_dataset_dict(dataset, args)
         dataset = _maybe_convert_to_listwise(dataset, args)
         return _maybe_convert_to_pairwise(dataset, args)
     elif args.dataset_mixture:
@@ -506,10 +596,12 @@ def get_dataset(args: ScriptArguments) -> DatasetDict:
                 logger.info(
                     f"Split dataset into train and test sets with test size: {args.dataset_mixture.test_split_size}"
                 )
+                combined_dataset = _maybe_downsample_dataset_dict(combined_dataset, args)
                 combined_dataset = _maybe_convert_to_listwise(combined_dataset, args)
                 return _maybe_convert_to_pairwise(combined_dataset, args)
             else:
-                combined_dataset = _maybe_convert_to_listwise(DatasetDict({"train": combined_dataset}), args)
+                combined_dataset = _maybe_downsample_dataset_dict(DatasetDict({"train": combined_dataset}), args)
+                combined_dataset = _maybe_convert_to_listwise(combined_dataset, args)
                 return _maybe_convert_to_pairwise(combined_dataset, args)
         else:
             raise ValueError("No datasets were loaded from the mixture configuration")

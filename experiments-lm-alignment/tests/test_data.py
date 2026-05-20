@@ -19,7 +19,7 @@ import pytest
 from datasets import Dataset, DatasetDict
 
 from alignment import ScriptArguments, get_dataset
-from alignment.data import _maybe_convert_to_listwise, _to_listwise_dataset
+from alignment.data import _maybe_convert_to_listwise, _maybe_downsample_dataset_dict, _to_listwise_dataset
 
 
 class GetDatasetTest(unittest.TestCase):
@@ -333,6 +333,106 @@ class GetDatasetTest(unittest.TestCase):
             ("C", "D"),
         }
         self.assertEqual(response_pairs, expected_pairs)
+
+    def test_preformatted_listwise_split_reduces_to_triplets_and_full_rankings(self):
+        preformatted = Dataset.from_list(
+            [
+                {
+                    "prompt": "p1",
+                    "responses": ["A", "B", "C", "D"],
+                    "scores": [4.0, 3.0, 2.0, 1.0],
+                    "preference_dimension": "instruction_following",
+                }
+            ]
+        )
+
+        triplet_args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="listwise",
+            preference_dimensions=["instruction_following"],
+            listwise_num_responses=3,
+            listwise_min_responses=2,
+        )
+        triplets = _maybe_convert_to_listwise(DatasetDict({"train": preformatted}), triplet_args)["train"]
+        self.assertEqual(len(triplets), 4)
+        self.assertEqual({len(responses) for responses in triplets["responses"]}, {3})
+
+        full_args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="listwise",
+            preference_dimensions=["instruction_following"],
+            listwise_num_responses=4,
+            listwise_min_responses=2,
+        )
+        full = _maybe_convert_to_listwise(DatasetDict({"train": preformatted}), full_args)["train"]
+        self.assertEqual(len(full), 1)
+        self.assertEqual(full[0]["responses"], ["A", "B", "C", "D"])
+
+    def test_grouped_downsampling_keeps_source_index_rows_together(self):
+        rows = []
+        for source_index in range(10):
+            for dimension in ("instruction_following", "helpfulness"):
+                rows.append(
+                    {
+                        "prompt": f"p{source_index}",
+                        "responses": ["A", "B", "C", "D"],
+                        "scores": [4.0, 3.0, 2.0, 1.0],
+                        "preference_dimension": dimension,
+                        "source_index": source_index,
+                    }
+                )
+
+        args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_downsample_ratio=0.5,
+            dataset_downsample_seed=13,
+        )
+        downsampled = _maybe_downsample_dataset_dict(DatasetDict({"train": Dataset.from_list(rows)}), args)["train"]
+
+        self.assertEqual(len(downsampled), 10)
+        counts = {}
+        for source_index in downsampled["source_index"]:
+            counts[source_index] = counts.get(source_index, 0) + 1
+        self.assertEqual(len(counts), 5)
+        self.assertEqual(set(counts.values()), {2})
+
+    def test_downsampling_applies_to_train_validation_and_test_deterministically(self):
+        dataset_dict = DatasetDict(
+            {
+                split: Dataset.from_list([{"prompt": f"{split}-{idx}", "completion": f"c{idx}"} for idx in range(10)])
+                for split in ("train", "validation", "test")
+            }
+        )
+        args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_downsample_ratio=0.5,
+            dataset_downsample_seed=7,
+        )
+
+        first = _maybe_downsample_dataset_dict(dataset_dict, args)
+        second = _maybe_downsample_dataset_dict(dataset_dict, args)
+
+        self.assertEqual({split: len(first[split]) for split in first}, {"train": 5, "validation": 5, "test": 5})
+        self.assertEqual(first["train"]["prompt"], second["train"]["prompt"])
+        self.assertEqual(first["validation"]["prompt"], second["validation"]["prompt"])
+        self.assertEqual(first["test"]["prompt"], second["test"]["prompt"])
+
+    def test_downsampling_uses_row_fallback_without_group_key(self):
+        dataset_dict = DatasetDict(
+            {
+                "train": Dataset.from_list(
+                    [{"prompt": f"p{idx}", "completion": f"c{idx}"} for idx in range(10)]
+                )
+            }
+        )
+        args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_downsample_ratio=0.3,
+            dataset_downsample_seed=5,
+        )
+
+        downsampled = _maybe_downsample_dataset_dict(dataset_dict, args)
+        self.assertEqual(len(downsampled["train"]), 3)
 
     def test_listwise_multiple_dimensions_non_cyclic(self):
         data = Dataset.from_list(

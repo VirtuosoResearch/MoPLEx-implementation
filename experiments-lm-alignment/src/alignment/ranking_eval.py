@@ -182,6 +182,41 @@ def _cluster_alignment(true_labels: list[int], pred_labels: list[int], num_clust
     return ClusterAlignment(true_to_pred=true_to_pred, pred_to_true=pred_to_true)
 
 
+def _cluster_metrics_by_dimension(
+    true_labels: list[int],
+    pred_labels: list[int],
+    dimensions: list[str],
+    alignment: ClusterAlignment,
+    *,
+    prefix: str = "mixture/by_dimension",
+) -> dict[str, float]:
+    if not true_labels or not pred_labels or not dimensions:
+        return {}
+
+    metrics: dict[str, float] = {}
+    dim_to_indices: dict[str, list[int]] = defaultdict(list)
+    for idx, dimension in enumerate(dimensions[: len(true_labels)]):
+        dim_to_indices[str(dimension)].append(idx)
+
+    for dimension, indices in sorted(dim_to_indices.items()):
+        raw_correct = 0
+        aligned_correct = 0
+        for idx in indices:
+            true_label = true_labels[idx]
+            pred_label = pred_labels[idx]
+            aligned_label = alignment.pred_to_true.get(pred_label, pred_label)
+            raw_correct += int(pred_label == true_label)
+            aligned_correct += int(aligned_label == true_label)
+
+        dim_key = _metric_dimension_key(dimension)
+        denom = max(len(indices), 1)
+        metrics[f"{prefix}/{dim_key}/num_examples"] = float(len(indices))
+        metrics[f"{prefix}/{dim_key}/cluster_acc"] = aligned_correct / denom
+        metrics[f"{prefix}/{dim_key}/cluster_acc_raw"] = raw_correct / denom
+
+    return metrics
+
+
 def _comb2(value: int) -> float:
     return value * (value - 1) / 2.0
 
@@ -279,6 +314,7 @@ def evaluate_ranking_split(
 
     true_labels: list[int] = []
     posterior_pred_labels: list[int] = []
+    dimension_labels: list[str] = []
     gamma_entropy_sum = 0.0
     gamma_count = 0
     mixture_nll_sum = 0.0
@@ -318,6 +354,7 @@ def evaluate_ranking_split(
 
             true_labels.extend(int(label) for label in true_cluster.detach().cpu().tolist())
             posterior_pred_labels.extend(int(label) for label in posterior_pred.detach().cpu().tolist())
+            dimension_labels.extend(dimensions)
             gamma_entropy = -(gamma * torch.log(gamma.clamp_min(1e-12))).sum(dim=1)
             gamma_entropy_sum += float(gamma_entropy.sum().detach().cpu().item())
             gamma_count += int(gamma_entropy.numel())
@@ -343,6 +380,7 @@ def evaluate_ranking_split(
     cluster_state = {
         "true_labels": true_labels,
         "posterior_pred_labels": posterior_pred_labels,
+        "dimension_labels": dimension_labels,
     }
     if collect_only_cluster_state:
         return {}, cluster_state
@@ -375,6 +413,7 @@ def evaluate_ranking_split(
                 len(posterior_pred_labels),
                 1,
             )
+        metrics.update(_cluster_metrics_by_dimension(true_labels, posterior_pred_labels, dimension_labels, alignment))
 
     return metrics, cluster_state
 

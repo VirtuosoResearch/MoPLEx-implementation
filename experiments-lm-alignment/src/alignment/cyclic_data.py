@@ -36,6 +36,15 @@ class DisagreementFilterStats:
     disagreement_rows: int = 0
 
 
+@dataclass
+class PatternFilterStats:
+    total_rows: int = 0
+    eligible_rows: int = 0
+    valid_score_rows: int = 0
+    tie_limited_rows: int = 0
+    pattern_match_rows: int = 0
+
+
 def _to_float(value: Any) -> float | None:
     if value is None:
         return None
@@ -133,6 +142,43 @@ def _validate_dimensions(dimensions: tuple[str, ...]) -> tuple[str, ...]:
     if invalid:
         raise ValueError(f"Unknown dimensions: {invalid}. Valid values: {list(DIMENSIONS)}")
     return dimensions
+
+
+def _validate_dimension_pair(dimensions: tuple[str, ...]) -> tuple[str, str]:
+    validated = _validate_dimensions(dimensions)
+    if len(validated) != 2:
+        raise ValueError("`dimension_pair` must contain exactly 2 dimensions.")
+    return validated[0], validated[1]
+
+
+def parse_rank_pattern(pattern: str) -> tuple[int, int, int, int]:
+    labels = {"A": 0, "B": 1, "C": 2, "D": 3}
+    pattern = pattern.strip().upper()
+    if not pattern:
+        raise ValueError("Ranking pattern must not be empty.")
+
+    if ">" in pattern:
+        parts = [part.strip() for part in pattern.split(">")]
+    elif "," in pattern:
+        parts = [part.strip() for part in pattern.split(",")]
+    else:
+        parts = list(pattern)
+
+    if len(parts) != 4:
+        raise ValueError("Ranking pattern must contain exactly A, B, C, and D.")
+    if any(part not in labels for part in parts):
+        raise ValueError("Ranking pattern may only contain labels A, B, C, and D.")
+    if len(set(parts)) != 4:
+        raise ValueError("Ranking pattern must not contain duplicate labels.")
+
+    return tuple(labels[part] for part in parts)
+
+
+def format_rank_pattern(order: tuple[int, int, int, int]) -> str:
+    index_to_label = ("A", "B", "C", "D")
+    if sorted(order) != [0, 1, 2, 3]:
+        raise ValueError("Ranking order must be a permutation of 0, 1, 2, and 3.")
+    return ">".join(index_to_label[idx] for idx in order)
 
 
 def _infer_shift(base_order: tuple[int, int, int, int], dim_order: tuple[int, int, int, int]) -> int | None:
@@ -306,6 +352,36 @@ def has_ranking_disagreement(
 
 def _score_desc_order(scores: list[float]) -> tuple[int, int, int, int]:
     return tuple(sorted(range(4), key=lambda idx: (-scores[idx], idx)))
+
+
+def _validate_rank_patterns(
+    patterns: tuple[str | tuple[int, int, int, int], ...],
+) -> tuple[tuple[int, int, int, int], tuple[int, int, int, int]]:
+    if len(patterns) != 2:
+        raise ValueError("`rank_patterns` must contain exactly 2 patterns.")
+
+    parsed_patterns: list[tuple[int, int, int, int]] = []
+    for pattern in patterns:
+        if isinstance(pattern, str):
+            parsed = parse_rank_pattern(pattern)
+        else:
+            parsed = tuple(pattern)
+            if sorted(parsed) != [0, 1, 2, 3]:
+                raise ValueError("Each rank pattern must be a permutation of 0, 1, 2, and 3.")
+        parsed_patterns.append(parsed)
+
+    return parsed_patterns[0], parsed_patterns[1]
+
+
+def _matches_resolved_pattern(
+    scores_by_dimension: dict[str, list[float]],
+    dimension_pair: tuple[str, str],
+    rank_patterns: tuple[tuple[int, int, int, int], tuple[int, int, int, int]],
+) -> bool:
+    return all(
+        _score_desc_order(scores_by_dimension[dimension]) == pattern
+        for dimension, pattern in zip(dimension_pair, rank_patterns)
+    )
 
 
 def _extract_response_text(completion: Any, response_text_key: str) -> str | None:
@@ -538,6 +614,108 @@ def build_disagreement_rows(
                     }
                 )
             stats.disagreement_rows += 1
+            break
+
+    return rows, stats
+
+
+def build_pattern_rows(
+    dataset: Dataset,
+    *,
+    prompt_column: str = "instruction",
+    responses_column: str = "completions",
+    response_text_key: str = "response",
+    scores_key: str = "scores",
+    annotations_key: str = "annotations",
+    dimension_pair: tuple[str, str] = ("instruction_following", "helpfulness"),
+    rank_patterns: tuple[str | tuple[int, int, int, int], str | tuple[int, int, int, int]] = ("ABCD", "BADC"),
+    seed: int = 0,
+    max_source_rows: int | None = None,
+    max_examples: int | None = None,
+    max_ties_per_dimension: int | None = 1,
+) -> tuple[list[dict[str, Any]], PatternFilterStats]:
+    dimensions = _validate_dimension_pair(tuple(dimension_pair))
+    patterns = _validate_rank_patterns(tuple(rank_patterns))
+    if max_ties_per_dimension is not None and max_ties_per_dimension < 0:
+        raise ValueError("`max_ties_per_dimension` must be non-negative when provided.")
+
+    rng = random.Random(seed)
+    rows: list[dict[str, Any]] = []
+    stats = PatternFilterStats()
+
+    for row_idx, row in enumerate(dataset):
+        if max_source_rows is not None and stats.total_rows >= max_source_rows:
+            break
+        if max_examples is not None and stats.pattern_match_rows >= max_examples:
+            break
+
+        stats.total_rows += 1
+
+        prompt_raw = row.get(prompt_column)
+        prompt = _as_text(prompt_raw).strip()
+        if not prompt:
+            continue
+
+        completions = row.get(responses_column)
+        if not isinstance(completions, list) or len(completions) < 4:
+            continue
+        stats.eligible_rows += 1
+
+        for candidate_indices in _iter_four_candidate_groups(len(completions), rng):
+            selected = [completions[idx] for idx in candidate_indices]
+
+            responses: list[str] = []
+            scores_by_dimension: dict[str, list[float]] = {dim: [] for dim in dimensions}
+            valid = True
+
+            for completion in selected:
+                text = _extract_response_text(completion, response_text_key)
+                if text is None:
+                    valid = False
+                    break
+                responses.append(text)
+
+                if not isinstance(completion, dict):
+                    valid = False
+                    break
+                for dimension in dimensions:
+                    score = _extract_dimension_score(
+                        completion,
+                        dimension=dimension,
+                        scores_key=scores_key,
+                        annotations_key=annotations_key,
+                    )
+                    if score is None:
+                        valid = False
+                        break
+                    scores_by_dimension[dimension].append(score)
+                if not valid:
+                    break
+
+            if not valid:
+                continue
+
+            stats.valid_score_rows += 1
+            if not _passes_tie_limit(scores_by_dimension, dimensions, max_ties_per_dimension):
+                continue
+            stats.tie_limited_rows += 1
+
+            if not _matches_resolved_pattern(scores_by_dimension, dimensions, patterns):
+                continue
+
+            for dimension, pattern in zip(dimensions, patterns):
+                ordered_responses = [responses[idx] for idx in pattern]
+                ordered_scores = [scores_by_dimension[dimension][idx] for idx in pattern]
+                rows.append(
+                    {
+                        "prompt": prompt,
+                        "responses": ordered_responses,
+                        "scores": ordered_scores,
+                        "preference_dimension": dimension,
+                        "source_index": int(row_idx),
+                    }
+                )
+            stats.pattern_match_rows += 1
             break
 
     return rows, stats
