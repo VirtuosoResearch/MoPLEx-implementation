@@ -369,10 +369,29 @@ class MixturePLConfig(DPOConfig):
                 raise ValueError("`router_hidden_size` must be >= 1")
 
 
-@dataclass
-class ORPOConfig(trl.ORPOConfig):
-    """
-    args for callbacks, benchmarks etc
-    """
+if hasattr(trl, "ORPOConfig"):
 
-    chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    @dataclass
+    class ORPOConfig(trl.ORPOConfig):
+        """
+        args for callbacks, benchmarks etc
+        """
+
+        chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+else:
+
+    @dataclass
+    class ORPOConfig:
+        """
+        Placeholder for environments where TRL no longer exposes ORPOConfig.
+        Allows importing non-ORPO workflows while providing a clear runtime error
+        if ORPO is selected.
+        """
+
+        chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+
+        def __post_init__(self):
+            raise RuntimeError(
+                "`trl.ORPOConfig` is not available in the installed TRL version. "
+                "Install a compatible TRL release (e.g. `trl<1.0`) to run ORPO."
+            )

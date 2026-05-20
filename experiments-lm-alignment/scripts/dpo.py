@@ -76,6 +76,18 @@ from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
 logger = logging.getLogger(__name__)
 
 
+def cast_trainable_bf16_params_to_fp32(module: torch.nn.Module) -> int:
+    """Avoid fp16 GradScaler failures on trainable bf16 parameters."""
+    converted = 0
+    for param in module.parameters():
+        if param.requires_grad and param.dtype == torch.bfloat16:
+            param.data = param.data.float()
+            if param.grad is not None:
+                param.grad.data = param.grad.data.float()
+            converted += 1
+    return converted
+
+
 class RankingEvaluationCallback(TrainerCallback):
     """Log full ranking metrics on the configured evaluation split during Trainer.evaluate()."""
 
@@ -216,6 +228,10 @@ def main(script_args, training_args, model_args):
         trainer_kwargs["listwise_beta"] = training_args.listwise_beta
 
     trainer = trainer_cls(**trainer_kwargs)
+    if getattr(training_args, "fp16", False):
+        converted = cast_trainable_bf16_params_to_fp32(trainer.model)
+        if converted:
+            logger.info("Cast %d trainable bf16 parameters to fp32 for fp16 GradScaler compatibility.", converted)
     if (
         ranking_dataset is not None
         and script_args.ranking_eval_during_training

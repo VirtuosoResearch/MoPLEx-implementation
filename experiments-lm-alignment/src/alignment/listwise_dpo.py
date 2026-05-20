@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import inspect
 import math
 import os
 import re
@@ -38,6 +39,12 @@ from .mixture_pl_components import (
     MixturePLHead,
     MixtureRouterHead,
 )
+
+
+def _peft_bf16_autocast_context(trainer) -> Any:
+    if getattr(trainer, "_peft_has_been_casted_to_bf16", False):
+        return torch.autocast(trainer.accelerator.device.type)
+    return nullcontext()
 
 
 @dataclass
@@ -161,6 +168,30 @@ class ListwiseDPOTrainer(DPOTrainer):
                 max_prompt_length=max_prompt_length,
             )
         super().__init__(*args, **kwargs)
+        self._stored_metrics = {"train": {}, "eval": {}}
+
+    def store_metrics(self, metrics: Dict[str, float], train_eval: Literal["train", "eval"] = "train") -> None:
+        if not hasattr(self, "_stored_metrics"):
+            self._stored_metrics = {"train": {}, "eval": {}}
+        bucket = self._stored_metrics.setdefault(train_eval, {})
+        for key, value in metrics.items():
+            bucket.setdefault(key, []).append(value)
+
+    def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
+        train_eval = "eval" if any(key.startswith("eval_") for key in logs) else "train"
+        stored = getattr(self, "_stored_metrics", {}).get(train_eval, {})
+        prefix = "eval_" if train_eval == "eval" else ""
+        for key, values in stored.items():
+            if not values:
+                continue
+            metric_key = key if key.startswith(prefix) else f"{prefix}{key}"
+            logs[metric_key] = torch.tensor(values, dtype=torch.float32).mean().item()
+        if hasattr(self, "_stored_metrics"):
+            self._stored_metrics[train_eval] = {}
+        try:
+            return super().log(logs, start_time=start_time)
+        except TypeError:
+            return super().log(logs)
 
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
@@ -198,7 +229,7 @@ class ListwiseDPOTrainer(DPOTrainer):
                 map_kwargs["desc"] = f"Applying chat template to {dataset_name} dataset"
             dataset = dataset.map(
                 maybe_apply_chat_template,
-                fn_kwargs={"tokenizer": processing_class, "tools": args.tools},
+                fn_kwargs={"tokenizer": processing_class, "tools": getattr(args, "tools", None)},
                 **map_kwargs,
             )
 
@@ -340,7 +371,7 @@ class ListwiseDPOTrainer(DPOTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         del kwargs
         compute_loss_context_manager = (
-            torch.autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+            _peft_bf16_autocast_context(self)
         )
         with compute_loss_context_manager:
             loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="train")
@@ -362,7 +393,7 @@ class ListwiseDPOTrainer(DPOTrainer):
     ):
         del ignore_keys
         prediction_context_manager = (
-            torch.autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+            _peft_bf16_autocast_context(self)
         )
         with torch.no_grad(), prediction_context_manager:
             loss, metrics = self.get_batch_loss_metrics(model, inputs, train_eval="eval")
@@ -416,7 +447,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         if tokenizer is not None and kwargs.get("processing_class") is None:
             kwargs["processing_class"] = tokenizer
 
-        super().__init__(
+        dpo_init_kwargs = dict(
             model=model,
             ref_model=ref_model,
             args=args,
@@ -429,6 +460,9 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             peft_config=peft_config,
             **kwargs,
         )
+        supported_init_args = set(inspect.signature(DPOTrainer.__init__).parameters)
+        dpo_init_kwargs = {key: value for key, value in dpo_init_kwargs.items() if key in supported_init_args}
+        super().__init__(**dpo_init_kwargs)
 
         self.mixture_config = mixture_config
         if mixture_config is None or not mixture_config.use_mixture:
@@ -965,7 +999,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         """Override to add mixture loss to DPO loss."""
         del kwargs
         compute_loss_context_manager = (
-            torch.autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+            _peft_bf16_autocast_context(self)
         )
         with compute_loss_context_manager:
             loss, metrics, _ = self.get_batch_loss_metrics_with_mixture(model, inputs, train_eval="train")
@@ -988,7 +1022,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         """Override to include mixture metrics in evaluation."""
         del ignore_keys
         prediction_context_manager = (
-            torch.autocast(self.accelerator.device.type) if self._peft_has_been_casted_to_bf16 else nullcontext()
+            _peft_bf16_autocast_context(self)
         )
         with torch.no_grad(), prediction_context_manager:
             loss, metrics, _ = self.get_batch_loss_metrics_with_mixture(model, inputs, train_eval="eval")
@@ -1179,11 +1213,7 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                         inputs,
                         gamma=gamma,
                     )
-                    metric_context_manager = (
-                        torch.autocast(self.accelerator.device.type)
-                        if self._peft_has_been_casted_to_bf16
-                        else nullcontext()
-                    )
+                    metric_context_manager = (_peft_bf16_autocast_context(self))
                     with torch.no_grad(), metric_context_manager:
                         if self.mixture_reward_backend == "lora":
                             self._set_active_adapter(self.policy_adapter_name)

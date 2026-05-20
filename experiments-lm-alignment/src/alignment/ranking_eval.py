@@ -249,18 +249,18 @@ def evaluate_ranking_split(
 ) -> tuple[dict[str, float], dict[str, Any]]:
     collator = ListwiseDPODataCollator(
         tokenizer=tokenizer,
-        max_length=training_args.max_length,
-        max_prompt_length=training_args.max_prompt_length,
+        max_length=getattr(training_args, "max_length", 1024),
+        max_prompt_length=getattr(training_args, "max_prompt_length", 512),
     )
     dataloader = DataLoader(
         split_dataset,
-        batch_size=training_args.per_device_eval_batch_size,
+        batch_size=getattr(training_args, "per_device_eval_batch_size", 8),
         shuffle=False,
         collate_fn=collator,
     )
 
     device = trainer.args.device
-    beta = getattr(trainer, "listwise_beta_override", None) or trainer.args.beta
+    beta = getattr(trainer, "listwise_beta_override", None) or getattr(trainer.args, "beta", 0.1)
     policy_acc = RankingMetricAccumulator()
     posterior_acc = RankingMetricAccumulator()
     aligned_acc = RankingMetricAccumulator()
