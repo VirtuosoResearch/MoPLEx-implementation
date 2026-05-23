@@ -1,10 +1,12 @@
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union, Tuple
 from pathlib import Path
+from collections import defaultdict
 from accelerate import Accelerator
 import evaluate
 import numpy as np
 import os
+from scipy.optimize import linear_sum_assignment
 import torch
 import torch.nn as nn
 from datasets import load_dataset, concatenate_datasets, Dataset, load_from_disk
@@ -189,6 +191,63 @@ def resolve_local_dataset_dir(dataset_name: str) -> str:
         f"Could not find local dataset directory for '{dataset_name}'. Tried: "
         + ", ".join(str(path) for path in candidates)
     )
+
+
+def resolve_dataset_path(data_path: str) -> str:
+    path_obj = Path(data_path)
+    if path_obj.exists():
+        return str(path_obj)
+    return resolve_local_dataset_dir(data_path)
+
+
+def parse_data_paths(raw_data_path: str) -> List[str]:
+    raw = str(raw_data_path).strip()
+    if not raw:
+        return []
+    if Path(raw).exists() or "/" in raw:
+        return [raw]
+    if "," in raw:
+        return [part.strip() for part in raw.split(",") if part.strip()]
+    return [raw]
+
+
+def listwise_to_pairwise_dataset(ds: Dataset) -> Dataset:
+    rows = []
+    for example in ds:
+        prompt = str(example.get("prompt", "")).strip()
+        responses = example.get("responses")
+        scores = example.get("scores")
+        if not prompt or not isinstance(responses, list) or not isinstance(scores, list):
+            continue
+        n = min(len(responses), len(scores))
+        if n < 2:
+            continue
+        ranked = sorted(
+            [(str(responses[i]), float(scores[i])) for i in range(n)],
+            key=lambda x: x[1],
+            reverse=True,
+        )
+        attribute = CYCLIC_ULTRAFEEDBACK_ATTRIBUTE_ALIASES.get(
+            str(example.get("preference_dimension", "")),
+            str(example.get("preference_dimension", "")),
+        )
+        for i in range(n - 1):
+            for j in range(i + 1, n):
+                chosen, chosen_score = ranked[i]
+                rejected, rejected_score = ranked[j]
+                rows.append(
+                    {
+                        "prompt": prompt,
+                        "chosen": chosen,
+                        "rejected": rejected,
+                        "attribute": attribute,
+                        "chosen_rating": chosen_score,
+                        "rejected_rating": rejected_score,
+                    }
+                )
+    if not rows:
+        raise ValueError("No pairwise rows converted from listwise dataset.")
+    return Dataset.from_list(rows)
 
 
 def load_cyclic_ultrafeedback_pairwise_split(split: str) -> Dataset:
@@ -512,9 +571,10 @@ if 'Llama' in model_name:
 else:
     tokenizer.pad_token = tokenizer.eos_token
 
-data_paths = data_path.split('-')
+data_paths = parse_data_paths(data_path)
 train_datasets = []
 eval_datasets = []
+ranking_eval_listwise = None
 
 for data_path in data_paths:
     if 'helpsteer2_per_attribute_pairwise_augmented' in data_path:
@@ -534,6 +594,24 @@ for data_path in data_paths:
         dataset = build_dataset_helpsteer(dataset, tokenizer)
         dataset_split = dataset.train_test_split(test_size=0.01)
         train_dataset, eval_dataset = dataset_split['train'], dataset_split['test']
+    elif 'ultrafeedback_disagreement' in data_path:
+        ds_path = resolve_dataset_path(data_path)
+        dataset_dict = load_from_disk(ds_path)
+        if "train" not in dataset_dict:
+            raise ValueError(f"ultrafeedback_disagreement dataset at {ds_path} must contain 'train' split.")
+        eval_split = "validation" if "validation" in dataset_dict else "test"
+        if eval_split not in dataset_dict:
+            raise ValueError(f"ultrafeedback_disagreement dataset at {ds_path} must contain validation or test split.")
+        ranking_eval_listwise = dataset_dict[eval_split]
+        train_dataset = listwise_to_pairwise_dataset(dataset_dict["train"])
+        eval_dataset = listwise_to_pairwise_dataset(dataset_dict[eval_split])
+        train_dataset = build_dataset_helpsteer(train_dataset, tokenizer)
+        eval_dataset = build_dataset_helpsteer(eval_dataset, tokenizer)
+        if accelerator.is_main_process:
+            print(
+                "Loaded ultrafeedback_disagreement listwise dataset: "
+                f"train={len(dataset_dict['train'])}, eval_split={eval_split}, eval={len(dataset_dict[eval_split])}"
+            )
     elif 'cyclic_ultrafeedback_all_pairs' in data_path:
         train_dataset = load_cyclic_ultrafeedback_pairwise_split('train')
         eval_split = 'validation'
@@ -750,6 +828,187 @@ def compute_metrics(eval_pred):
             metric_key = attr_name.replace("-", "_")
             metrics[f"accuracy_{metric_key}"] = float(attr_acc)
             metrics[f"count_{metric_key}"] = int(attr_mask.sum())
+    return metrics
+
+
+def hungarian_cluster_alignment(
+    pred_clusters: np.ndarray,
+    true_clusters: np.ndarray,
+    num_heads: int,
+) -> Dict[int, int]:
+    if pred_clusters.size == 0 or true_clusters.size == 0:
+        return {}
+
+    max_cluster_id = int(max(pred_clusters.max(initial=0), true_clusters.max(initial=0), num_heads - 1))
+    num_clusters = max_cluster_id + 1
+    confusion = np.zeros((num_clusters, num_clusters), dtype=np.int64)
+    for true_cluster, pred_cluster in zip(true_clusters, pred_clusters):
+        if true_cluster < 0 or pred_cluster < 0:
+            continue
+        confusion[int(true_cluster), int(pred_cluster)] += 1
+
+    row_ind, col_ind = linear_sum_assignment(-confusion)
+    return {int(pred_idx): int(true_idx) for true_idx, pred_idx in zip(row_ind, col_ind)}
+
+
+def evaluate_posterior_head_ranking(
+    model: nn.Module,
+    tokenizer: AutoTokenizer,
+    listwise_dataset: Optional[Dataset],
+    device: str,
+) -> Dict[str, float]:
+    if listwise_dataset is None:
+        return {}
+    if script_args.loss_type not in ['mixture_reward', 'mixture_BT'] or script_args.num_heads is None or script_args.num_heads <= 1:
+        return {}
+
+    model.eval()
+    pairwise_correct_total = 0
+    pairwise_total = 0
+    top1_correct = 0
+    sample_count = 0
+
+    dim_pairwise_correct = defaultdict(int)
+    dim_pairwise_total = defaultdict(int)
+    dim_top1_correct = defaultdict(int)
+    dim_count = defaultdict(int)
+
+    pred_clusters = []
+    true_clusters = []
+    dimension_labels = []
+    dim_to_true_cluster = {}
+
+    with torch.no_grad():
+        for row in listwise_dataset:
+            prompt = str(row.get("prompt", "")).strip()
+            responses = row.get("responses")
+            scores = row.get("scores")
+            dimension = str(row.get("preference_dimension", "unknown"))
+            if not prompt or not isinstance(responses, list) or not isinstance(scores, list):
+                continue
+            n = min(len(responses), len(scores))
+            if n < 2:
+                continue
+
+            ranked = sorted(
+                [(str(responses[i]), float(scores[i])) for i in range(n)],
+                key=lambda x: x[1],
+                reverse=True,
+            )
+            ranked_responses = [resp for resp, _ in ranked]
+
+            model_inputs = []
+            for response in ranked_responses:
+                messages = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": response},
+                ]
+                text = tokenizer.apply_chat_template(messages, tokenize=False)
+                tok = tokenizer(text, return_tensors="pt")
+                model_inputs.append(
+                    {
+                        "input_ids": tok["input_ids"][0],
+                        "attention_mask": tok["attention_mask"][0],
+                    }
+                )
+
+            batch = tokenizer.pad(model_inputs, return_tensors="pt")
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            logits = model(input_ids=input_ids, attention_mask=attention_mask).logits
+            if logits.ndim == 1:
+                logits = logits.unsqueeze(-1)
+            if logits.shape[-1] <= 1:
+                continue
+
+            rewards = logits.float()
+            num_candidates, num_heads = rewards.shape
+
+            comp_logp = []
+            for head_idx in range(num_heads):
+                u = rewards[:, head_idx]
+                ll = torch.tensor(0.0, device=u.device)
+                for pos in range(num_candidates - 1):
+                    ll = ll + (u[pos] - torch.logsumexp(u[pos:], dim=0))
+                comp_logp.append(ll)
+            comp_logp = torch.stack(comp_logp, dim=0)
+            posterior = torch.softmax(comp_logp, dim=0)
+            selected_head = int(torch.argmax(posterior).item())
+            selected_scores = rewards[:, selected_head]
+
+            pred_top = int(torch.argmax(selected_scores).item())
+            top1_ok = int(pred_top == 0)
+
+            row_pairwise_total = 0
+            row_pairwise_correct = 0
+            for i in range(num_candidates - 1):
+                for j in range(i + 1, num_candidates):
+                    row_pairwise_total += 1
+                    if selected_scores[i] > selected_scores[j]:
+                        row_pairwise_correct += 1
+
+            sample_count += 1
+            top1_correct += top1_ok
+            pairwise_total += row_pairwise_total
+            pairwise_correct_total += row_pairwise_correct
+
+            dim_count[dimension] += 1
+            dim_top1_correct[dimension] += top1_ok
+            dim_pairwise_total[dimension] += row_pairwise_total
+            dim_pairwise_correct[dimension] += row_pairwise_correct
+
+            pred_clusters.append(selected_head)
+            if dimension not in dim_to_true_cluster:
+                dim_to_true_cluster[dimension] = len(dim_to_true_cluster)
+            true_clusters.append(dim_to_true_cluster[dimension])
+            dimension_labels.append(dimension)
+
+    if sample_count == 0:
+        return {}
+
+    metrics = {
+        "cluster_posterior/num_examples": float(sample_count),
+        "cluster_posterior/pairwise_acc": pairwise_correct_total / max(pairwise_total, 1),
+        "cluster_posterior/top1_acc": top1_correct / max(sample_count, 1),
+    }
+
+    pred_clusters_np = np.array(pred_clusters, dtype=np.int64)
+    true_clusters_np = np.array(true_clusters, dtype=np.int64)
+    pred_to_true = hungarian_cluster_alignment(
+        pred_clusters_np,
+        true_clusters_np,
+        int(script_args.num_heads),
+    )
+    aligned_pred_clusters_np = np.array(
+        [pred_to_true.get(int(pred), int(pred)) for pred in pred_clusters_np],
+        dtype=np.int64,
+    )
+    metrics["cluster_posterior/cluster_acc_raw"] = float((pred_clusters_np == true_clusters_np).mean())
+    metrics["cluster_posterior/cluster_acc"] = float((aligned_pred_clusters_np == true_clusters_np).mean())
+
+    for dim_name in sorted(dim_count.keys()):
+        dim_key = dim_name.replace("-", "_")
+        metrics[f"cluster_posterior/by_dimension/{dim_key}/num_examples"] = float(dim_count[dim_name])
+        metrics[f"cluster_posterior/by_dimension/{dim_key}/top1_acc"] = dim_top1_correct[dim_name] / max(
+            dim_count[dim_name],
+            1,
+        )
+        metrics[f"cluster_posterior/by_dimension/{dim_key}/pairwise_acc"] = dim_pairwise_correct[dim_name] / max(
+            dim_pairwise_total[dim_name],
+            1,
+        )
+
+    dim_to_indices = defaultdict(list)
+    for idx, dim_name in enumerate(dimension_labels):
+        dim_to_indices[dim_name].append(idx)
+    for dim_name, indices in sorted(dim_to_indices.items()):
+        dim_key = dim_name.replace("-", "_")
+        dim_pred = pred_clusters_np[indices]
+        dim_true = true_clusters_np[indices]
+        dim_aligned_pred = aligned_pred_clusters_np[indices]
+        metrics[f"cluster_posterior/by_dimension/{dim_key}/cluster_acc_raw"] = float((dim_pred == dim_true).mean())
+        metrics[f"cluster_posterior/by_dimension/{dim_key}/cluster_acc"] = float((dim_aligned_pred == dim_true).mean())
+
     return metrics
 
 
@@ -1002,6 +1261,14 @@ print_trainable_parameters(trainer.model)
 if script_args.eval_only:
     print("eval_only mode: evaluating checkpoint")
     eval_metrics = trainer.evaluate()
+    posterior_metrics = evaluate_posterior_head_ranking(
+        model=trainer.model,
+        tokenizer=tokenizer,
+        listwise_dataset=ranking_eval_listwise,
+        device=device,
+    )
+    if posterior_metrics:
+        eval_metrics.update(posterior_metrics)
     trainer.log_metrics("eval_only", eval_metrics)
     trainer.save_metrics("eval_only", eval_metrics)
 else:
@@ -1011,6 +1278,14 @@ else:
     # Run one final evaluation after full training regardless of eval_steps scheduling.
     print("final evaluating")
     final_eval_metrics = trainer.evaluate()
+    posterior_metrics = evaluate_posterior_head_ranking(
+        model=trainer.model,
+        tokenizer=tokenizer,
+        listwise_dataset=ranking_eval_listwise,
+        device=device,
+    )
+    if posterior_metrics:
+        final_eval_metrics.update(posterior_metrics)
     trainer.log_metrics("eval_final", final_eval_metrics)
     trainer.save_metrics("eval_final", final_eval_metrics)
 

@@ -209,6 +209,27 @@ class ScriptArguments(trl.ScriptArguments):
             )
         },
     )
+    eval_only_ranking: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, skip training and run ranking evaluation only using a loaded checkpoint/model."
+            )
+        },
+    )
+    eval_checkpoint_path: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Optional checkpoint path to load before eval_only_ranking. "
+                "Accepts Trainer checkpoint-* directory or final saved model directory."
+            )
+        },
+    )
+    eval_ranking_split: str = field(
+        default="test",
+        metadata={"help": "Ranking split to evaluate in eval_only_ranking mode. Choices: train/validation/test."},
+    )
 
     def __post_init__(self):
         if self.dataset_name is None and self.dataset_mixture is None:
@@ -456,10 +477,29 @@ class MixturePLConfig(DPOConfig):
                 raise ValueError("Only `linear_approx_gradient_mode='stop_gradient'` is currently supported")
 
 
-@dataclass
-class ORPOConfig(trl.ORPOConfig):
-    """
-    args for callbacks, benchmarks etc
-    """
+if hasattr(trl, "ORPOConfig"):
 
-    chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+    @dataclass
+    class ORPOConfig(trl.ORPOConfig):
+        """
+        args for callbacks, benchmarks etc
+        """
+
+        chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+else:
+
+    @dataclass
+    class ORPOConfig:
+        """
+        Placeholder for environments where TRL no longer exposes ORPOConfig.
+        Allows importing non-ORPO workflows while providing a clear runtime error
+        if ORPO is selected.
+        """
+
+        chat_template: Optional[str] = field(default=None, metadata={"help": "The chat template to use."})
+
+        def __post_init__(self):
+            raise RuntimeError(
+                "`trl.ORPOConfig` is not available in the installed TRL version. "
+                "Install a compatible TRL release (e.g. `trl<1.0`) to run ORPO."
+            )
