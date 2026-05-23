@@ -70,7 +70,12 @@ from alignment import (
     get_model,
     get_tokenizer,
 )
-from alignment.ranking_eval import _dimension_mapping, evaluate_ranking_split, evaluate_ranking_splits
+from alignment.ranking_eval import (
+    _dimension_mapping,
+    compute_validation_cluster_alignment,
+    evaluate_ranking_split,
+    evaluate_ranking_splits,
+)
 from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
 
 
@@ -140,10 +145,14 @@ def main(script_args, training_args, model_args):
     transformers.utils.logging.set_verbosity(log_level)
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
+    # Suppress noisy BPE-boundary tokenization mismatch warning from TRL DPO trainer.
+    # This is a known tokenizer boundary effect with plain-text prompt/chosen/rejected fields
+    # and does not affect the correctness of training.
+    logging.getLogger("trl.trainer.dpo_trainer").setLevel(logging.ERROR)
 
-    logger.info(f"Model parameters {model_args}")
-    logger.info(f"Script parameters {script_args}")
-    logger.info(f"Training parameters {training_args}")
+    # logger.info(f"Model parameters {model_args}")
+    # logger.info(f"Script parameters {script_args}")
+    # logger.info(f"Training parameters {training_args}")
 
     # Check for last checkpoint
     last_checkpoint = None
@@ -179,10 +188,10 @@ def main(script_args, training_args, model_args):
             logger.info(f"Loaded {len(ranking_dataset[split])} ranking examples from the '{split}' split.")
     
     # print a few examples from the dataset for sanity check
-    for split in dataset:
-        logger.info(f"Sample examples from the '{split}' split:")
-        for i in range(min(12, len(dataset[split]))):
-            logger.info(dataset[split][i])
+    # for split in dataset:
+    #     logger.info(f"Sample examples from the '{split}' split:")
+    #     for i in range(min(12, len(dataset[split]))):
+    #         logger.info(dataset[split][i])
     
     for split in dataset:
         if "messages" in dataset[split].column_names:
@@ -251,6 +260,39 @@ def main(script_args, training_args, model_args):
         )
         ranking_callback.trainer = trainer
         trainer.add_callback(ranking_callback)
+
+    if script_args.eval_only_ranking:
+        if ranking_dataset is None:
+            raise ValueError("`eval_only_ranking=True` requires `run_ranking_eval=True` and available ranking splits.")
+        eval_split = script_args.eval_ranking_split
+        if eval_split not in {"train", "validation", "test"}:
+            raise ValueError("`eval_ranking_split` must be one of: train, validation, test.")
+        if eval_split not in ranking_dataset:
+            raise ValueError(f"Ranking split '{eval_split}' not found in ranking dataset.")
+
+        if script_args.eval_checkpoint_path:
+            logger.info("Loading checkpoint for ranking-only eval from: %s", script_args.eval_checkpoint_path)
+            trainer._load_from_checkpoint(script_args.eval_checkpoint_path)
+
+        dimension_to_id = _dimension_mapping(script_args.preference_dimensions, ranking_dataset)
+        cluster_alignment = compute_validation_cluster_alignment(
+            trainer=trainer,
+            ranking_dataset=ranking_dataset,
+            tokenizer=tokenizer,
+            training_args=training_args,
+            dimension_to_id=dimension_to_id,
+        )
+        split_metrics, _ = evaluate_ranking_split(
+            trainer=trainer,
+            split_dataset=ranking_dataset[eval_split],
+            tokenizer=tokenizer,
+            training_args=training_args,
+            dimension_to_id=dimension_to_id,
+            cluster_alignment=cluster_alignment,
+        )
+        trainer.log_metrics(f"ranking_{eval_split}", split_metrics)
+        trainer.save_metrics(f"ranking_{eval_split}", split_metrics)
+        return
 
     logger.info("*** Train ***")
     checkpoint = None
