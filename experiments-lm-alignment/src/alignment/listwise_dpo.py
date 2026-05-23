@@ -37,6 +37,7 @@ from .mixture_pl_components import (
     mixture_pl_nll,
     MixturePLHead,
     MixtureRouterHead,
+    pl_log_prob,
 )
 
 
@@ -1354,6 +1355,134 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             metrics.update(self._mixture_posterior_ranking_metrics(mixture_output, gamma, batch))
         return mixture_em_nll, metrics, mixture_output, gamma
 
+    def _lora_router_em_loss(
+        self,
+        model,
+        flat_input_ids: torch.Tensor,
+        flat_attention_mask: torch.Tensor,
+        batch_size: int,
+        num_candidates: int,
+        gamma: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.mixture_router is None or self.policy_adapter_name is None:
+            raise RuntimeError("LoRA mixture backend was not initialized.")
+
+        if self.mixture_config.use_contextual_router:
+            self._set_active_adapter(self.policy_adapter_name)
+            context_output = model(
+                input_ids=flat_input_ids,
+                attention_mask=flat_attention_mask,
+                output_hidden_states=True,
+            )
+            pooled = self._pool_last_hidden_state(context_output.hidden_states[-1], flat_attention_mask)
+            pooled = pooled.view(batch_size, num_candidates, self.hidden_size)
+            weights = batch["candidate_mask"].to(dtype=pooled.dtype).unsqueeze(-1)
+            context = (pooled * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        else:
+            router_param = next(self.mixture_router.parameters())
+            context = torch.zeros(
+                batch_size,
+                self.hidden_size,
+                device=flat_input_ids.device,
+                dtype=router_param.dtype,
+            )
+
+        router_logits = self.mixture_router(context.to(dtype=next(self.mixture_router.parameters()).dtype))
+        log_alpha = F.log_softmax(router_logits, dim=1)
+        row_losses = -(gamma.to(device=log_alpha.device, dtype=log_alpha.dtype) * log_alpha).sum(dim=1)
+        if not torch.any(valid_rows):
+            return row_losses.sum() * 0.0
+        return row_losses[valid_rows].mean()
+
+    def _backward_lora_mixture_em_loss_sequential(
+        self,
+        model,
+        batch: Dict[str, Any],
+        gamma: torch.Tensor,
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Backward the LoRA-mixture EM M-step one component at a time.
+
+        With fixed E-step responsibilities, the complete-data objective decomposes
+        across mixture components. Backwarding each adapter loss separately avoids
+        holding all cluster adapter autograd graphs in memory at once.
+        """
+        if self.policy_adapter_name is None or self.mixture_router is None:
+            raise RuntimeError("LoRA mixture backend was not initialized.")
+
+        batch_size, num_candidates, seq_len = batch["input_ids"].shape
+        flat_input_ids = batch["input_ids"].view(batch_size * num_candidates, seq_len)
+        flat_attention_mask = batch["attention_mask"].view(batch_size * num_candidates, seq_len)
+        flat_labels = batch["labels"].view(batch_size * num_candidates, seq_len)
+        candidate_mask = batch["candidate_mask"]
+        ranked_prefix_lengths = batch.get("ranked_prefix_length")
+        rankings = self._observed_rankings(candidate_mask).long()
+        if ranked_prefix_lengths is None:
+            ranked_prefix_lengths = candidate_mask.long().sum(dim=1)
+        valid_rows = (candidate_mask.sum(dim=1) >= 2) & (ranked_prefix_lengths >= 1)
+        gamma = gamma.to(device=flat_input_ids.device)
+
+        component_loss_value = 0.0
+        total_loss_value = 0.0
+        closed_form_router = (
+            not self.mixture_config.use_contextual_router
+            and getattr(self.mixture_config, "use_closed_form_router_prior_update", False)
+        )
+
+        router_context = torch.no_grad() if closed_form_router else nullcontext()
+        with router_context:
+            router_loss = self._lora_router_em_loss(
+                model,
+                flat_input_ids,
+                flat_attention_mask,
+                batch_size,
+                num_candidates,
+                gamma,
+                valid_rows,
+            )
+        router_loss_value = float(router_loss.detach().item())
+        total_loss_value += router_loss_value
+        if not closed_form_router:
+            self.accelerator.backward(router_loss)
+
+        ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
+        beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+
+        for cluster_idx, adapter_name in enumerate(self.mixture_adapter_names):
+            self._set_active_adapter(adapter_name)
+            adapter_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
+            adapter_logps = self._sequence_logps(adapter_logits, flat_labels).view(batch_size, num_candidates)
+            rewards = beta * (adapter_logps - ref_logps)
+            comp_logp = pl_log_prob(
+                rewards,
+                rankings,
+                candidate_mask=candidate_mask,
+                ranked_prefix_lengths=ranked_prefix_lengths,
+            )
+            weighted_comp_nll = -(gamma[:, cluster_idx].to(dtype=comp_logp.dtype) * comp_logp)
+            if torch.any(valid_rows):
+                component_loss = weighted_comp_nll[valid_rows].mean()
+            else:
+                component_loss = weighted_comp_nll.sum() * 0.0
+
+            self.accelerator.backward(component_loss)
+            loss_value = float(component_loss.detach().item())
+            component_loss_value += loss_value
+            total_loss_value += loss_value
+
+            del adapter_logits, adapter_logps, rewards, comp_logp, weighted_comp_nll, component_loss
+
+        self._set_active_adapter(self.policy_adapter_name)
+        self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
+
+        metrics = {
+            "mixture/em_nll": total_loss_value,
+            "mixture/router_em_nll": router_loss_value,
+            "mixture/component_em_nll": component_loss_value,
+        }
+        return total_loss_value, metrics
+
     def get_batch_loss_metrics_with_mixture(
         self,
         model,
@@ -1616,11 +1745,18 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                 for m_step in range(m_step_updates):
                     self.model.train()
                     should_log = args.logging_steps > 0 and (self.state.global_step + 1) % args.logging_steps == 0
-                    loss, metrics, _, _ = self.get_batch_mixture_em_loss_metrics(
-                        self.model,
-                        inputs,
-                        gamma=gamma,
-                    )
+                    if self.mixture_reward_backend == "lora":
+                        loss_value, metrics = self._backward_lora_mixture_em_loss_sequential(
+                            self.model,
+                            inputs,
+                            gamma=gamma,
+                        )
+                    else:
+                        loss, metrics, _, _ = self.get_batch_mixture_em_loss_metrics(
+                            self.model,
+                            inputs,
+                            gamma=gamma,
+                        )
                     metric_context_manager = (
                         torch.autocast(self.accelerator.device.type)
                         if self._peft_has_been_casted_to_bf16
@@ -1637,7 +1773,9 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                     metrics.update(listwise_metrics)
                     self.store_metrics(metrics, train_eval="train")
 
-                    self.accelerator.backward(loss)
+                    if self.mixture_reward_backend != "lora":
+                        self.accelerator.backward(loss)
+                        loss_value = float(loss.detach().item())
                     if args.max_grad_norm is not None and args.max_grad_norm > 0:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), args.max_grad_norm)
 
@@ -1647,12 +1785,12 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                     self.optimizer.zero_grad()
 
                     self.state.global_step += 1
-                    total_loss += float(loss.detach().item())
+                    total_loss += loss_value
 
                     if should_log:
                         self.log(
                             {
-                                "loss": float(loss.detach().item()),
+                                "loss": loss_value,
                                 "em/e_step_epoch": float(epoch),
                                 "em/m_step": float(m_step + 1),
                             }

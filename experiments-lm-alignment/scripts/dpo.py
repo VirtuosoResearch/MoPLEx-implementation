@@ -129,6 +129,19 @@ def main(script_args, training_args, model_args):
     transformers.utils.logging.enable_default_handler()
     transformers.utils.logging.enable_explicit_format()
 
+    if (
+        getattr(training_args, "use_mixture", False)
+        and getattr(training_args, "mixture_reward_backend", None) == "lora"
+        and getattr(training_args, "gradient_checkpointing", False)
+    ):
+        logger.warning(
+            "Disabling gradient checkpointing for mixture_reward_backend='lora'. "
+            "The LoRA mixture backend switches active adapters inside the loss forward, "
+            "which is incompatible with checkpoint recomputation."
+        )
+        training_args.gradient_checkpointing = False
+        training_args.gradient_checkpointing_kwargs = None
+
     logger.info(f"Model parameters {model_args}")
     logger.info(f"Script parameters {script_args}")
     logger.info(f"Training parameters {training_args}")
