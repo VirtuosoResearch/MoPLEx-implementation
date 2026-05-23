@@ -16,6 +16,7 @@ from typing import Any, Callable
 
 import torch
 from datasets import Dataset, DatasetDict, load_dataset, load_from_disk
+from tqdm.auto import tqdm
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 
@@ -73,6 +74,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt_format", choices=("raw", "chat_auto"), default="raw")
     parser.add_argument("--deduplicate", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--allow_short_generation", action="store_true")
+    parser.add_argument("--disable_tqdm", action="store_true", help="Disable progress bars.")
     return parser.parse_args()
 
 
@@ -294,6 +296,7 @@ def generate_for_groups(
     num_new_responses: int,
     deduplicate: bool,
     allow_short_generation: bool,
+    disable_tqdm: bool = False,
 ) -> tuple[dict[str, list[str]], dict[str, int]]:
     if batch_size < 1:
         raise ValueError("`batch_size` must be at least 1.")
@@ -301,7 +304,14 @@ def generate_for_groups(
     generated_by_key: dict[str, list[str]] = {}
     stats = {"prompt_groups": len(groups), "generated_responses": 0, "dropped_generated_responses": 0}
 
-    for start in range(0, len(groups), batch_size):
+    batch_starts = range(0, len(groups), batch_size)
+    for start in tqdm(
+        batch_starts,
+        total=(len(groups) + batch_size - 1) // batch_size,
+        desc="Generating responses",
+        unit="batch",
+        disable=disable_tqdm,
+    ):
         batch_groups = groups[start : start + batch_size]
         batch_outputs = generate_fn([group.prompt for group in batch_groups])
         if len(batch_outputs) != len(batch_groups):
@@ -340,6 +350,7 @@ def augment_dataset_dict(
     dataset_downsample_seed: int | None = None,
     dataset_downsample_group_key: str = "source_index",
     dataset_downsample_splits: list[str] | None = None,
+    disable_tqdm: bool = False,
     batch_size: int,
     num_new_responses: int,
     deduplicate: bool,
@@ -377,14 +388,21 @@ def augment_dataset_dict(
         num_new_responses=num_new_responses,
         deduplicate=deduplicate,
         allow_short_generation=allow_short_generation,
+        disable_tqdm=disable_tqdm,
     )
 
     augmented_splits: dict[str, Dataset] = {}
-    for split in split_names:
+    for split in tqdm(split_names, desc="Augmenting splits", unit="split", disable=disable_tqdm):
         rows = []
         should_augment = split in augment_split_names
         validate_preformatted_split(prepared[split], split)
-        for row in prepared[split]:
+        for row in tqdm(
+            prepared[split],
+            desc=f"Writing {split}",
+            unit="row",
+            leave=False,
+            disable=disable_tqdm,
+        ):
             row = dict(row)
             original_responses = _stringify_responses(row["responses"])
             original_scores = [float(score) for score in row["scores"]]
@@ -532,6 +550,7 @@ def main() -> None:
         dataset_downsample_seed=args.dataset_downsample_seed,
         dataset_downsample_group_key=args.dataset_downsample_group_key,
         dataset_downsample_splits=args.dataset_downsample_splits,
+        disable_tqdm=args.disable_tqdm,
         batch_size=args.batch_size,
         num_new_responses=args.num_new_responses,
         deduplicate=args.deduplicate,
@@ -552,6 +571,7 @@ def main() -> None:
             "torch_dtype": args.torch_dtype,
             "device_map": args.device_map,
             "prompt_format": args.prompt_format,
+            "disable_tqdm": args.disable_tqdm,
         }
     )
     LOGGER.info("Saving augmented dataset to %s", args.output_dir)

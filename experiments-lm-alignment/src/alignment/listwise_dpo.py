@@ -230,6 +230,152 @@ class ListwiseDPOTrainer(DPOTrainer):
                 ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask).logits
         return self._sequence_logps(ref_logits, labels)
 
+    def _forward_ref_from_embeds(
+        self,
+        inputs_embeds: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        ref_model = self.model if self.ref_model is None else self.ref_model
+        ref_params = tuple(ref_model.parameters())
+        original_requires_grad = tuple(param.requires_grad for param in ref_params)
+        try:
+            for param in ref_params:
+                param.requires_grad_(False)
+            if self.ref_model is None:
+                with self.model.disable_adapter():
+                    ref_logits = self.model(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits
+            else:
+                ref_logits = self.ref_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask).logits
+        finally:
+            for param, requires_grad in zip(ref_params, original_requires_grad):
+                param.requires_grad_(requires_grad)
+        return self._sequence_logps(ref_logits, labels)
+
+    def _use_linear_reward_approx(self, train_eval: Literal["train", "eval"]) -> bool:
+        if not getattr(self.args, "use_linear_reward_approx", False):
+            return False
+        if train_eval != "train" and getattr(self.args, "linear_approx_exact_eval", True):
+            return False
+        return True
+
+    def _select_linear_approx_anchors(self, candidate_mask: torch.Tensor) -> list[torch.Tensor]:
+        num_anchors = int(getattr(self.args, "linear_approx_num_anchors", 2))
+        anchor_positions = []
+        for row_mask in candidate_mask:
+            valid_positions = torch.nonzero(row_mask, as_tuple=False).flatten()
+            if valid_positions.numel() > num_anchors:
+                permutation = torch.randperm(valid_positions.numel(), device=valid_positions.device)
+                valid_positions = valid_positions.index_select(0, permutation[:num_anchors]).sort().values
+            anchor_positions.append(valid_positions)
+        return anchor_positions
+
+    @staticmethod
+    def _linear_approx_from_anchor_tensors(
+        candidate_embeddings: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        anchor_positions: list[torch.Tensor],
+        anchor_scores: torch.Tensor,
+        anchor_grads: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Estimate candidate scores from exact anchor scores and stop-gradient input gradients.
+
+        Shapes:
+            candidate_embeddings: [B, M, S, H]
+            anchor_scores: [N] or [N, K]
+            anchor_grads: [N, S, H] or [N, K, S, H]
+        """
+        batch_size, num_candidates = candidate_mask.shape
+        if anchor_scores.dim() == 1:
+            estimates = anchor_scores.new_zeros((batch_size, num_candidates))
+        elif anchor_scores.dim() == 2:
+            estimates = anchor_scores.new_zeros((batch_size, anchor_scores.shape[1], num_candidates))
+        else:
+            raise ValueError("anchor_scores must have shape [N] or [N, K]")
+
+        offset = 0
+        for row_idx, row_anchor_positions in enumerate(anchor_positions):
+            num_row_anchors = row_anchor_positions.numel()
+            if num_row_anchors == 0:
+                continue
+
+            row_scores = anchor_scores[offset : offset + num_row_anchors]
+            row_grads = anchor_grads[offset : offset + num_row_anchors]
+            row_embeddings = candidate_embeddings[row_idx].to(dtype=row_grads.dtype)
+            anchor_embeddings = row_embeddings.index_select(0, row_anchor_positions)
+            deltas = row_embeddings.unsqueeze(0) - anchor_embeddings.unsqueeze(1)
+
+            if anchor_scores.dim() == 1:
+                dot_terms = (row_grads.unsqueeze(1) * deltas).sum(dim=(-1, -2))
+                row_estimates = (row_scores.detach().unsqueeze(1) + dot_terms).mean(dim=0)
+                row_estimates[row_anchor_positions] = row_scores
+                estimates[row_idx] = row_estimates.to(dtype=estimates.dtype)
+            else:
+                dot_terms = (row_grads.unsqueeze(2) * deltas.unsqueeze(1)).sum(dim=(-1, -2))
+                row_estimates = (row_scores.detach().unsqueeze(-1) + dot_terms).mean(dim=0)
+                row_estimates[:, row_anchor_positions] = row_scores.transpose(0, 1)
+                estimates[row_idx] = row_estimates.to(dtype=estimates.dtype)
+
+            offset += num_row_anchors
+
+        if anchor_scores.dim() == 1:
+            return estimates.masked_fill(~candidate_mask, 0.0)
+        return estimates.masked_fill(~candidate_mask.unsqueeze(1), 0.0)
+
+    def _approximate_listwise_utilities(
+        self,
+        model,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        candidate_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        batch_size, num_candidates, seq_len = input_ids.shape
+        flat_input_ids = input_ids.view(batch_size * num_candidates, seq_len)
+        flat_attention_mask = attention_mask.view(batch_size * num_candidates, seq_len)
+        flat_labels = labels.view(batch_size * num_candidates, seq_len)
+
+        embedding_layer = model.get_input_embeddings()
+        candidate_embeddings = embedding_layer(flat_input_ids).detach().view(batch_size, num_candidates, seq_len, -1)
+        anchor_positions = self._select_linear_approx_anchors(candidate_mask)
+        anchor_flat_indices = [
+            row_idx * num_candidates + position
+            for row_idx, positions in enumerate(anchor_positions)
+            for position in positions.tolist()
+        ]
+        if not anchor_flat_indices:
+            return input_ids.new_zeros((batch_size, num_candidates), dtype=torch.float32)
+
+        anchor_flat_indices_tensor = torch.tensor(anchor_flat_indices, device=input_ids.device, dtype=torch.long)
+        anchor_embeds = candidate_embeddings.view(batch_size * num_candidates, seq_len, -1).index_select(
+            0, anchor_flat_indices_tensor
+        )
+        anchor_embeds = anchor_embeds.detach().requires_grad_(True)
+        anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
+        anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
+
+        with torch.enable_grad():
+            policy_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
+            policy_logps = self._sequence_logps(policy_logits, anchor_labels)
+            ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
+            beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+            anchor_utilities = beta * (policy_logps - ref_logps)
+            anchor_grads = torch.autograd.grad(
+                anchor_utilities.sum(),
+                anchor_embeds,
+                retain_graph=True,
+                create_graph=False,
+            )[0].detach()
+
+        return self._linear_approx_from_anchor_tensors(
+            candidate_embeddings,
+            candidate_mask,
+            anchor_positions,
+            anchor_utilities,
+            anchor_grads,
+        )
+
     @staticmethod
     def _pl_negative_log_likelihood(
         utilities: torch.Tensor,
@@ -340,12 +486,21 @@ class ListwiseDPOTrainer(DPOTrainer):
         flat_attention_mask = attention_mask.view(batch_size * num_candidates, seq_len)
         flat_labels = labels.view(batch_size * num_candidates, seq_len)
 
-        policy_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
-        policy_logps = self._sequence_logps(policy_logits, flat_labels).view(batch_size, num_candidates)
-        ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
+        if self._use_linear_reward_approx(train_eval):
+            utilities = self._approximate_listwise_utilities(
+                model,
+                input_ids,
+                attention_mask,
+                labels,
+                candidate_mask,
+            )
+        else:
+            policy_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
+            policy_logps = self._sequence_logps(policy_logits, flat_labels).view(batch_size, num_candidates)
+            ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
 
-        beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
-        utilities = beta * (policy_logps - ref_logps)
+            beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+            utilities = beta * (policy_logps - ref_logps)
         loss = self._pl_negative_log_likelihood(utilities, candidate_mask, ranked_prefix_lengths)
 
         metric_tensors = self._listwise_metrics(utilities, candidate_mask, ranked_prefix_lengths)
@@ -643,6 +798,96 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         attn_mask = attention_mask.unsqueeze(-1).float()
         return (hidden_states * attn_mask).sum(dim=1) / attn_mask.sum(dim=1).clamp_min(1.0)
 
+    def _get_batch_mixture_output_head_approx(
+        self,
+        model,
+        flat_input_ids: torch.Tensor,
+        flat_attention_mask: torch.Tensor,
+        batch: Dict[str, Any],
+        batch_size: int,
+        num_candidates: int,
+    ) -> Dict[str, torch.Tensor]:
+        seq_len = flat_input_ids.shape[1]
+        candidate_mask = batch["candidate_mask"]
+        embedding_layer = model.get_input_embeddings()
+        candidate_embeddings = embedding_layer(flat_input_ids).detach().view(batch_size, num_candidates, seq_len, -1)
+        anchor_positions = self._select_linear_approx_anchors(candidate_mask)
+        anchor_flat_indices = [
+            row_idx * num_candidates + position
+            for row_idx, positions in enumerate(anchor_positions)
+            for position in positions.tolist()
+        ]
+        if not anchor_flat_indices:
+            router_logits = self.mixture_head.router(
+                torch.zeros(
+                    batch_size,
+                    self.hidden_size,
+                    device=flat_input_ids.device,
+                    dtype=next(self.mixture_head.parameters()).dtype,
+                )
+            )
+            return {
+                "router_logits": router_logits,
+                "rewards": flat_attention_mask.new_zeros(
+                    (batch_size, self.num_clusters, num_candidates),
+                    dtype=next(self.mixture_head.parameters()).dtype,
+                ),
+                "pooled": None,
+            }
+
+        anchor_flat_indices_tensor = torch.tensor(anchor_flat_indices, device=flat_input_ids.device, dtype=torch.long)
+        anchor_embeds = candidate_embeddings.view(batch_size * num_candidates, seq_len, -1).index_select(
+            0, anchor_flat_indices_tensor
+        )
+        anchor_embeds = anchor_embeds.detach().requires_grad_(True)
+        anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
+
+        mixture_param = next(self.mixture_head.parameters())
+        with torch.enable_grad():
+            model_output = model(
+                inputs_embeds=anchor_embeds,
+                attention_mask=anchor_attention_mask,
+                output_hidden_states=True,
+            )
+            pooled = self._pool_last_hidden_state(model_output.hidden_states[-1], anchor_attention_mask)
+            pooled_for_head = pooled.to(dtype=mixture_param.dtype)
+            anchor_rewards = torch.stack(
+                [head(pooled_for_head).squeeze(-1) for head in self.mixture_head.reward_heads],
+                dim=1,
+            )
+            anchor_grads = []
+            for cluster_idx in range(self.num_clusters):
+                anchor_grads.append(
+                    torch.autograd.grad(
+                        anchor_rewards[:, cluster_idx].sum(),
+                        anchor_embeds,
+                        retain_graph=True,
+                        create_graph=False,
+                    )[0].detach()
+                )
+            anchor_grads = torch.stack(anchor_grads, dim=1)
+
+        rewards = self._linear_approx_from_anchor_tensors(
+            candidate_embeddings,
+            candidate_mask,
+            anchor_positions,
+            anchor_rewards,
+            anchor_grads,
+        )
+        router_context = torch.zeros(
+            batch_size,
+            self.hidden_size,
+            device=flat_input_ids.device,
+            dtype=mixture_param.dtype,
+        )
+        router_logits = self.mixture_head.router(router_context)
+
+        return {
+            "router_logits": router_logits,
+            "rewards": rewards,
+            "pooled": None,
+        }
+
     def _get_batch_mixture_output_head(
         self,
         model,
@@ -724,10 +969,107 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             "pooled": pooled,
         }
 
+    def _get_batch_mixture_output_lora_approx(
+        self,
+        model,
+        flat_input_ids: torch.Tensor,
+        flat_attention_mask: torch.Tensor,
+        flat_labels: torch.Tensor,
+        batch: Dict[str, Any],
+        batch_size: int,
+        num_candidates: int,
+    ) -> Dict[str, torch.Tensor]:
+        if self.policy_adapter_name is None or self.mixture_router is None:
+            raise RuntimeError("LoRA mixture backend was not initialized.")
+
+        router_param = next(self.mixture_router.parameters())
+        context = torch.zeros(
+            batch_size,
+            self.hidden_size,
+            device=flat_input_ids.device,
+            dtype=router_param.dtype,
+        )
+        router_logits = self.mixture_router(context)
+
+        seq_len = flat_input_ids.shape[1]
+        candidate_mask = batch["candidate_mask"]
+        embedding_layer = model.get_input_embeddings()
+        candidate_embeddings = embedding_layer(flat_input_ids).detach().view(batch_size, num_candidates, seq_len, -1)
+        anchor_positions = self._select_linear_approx_anchors(candidate_mask)
+        anchor_flat_indices = [
+            row_idx * num_candidates + position
+            for row_idx, positions in enumerate(anchor_positions)
+            for position in positions.tolist()
+        ]
+        if not anchor_flat_indices:
+            self._set_active_adapter(self.policy_adapter_name)
+            self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
+            return {
+                "router_logits": router_logits,
+                "rewards": flat_attention_mask.new_zeros(
+                    (batch_size, self.num_clusters, num_candidates),
+                    dtype=router_param.dtype,
+                ),
+                "pooled": None,
+            }
+
+        anchor_flat_indices_tensor = torch.tensor(anchor_flat_indices, device=flat_input_ids.device, dtype=torch.long)
+        anchor_embeds = candidate_embeddings.view(batch_size * num_candidates, seq_len, -1).index_select(
+            0, anchor_flat_indices_tensor
+        )
+        anchor_embeds = anchor_embeds.detach().requires_grad_(True)
+        anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
+        anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
+
+        with torch.enable_grad():
+            ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
+            ref_grads = torch.autograd.grad(
+                ref_logps.sum(),
+                anchor_embeds,
+                retain_graph=False,
+                create_graph=False,
+            )[0].detach()
+
+        beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+        reward_tensors = []
+        for adapter_name in self.mixture_adapter_names:
+            self._set_active_adapter(adapter_name)
+            with torch.enable_grad():
+                adapter_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
+                adapter_logps = self._sequence_logps(adapter_logits, anchor_labels)
+                adapter_grads = torch.autograd.grad(
+                    adapter_logps.sum(),
+                    anchor_embeds,
+                    retain_graph=True,
+                    create_graph=False,
+                )[0].detach()
+                anchor_utilities = beta * (adapter_logps - ref_logps.detach())
+                anchor_utility_grads = beta * (adapter_grads - ref_grads)
+
+            reward_tensors.append(
+                self._linear_approx_from_anchor_tensors(
+                    candidate_embeddings,
+                    candidate_mask,
+                    anchor_positions,
+                    anchor_utilities,
+                    anchor_utility_grads,
+                )
+            )
+
+        self._set_active_adapter(self.policy_adapter_name)
+        self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
+
+        return {
+            "router_logits": router_logits,
+            "rewards": torch.stack(reward_tensors, dim=1),
+            "pooled": None,
+        }
+
     def get_batch_mixture_output(
         self,
         model,
         batch: Dict[str, Any],
+        train_eval: Literal["train", "eval"] = "eval",
     ) -> Dict[str, torch.Tensor]:
         """
         Compute mixture model outputs: router logits and component rewards.
@@ -745,10 +1087,30 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         flat_labels = batch["labels"].view(batch_size * num_candidates, seq_len)
 
         if self.mixture_reward_backend == "head":
+            if self._use_linear_reward_approx(train_eval) and not self.mixture_config.use_contextual_router:
+                return self._get_batch_mixture_output_head_approx(
+                    model,
+                    flat_input_ids,
+                    flat_attention_mask,
+                    batch,
+                    batch_size,
+                    num_candidates,
+                )
             return self._get_batch_mixture_output_head(
                 model,
                 flat_input_ids,
                 flat_attention_mask,
+                batch,
+                batch_size,
+                num_candidates,
+            )
+
+        if self._use_linear_reward_approx(train_eval) and not self.mixture_config.use_contextual_router:
+            return self._get_batch_mixture_output_lora_approx(
+                model,
+                flat_input_ids,
+                flat_attention_mask,
+                flat_labels,
                 batch,
                 batch_size,
                 num_candidates,
@@ -937,8 +1299,9 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         batch: Dict[str, Any],
         gamma: Optional[torch.Tensor] = None,
         include_cluster_metrics: bool = True,
+        train_eval: Literal["train", "eval"] = "train",
     ) -> Tuple[torch.Tensor, Dict[str, float], Dict[str, torch.Tensor], torch.Tensor]:
-        mixture_output = self.get_batch_mixture_output(model, batch)
+        mixture_output = self.get_batch_mixture_output(model, batch, train_eval=train_eval)
         candidate_mask = batch["candidate_mask"]
         ranked_prefix_lengths = batch.get("ranked_prefix_length")
         rankings = self._observed_rankings(candidate_mask).long()
@@ -1017,7 +1380,11 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         mixture_output = None
 
         if train_eval == "train" or self.mixture_config.log_cluster_metrics:
-            mixture_em_nll, mixture_metrics, mixture_output, gamma = self.get_batch_mixture_em_loss_metrics(model, batch)
+            mixture_em_nll, mixture_metrics, mixture_output, gamma = self.get_batch_mixture_em_loss_metrics(
+                model,
+                batch,
+                train_eval=train_eval,
+            )
 
             if train_eval == "train":
                 self._update_global_router_prior_from_gamma(gamma)
