@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import gc
 import inspect
 import math
 import os
@@ -38,6 +39,7 @@ from .mixture_pl_components import (
     mixture_pl_nll,
     MixturePLHead,
     MixtureRouterHead,
+    pl_log_prob,
 )
 
 
@@ -385,27 +387,46 @@ class ListwiseDPOTrainer(DPOTrainer):
         anchor_embeds = anchor_embeds.detach().requires_grad_(True)
         anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
         anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
+        ref_mode = getattr(self.args, "linear_approx_ref_mode", "input_gradient")
+        beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+        exact_ref_logps = None
+        if ref_mode == "exact_score":
+            exact_ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
+                batch_size,
+                num_candidates,
+            )
 
         with torch.enable_grad():
             policy_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
             policy_logps = self._sequence_logps(policy_logits, anchor_labels)
-            ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
-            beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
-            anchor_utilities = beta * (policy_logps - ref_logps)
-            anchor_grads = torch.autograd.grad(
-                anchor_utilities.sum(),
-                anchor_embeds,
-                retain_graph=True,
-                create_graph=False,
-            )[0].detach()
+            if ref_mode == "exact_score":
+                anchor_grads = torch.autograd.grad(
+                    policy_logps.sum(),
+                    anchor_embeds,
+                    retain_graph=True,
+                    create_graph=False,
+                )[0].detach()
+                anchor_scores = policy_logps
+            else:
+                ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
+                anchor_scores = beta * (policy_logps - ref_logps)
+                anchor_grads = torch.autograd.grad(
+                    anchor_scores.sum(),
+                    anchor_embeds,
+                    retain_graph=True,
+                    create_graph=False,
+                )[0].detach()
 
-        return self._linear_approx_from_anchor_tensors(
+        estimates = self._linear_approx_from_anchor_tensors(
             candidate_embeddings,
             candidate_mask,
             anchor_positions,
-            anchor_utilities,
+            anchor_scores,
             anchor_grads,
         )
+        if ref_mode == "exact_score":
+            return beta * (estimates - exact_ref_logps.detach())
+        return estimates
 
     @staticmethod
     def _pl_negative_log_likelihood(
@@ -1054,17 +1075,25 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         anchor_embeds = anchor_embeds.detach().requires_grad_(True)
         anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
         anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
-
-        with torch.enable_grad():
-            ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
-            ref_grads = torch.autograd.grad(
-                ref_logps.sum(),
-                anchor_embeds,
-                retain_graph=False,
-                create_graph=False,
-            )[0].detach()
-
+        ref_mode = getattr(self.mixture_config, "linear_approx_ref_mode", "input_gradient")
         beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+
+        if ref_mode == "exact_score":
+            ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
+                batch_size,
+                num_candidates,
+            )
+            ref_grads = None
+        else:
+            with torch.enable_grad():
+                ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
+                ref_grads = torch.autograd.grad(
+                    ref_logps.sum(),
+                    anchor_embeds,
+                    retain_graph=False,
+                    create_graph=False,
+                )[0].detach()
+
         reward_tensors = []
         for adapter_name in self.mixture_adapter_names:
             self._set_active_adapter(adapter_name)
@@ -1077,18 +1106,23 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
                     retain_graph=True,
                     create_graph=False,
                 )[0].detach()
-                anchor_utilities = beta * (adapter_logps - ref_logps.detach())
-                anchor_utility_grads = beta * (adapter_grads - ref_grads)
+                if ref_mode == "exact_score":
+                    anchor_scores = adapter_logps
+                    anchor_grads = adapter_grads
+                else:
+                    anchor_scores = beta * (adapter_logps - ref_logps.detach())
+                    anchor_grads = beta * (adapter_grads - ref_grads)
 
-            reward_tensors.append(
-                self._linear_approx_from_anchor_tensors(
-                    candidate_embeddings,
-                    candidate_mask,
-                    anchor_positions,
-                    anchor_utilities,
-                    anchor_utility_grads,
-                )
+            estimates = self._linear_approx_from_anchor_tensors(
+                candidate_embeddings,
+                candidate_mask,
+                anchor_positions,
+                anchor_scores,
+                anchor_grads,
             )
+            if ref_mode == "exact_score":
+                estimates = beta * (estimates - ref_logps.detach())
+            reward_tensors.append(estimates)
 
         self._set_active_adapter(self.policy_adapter_name)
         self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
@@ -1388,6 +1422,134 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             metrics.update(self._mixture_posterior_ranking_metrics(mixture_output, gamma, batch))
         return mixture_em_nll, metrics, mixture_output, gamma
 
+    def _lora_router_em_loss(
+        self,
+        model,
+        flat_input_ids: torch.Tensor,
+        flat_attention_mask: torch.Tensor,
+        batch_size: int,
+        num_candidates: int,
+        gamma: torch.Tensor,
+        valid_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.mixture_router is None or self.policy_adapter_name is None:
+            raise RuntimeError("LoRA mixture backend was not initialized.")
+
+        if self.mixture_config.use_contextual_router:
+            self._set_active_adapter(self.policy_adapter_name)
+            context_output = model(
+                input_ids=flat_input_ids,
+                attention_mask=flat_attention_mask,
+                output_hidden_states=True,
+            )
+            pooled = self._pool_last_hidden_state(context_output.hidden_states[-1], flat_attention_mask)
+            pooled = pooled.view(batch_size, num_candidates, self.hidden_size)
+            weights = batch["candidate_mask"].to(dtype=pooled.dtype).unsqueeze(-1)
+            context = (pooled * weights).sum(dim=1) / weights.sum(dim=1).clamp_min(1.0)
+        else:
+            router_param = next(self.mixture_router.parameters())
+            context = torch.zeros(
+                batch_size,
+                self.hidden_size,
+                device=flat_input_ids.device,
+                dtype=router_param.dtype,
+            )
+
+        router_logits = self.mixture_router(context.to(dtype=next(self.mixture_router.parameters()).dtype))
+        log_alpha = F.log_softmax(router_logits, dim=1)
+        row_losses = -(gamma.to(device=log_alpha.device, dtype=log_alpha.dtype) * log_alpha).sum(dim=1)
+        if not torch.any(valid_rows):
+            return row_losses.sum() * 0.0
+        return row_losses[valid_rows].mean()
+
+    def _backward_lora_mixture_em_loss_sequential(
+        self,
+        model,
+        batch: Dict[str, Any],
+        gamma: torch.Tensor,
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Backward the LoRA-mixture EM M-step one component at a time.
+
+        With fixed E-step responsibilities, the complete-data objective decomposes
+        across mixture components. Backwarding each adapter loss separately avoids
+        holding all cluster adapter autograd graphs in memory at once.
+        """
+        if self.policy_adapter_name is None or self.mixture_router is None:
+            raise RuntimeError("LoRA mixture backend was not initialized.")
+
+        batch_size, num_candidates, seq_len = batch["input_ids"].shape
+        flat_input_ids = batch["input_ids"].view(batch_size * num_candidates, seq_len)
+        flat_attention_mask = batch["attention_mask"].view(batch_size * num_candidates, seq_len)
+        flat_labels = batch["labels"].view(batch_size * num_candidates, seq_len)
+        candidate_mask = batch["candidate_mask"]
+        ranked_prefix_lengths = batch.get("ranked_prefix_length")
+        rankings = self._observed_rankings(candidate_mask).long()
+        if ranked_prefix_lengths is None:
+            ranked_prefix_lengths = candidate_mask.long().sum(dim=1)
+        valid_rows = (candidate_mask.sum(dim=1) >= 2) & (ranked_prefix_lengths >= 1)
+        gamma = gamma.to(device=flat_input_ids.device)
+
+        component_loss_value = 0.0
+        total_loss_value = 0.0
+        closed_form_router = (
+            not self.mixture_config.use_contextual_router
+            and getattr(self.mixture_config, "use_closed_form_router_prior_update", False)
+        )
+
+        router_context = torch.no_grad() if closed_form_router else nullcontext()
+        with router_context:
+            router_loss = self._lora_router_em_loss(
+                model,
+                flat_input_ids,
+                flat_attention_mask,
+                batch_size,
+                num_candidates,
+                gamma,
+                valid_rows,
+            )
+        router_loss_value = float(router_loss.detach().item())
+        total_loss_value += router_loss_value
+        if not closed_form_router:
+            self.accelerator.backward(router_loss)
+
+        ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
+        beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+
+        for cluster_idx, adapter_name in enumerate(self.mixture_adapter_names):
+            self._set_active_adapter(adapter_name)
+            adapter_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
+            adapter_logps = self._sequence_logps(adapter_logits, flat_labels).view(batch_size, num_candidates)
+            rewards = beta * (adapter_logps - ref_logps)
+            comp_logp = pl_log_prob(
+                rewards,
+                rankings,
+                candidate_mask=candidate_mask,
+                ranked_prefix_lengths=ranked_prefix_lengths,
+            )
+            weighted_comp_nll = -(gamma[:, cluster_idx].to(dtype=comp_logp.dtype) * comp_logp)
+            if torch.any(valid_rows):
+                component_loss = weighted_comp_nll[valid_rows].mean()
+            else:
+                component_loss = weighted_comp_nll.sum() * 0.0
+
+            self.accelerator.backward(component_loss)
+            loss_value = float(component_loss.detach().item())
+            component_loss_value += loss_value
+            total_loss_value += loss_value
+
+            del adapter_logits, adapter_logps, rewards, comp_logp, weighted_comp_nll, component_loss
+
+        self._set_active_adapter(self.policy_adapter_name)
+        self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
+
+        metrics = {
+            "mixture/em_nll": total_loss_value,
+            "mixture/router_em_nll": router_loss_value,
+            "mixture/component_em_nll": component_loss_value,
+        }
+        return total_loss_value, metrics
+
     def get_batch_loss_metrics_with_mixture(
         self,
         model,
@@ -1539,6 +1701,14 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
         except (TypeError, ValueError):
             return 0
 
+    def _release_cuda_cache_after_eval_or_save(self) -> None:
+        """Release cached CUDA blocks after memory-heavy eval/checkpoint phases."""
+        if not torch.cuda.is_available():
+            return
+        self.accelerator.wait_for_everyone()
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def _update_best_metric_for_legacy_checkpointing(self, metrics: Optional[dict[str, float]]) -> None:
         """Update TrainerState best fields for Trainer versions whose _save_checkpoint lacks metrics=."""
         if not metrics:
@@ -1574,6 +1744,7 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
 
         if should_eval and self.eval_dataset is not None:
             eval_metrics = self.evaluate()
+            self._release_cuda_cache_after_eval_or_save()
 
         should_save = False
         if force_epoch:
@@ -1589,6 +1760,7 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                 and self.eval_dataset is not None
             ):
                 eval_metrics = self.evaluate()
+                self._release_cuda_cache_after_eval_or_save()
             try:
                 self._save_checkpoint(self.model, trial=trial, metrics=eval_metrics)
             except TypeError as exc:
@@ -1597,6 +1769,7 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                 self._update_best_metric_for_legacy_checkpointing(eval_metrics)
                 self._save_checkpoint(self.model, trial=trial)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+            self._release_cuda_cache_after_eval_or_save()
 
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):  # noqa: D401
         del ignore_keys_for_eval, kwargs
@@ -1650,12 +1823,23 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                 for m_step in range(m_step_updates):
                     self.model.train()
                     should_log = args.logging_steps > 0 and (self.state.global_step + 1) % args.logging_steps == 0
-                    loss, metrics, _, _ = self.get_batch_mixture_em_loss_metrics(
-                        self.model,
-                        inputs,
-                        gamma=gamma,
+                    if self.mixture_reward_backend == "lora":
+                        loss_value, metrics = self._backward_lora_mixture_em_loss_sequential(
+                            self.model,
+                            inputs,
+                            gamma=gamma,
+                        )
+                    else:
+                        loss, metrics, _, _ = self.get_batch_mixture_em_loss_metrics(
+                            self.model,
+                            inputs,
+                            gamma=gamma,
+                        )
+                    metric_context_manager = (
+                        torch.autocast(self.accelerator.device.type)
+                        if self._peft_has_been_casted_to_bf16
+                        else nullcontext()
                     )
-                    metric_context_manager = (_peft_bf16_autocast_context(self))
                     with torch.no_grad(), metric_context_manager:
                         if self.mixture_reward_backend == "lora":
                             self._set_active_adapter(self.policy_adapter_name)
@@ -1667,7 +1851,9 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                     metrics.update(listwise_metrics)
                     self.store_metrics(metrics, train_eval="train")
 
-                    self.accelerator.backward(loss)
+                    if self.mixture_reward_backend != "lora":
+                        self.accelerator.backward(loss)
+                        loss_value = float(loss.detach().item())
                     if args.max_grad_norm is not None and args.max_grad_norm > 0:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), args.max_grad_norm)
 
@@ -1677,12 +1863,12 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                     self.optimizer.zero_grad()
 
                     self.state.global_step += 1
-                    total_loss += float(loss.detach().item())
+                    total_loss += loss_value
 
                     if should_log:
                         self.log(
                             {
-                                "loss": float(loss.detach().item()),
+                                "loss": loss_value,
                                 "em/e_step_epoch": float(epoch),
                                 "em/m_step": float(m_step + 1),
                             }

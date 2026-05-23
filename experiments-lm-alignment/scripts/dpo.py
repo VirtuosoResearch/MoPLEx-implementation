@@ -124,7 +124,6 @@ class RankingEvaluationCallback(TrainerCallback):
         if metrics is not None:
             metrics.update(logged_metrics)
             metrics.update(best_model_aliases)
-        self.trainer.log(logged_metrics)
 
 
 def main(script_args, training_args, model_args):
@@ -150,9 +149,22 @@ def main(script_args, training_args, model_args):
     # and does not affect the correctness of training.
     logging.getLogger("trl.trainer.dpo_trainer").setLevel(logging.ERROR)
 
-    # logger.info(f"Model parameters {model_args}")
-    # logger.info(f"Script parameters {script_args}")
-    # logger.info(f"Training parameters {training_args}")
+    if (
+        getattr(training_args, "use_mixture", False)
+        and getattr(training_args, "mixture_reward_backend", None) == "lora"
+        and getattr(training_args, "gradient_checkpointing", False)
+    ):
+        logger.warning(
+            "Disabling gradient checkpointing for mixture_reward_backend='lora'. "
+            "The LoRA mixture backend switches active adapters inside the loss forward, "
+            "which is incompatible with checkpoint recomputation."
+        )
+        training_args.gradient_checkpointing = False
+        training_args.gradient_checkpointing_kwargs = None
+
+    logger.info(f"Model parameters {model_args}")
+    logger.info(f"Script parameters {script_args}")
+    logger.info(f"Training parameters {training_args}")
 
     # Check for last checkpoint
     last_checkpoint = None

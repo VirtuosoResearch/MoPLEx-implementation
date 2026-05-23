@@ -84,6 +84,7 @@ class ScriptArguments:
         default=1,
         metadata={"help": "The number of training epochs for the reward model."},
     )
+    max_steps: Optional[int] = field(default=-1)
     optim: Optional[str] = field(
         default="adamw_torch",
         metadata={"help": "The optimizer to use."},
@@ -534,6 +535,7 @@ training_args = RewardConfig(
     per_device_train_batch_size=script_args.per_device_train_batch_size,
     per_device_eval_batch_size=script_args.per_device_eval_batch_size,
     num_train_epochs=script_args.num_train_epochs,
+    max_steps=script_args.max_steps,
     # weight_decay=script_args.weight_decay,
     eval_strategy=script_args.eval_strategy,
     eval_steps=100000,
@@ -611,6 +613,34 @@ for data_path in data_paths:
             print(
                 "Loaded ultrafeedback_disagreement listwise dataset: "
                 f"train={len(dataset_dict['train'])}, eval_split={eval_split}, eval={len(dataset_dict[eval_split])}"
+            )
+    elif 'persona_' in data_path and ('top1_listwise' in data_path or 'pairwise' in data_path):
+        ds_path = resolve_dataset_path(data_path)
+        dataset_dict = load_from_disk(ds_path)
+        if "train" not in dataset_dict:
+            raise ValueError(f"PERSONA dataset at {ds_path} must contain 'train' split.")
+        eval_split = "validation" if "validation" in dataset_dict else "test"
+        if eval_split not in dataset_dict:
+            raise ValueError(f"PERSONA dataset at {ds_path} must contain validation or test split.")
+        train_split = dataset_dict["train"]
+        eval_split_ds = dataset_dict[eval_split]
+        if {"responses", "scores"}.issubset(set(train_split.column_names)):
+            ranking_eval_listwise = eval_split_ds
+            train_dataset = listwise_to_pairwise_dataset(train_split)
+            eval_dataset = listwise_to_pairwise_dataset(eval_split_ds)
+        elif {"chosen", "rejected"}.issubset(set(train_split.column_names)):
+            train_dataset = train_split
+            eval_dataset = eval_split_ds
+        else:
+            raise ValueError(
+                f"PERSONA dataset at {ds_path} must be pairwise chosen/rejected or listwise responses/scores."
+            )
+        train_dataset = build_dataset_helpsteer(train_dataset, tokenizer)
+        eval_dataset = build_dataset_helpsteer(eval_dataset, tokenizer)
+        if accelerator.is_main_process:
+            print(
+                "Loaded PERSONA dataset: "
+                f"path={ds_path}, train={len(train_split)}, eval_split={eval_split}, eval={len(eval_split_ds)}"
             )
     elif 'cyclic_ultrafeedback_all_pairs' in data_path:
         train_dataset = load_cyclic_ultrafeedback_pairwise_split('train')
