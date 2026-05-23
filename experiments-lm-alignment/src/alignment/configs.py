@@ -103,6 +103,16 @@ class ScriptArguments(trl.ScriptArguments):
         default=4,
         metadata={"help": "Number of ranked responses per prompt to keep for listwise training."},
     )
+    listwise_num_generated_responses: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "Number of generated tail responses to append when reducing augmented preformatted listwise data. "
+                "When >0, listwise_num_responses is interpreted as the number of original ranked-prefix "
+                "responses and this value is the number of generated bottom candidates."
+            )
+        },
+    )
     listwise_prompt_column: str = field(
         default="instruction",
         metadata={"help": "Prompt column in the raw listwise dataset."},
@@ -231,6 +241,8 @@ class ScriptArguments(trl.ScriptArguments):
             raise ValueError("`pairwise_from_listwise_strategy` must be either 'extreme' or 'all_pairs'")
         if self.listwise_num_responses < 2:
             raise ValueError("`listwise_num_responses` must be >= 2")
+        if self.listwise_num_generated_responses < 0:
+            raise ValueError("`listwise_num_generated_responses` must be >= 0")
         if self.listwise_min_responses < 2:
             raise ValueError("`listwise_min_responses` must be >= 2")
         if self.dataset_downsample_ratio <= 0 or self.dataset_downsample_ratio > 1:
@@ -408,6 +420,27 @@ class MixturePLConfig(DPOConfig):
         default=True,
         metadata={"help": "If True, compute and log cluster assignment accuracy during validation."},
     )
+    use_linear_reward_approx: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "If True, use anchor-based first-order reward approximation for listwise/mixture training. "
+                "Standard pairwise DPO remains exact."
+            )
+        },
+    )
+    linear_approx_num_anchors: int = field(
+        default=2,
+        metadata={"help": "Number of valid candidate responses to score exactly per row when approximation is enabled."},
+    )
+    linear_approx_gradient_mode: str = field(
+        default="stop_gradient",
+        metadata={"help": "Gradient mode for non-anchor estimates. Currently only 'stop_gradient' is supported."},
+    )
+    linear_approx_exact_eval: bool = field(
+        default=True,
+        metadata={"help": "If True, validation/evaluation uses exact scoring even when approximation is enabled."},
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -436,6 +469,12 @@ class MixturePLConfig(DPOConfig):
                 raise ValueError("`mixture_lora_adapter_prefix` must be non-empty")
             if self.router_hidden_size < 1:
                 raise ValueError("`router_hidden_size` must be >= 1")
+
+        if self.use_linear_reward_approx:
+            if self.linear_approx_num_anchors < 1:
+                raise ValueError("`linear_approx_num_anchors` must be >= 1")
+            if self.linear_approx_gradient_mode != "stop_gradient":
+                raise ValueError("Only `linear_approx_gradient_mode='stop_gradient'` is currently supported")
 
 
 if hasattr(trl, "ORPOConfig"):

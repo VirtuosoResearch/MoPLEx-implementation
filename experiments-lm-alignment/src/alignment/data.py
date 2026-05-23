@@ -123,6 +123,7 @@ def _maybe_downsample_dataset_dict(dataset_dict: DatasetDict, args: ScriptArgume
 def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) -> Dataset:
     rows: list[dict[str, Any]] = []
     target_k = args.listwise_num_responses
+    generated_k = getattr(args, "listwise_num_generated_responses", 0)
     min_k = args.listwise_min_responses
     allowed_dimensions = set(args.preference_dimensions) if args.preference_dimensions is not None else None
 
@@ -146,6 +147,34 @@ def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) 
 
         trimmed_responses = responses[:n]
         trimmed_scores = [float(x) for x in scores[:n]]
+
+        if generated_k > 0:
+            ranked_prefix_length = row.get("ranked_prefix_length", n)
+            ranked_prefix_length = max(0, min(int(ranked_prefix_length), n))
+            original_indices = tuple(range(ranked_prefix_length))
+            generated_indices = tuple(range(ranked_prefix_length, n))
+
+            if len(original_indices) < target_k:
+                continue
+
+            if generated_indices:
+                if len(generated_indices) < generated_k:
+                    continue
+                subset_indices_iter = (
+                    original_subset + generated_subset
+                    for original_subset in combinations(original_indices, target_k)
+                    for generated_subset in combinations(generated_indices, generated_k)
+                )
+            else:
+                subset_indices_iter = combinations(original_indices, target_k)
+
+            for idxs in subset_indices_iter:
+                new_row = dict(row)
+                new_row["responses"] = [trimmed_responses[i] for i in idxs]
+                new_row["scores"] = [trimmed_scores[i] for i in idxs]
+                new_row["ranked_prefix_length"] = target_k
+                rows.append(new_row)
+            continue
 
         if n <= effective_k:
             new_row = dict(row)

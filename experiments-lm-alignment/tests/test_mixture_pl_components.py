@@ -9,7 +9,9 @@ import unittest
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
+from alignment.listwise_dpo import ListwiseDPOTrainer
 from alignment.mixture_pl_components import (
     pl_log_prob,
     mixture_pl_nll,
@@ -85,6 +87,60 @@ class TestPlLogProb(unittest.TestCase):
         )
 
         self.assertTrue(torch.allclose(first, second))
+
+    def test_pl_log_prob_m2_matches_logsigmoid(self):
+        """Verify two-way PL is the pairwise log-sigmoid objective."""
+        rewards = torch.tensor([[2.0, -1.0], [-0.5, 0.75]], dtype=torch.float32)
+        rankings = torch.tensor([[0, 1], [0, 1]], dtype=torch.long)
+
+        logp = pl_log_prob(rewards, rankings)
+        expected = F.logsigmoid(rewards[:, 0] - rewards[:, 1])
+
+        self.assertTrue(torch.allclose(logp, expected))
+
+
+class TestLinearApproximationHelper(unittest.TestCase):
+    """Test direct inner-product Taylor approximation helper."""
+
+    def test_scalar_linear_reward_is_exact(self):
+        candidate_embeddings = torch.randn(1, 4, 2, 3)
+        candidate_mask = torch.tensor([[True, True, True, False]])
+        weight = torch.randn(2, 3)
+        exact_scores = (candidate_embeddings[0] * weight).sum(dim=(-1, -2))
+        anchor_positions = [torch.tensor([0, 2], dtype=torch.long)]
+        anchor_scores = exact_scores[anchor_positions[0]]
+        anchor_grads = weight.expand(anchor_positions[0].numel(), -1, -1).clone()
+
+        estimates = ListwiseDPOTrainer._linear_approx_from_anchor_tensors(
+            candidate_embeddings,
+            candidate_mask,
+            anchor_positions,
+            anchor_scores,
+            anchor_grads,
+        )
+
+        self.assertTrue(torch.allclose(estimates[0, :3], exact_scores[:3], atol=1e-6))
+        self.assertEqual(estimates[0, 3].item(), 0.0)
+
+    def test_cluster_linear_reward_is_exact(self):
+        candidate_embeddings = torch.randn(1, 5, 2, 3)
+        candidate_mask = torch.tensor([[True, True, True, True, False]])
+        weights = torch.randn(2, 2, 3)
+        exact_scores = torch.einsum("msh,ksh->km", candidate_embeddings[0], weights)
+        anchor_positions = [torch.tensor([1, 3], dtype=torch.long)]
+        anchor_scores = exact_scores[:, anchor_positions[0]].transpose(0, 1)
+        anchor_grads = weights.unsqueeze(0).expand(anchor_positions[0].numel(), -1, -1, -1).clone()
+
+        estimates = ListwiseDPOTrainer._linear_approx_from_anchor_tensors(
+            candidate_embeddings,
+            candidate_mask,
+            anchor_positions,
+            anchor_scores,
+            anchor_grads,
+        )
+
+        self.assertTrue(torch.allclose(estimates[0, :, :4], exact_scores[:, :4], atol=1e-6))
+        self.assertTrue(torch.all(estimates[0, :, 4] == 0.0))
 
 
 class TestMixturePLNLL(unittest.TestCase):
