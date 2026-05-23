@@ -441,6 +441,16 @@ class MixturePLConfig(DPOConfig):
         default=True,
         metadata={"help": "If True, validation/evaluation uses exact scoring even when approximation is enabled."},
     )
+    linear_approx_ref_mode: str = field(
+        default="input_gradient",
+        metadata={
+            "help": (
+                "Reference handling for linear approximation. 'input_gradient' approximates the full "
+                "DPO utility gradient, while 'exact_score' subtracts exact no-grad reference scores "
+                "and ignores reference input gradients."
+            )
+        },
+    )
 
     def __post_init__(self):
         super().__post_init__()
@@ -475,6 +485,8 @@ class MixturePLConfig(DPOConfig):
                 raise ValueError("`linear_approx_num_anchors` must be >= 1")
             if self.linear_approx_gradient_mode != "stop_gradient":
                 raise ValueError("Only `linear_approx_gradient_mode='stop_gradient'` is currently supported")
+            if self.linear_approx_ref_mode not in {"input_gradient", "exact_score"}:
+                raise ValueError("`linear_approx_ref_mode` must be either 'input_gradient' or 'exact_score'")
 
 
 if hasattr(trl, "ORPOConfig"):

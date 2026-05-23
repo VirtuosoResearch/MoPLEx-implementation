@@ -329,7 +329,93 @@ def run_toy_em_only_training_smoke_test() -> None:
     print("✓ MixtureEMDPOTrainer EM-only loop completed successfully")
 
 
+def run_toy_lora_em_only_training_smoke_test() -> None:
+    torch.manual_seed(0)
+
+    tokenizer = TinyTokenizer(vocab_size=128)
+    model_config = GPT2Config(
+        vocab_size=128,
+        n_positions=128,
+        n_ctx=128,
+        n_embd=32,
+        n_layer=1,
+        n_head=2,
+    )
+    model = GPT2LMHeadModel(model_config)
+
+    training_args = MixturePLConfig(
+        output_dir="/tmp/mixture_dpo_toy_lora_em_only_smoke",
+        bf16=False,
+        remove_unused_columns=False,
+        report_to=[],
+        max_steps=2,
+        save_strategy="no",
+        eval_strategy="no",
+        logging_steps=1,
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=1,
+        learning_rate=5e-4,
+        max_length=96,
+        max_prompt_length=48,
+        use_mixture=True,
+        num_clusters=2,
+        mixture_training_mode="em_only",
+        m_step_updates=2,
+        mixture_reward_backend="lora",
+        mixture_nll_weight=0.1,
+        use_contextual_router=False,
+        router_hidden_size=32,
+        em_temperature=1.0,
+        log_cluster_metrics=True,
+    )
+    peft_config = LoraConfig(
+        r=2,
+        lora_alpha=2,
+        lora_dropout=0.0,
+        target_modules=["c_attn"],
+        task_type="CAUSAL_LM",
+    )
+
+    trainer = MixtureEMDPOTrainer(
+        model=model,
+        ref_model=None,
+        args=training_args,
+        train_dataset=build_toy_listwise_dataset(),
+        eval_dataset=build_toy_listwise_dataset(),
+        processing_class=tokenizer,
+        peft_config=peft_config,
+        mixture_config=training_args,
+        listwise_beta=0.1,
+    )
+
+    result = trainer.train()
+    if result.global_step != training_args.max_steps:
+        raise RuntimeError(f"Expected {training_args.max_steps} LoRA EM optimizer steps, got {result.global_step}.")
+    if not torch.isfinite(torch.tensor(result.training_loss)):
+        raise RuntimeError(f"LoRA EM-only training loss is not finite: {result.training_loss}")
+
+    logged_keys = set()
+    for log_entry in trainer.state.log_history:
+        logged_keys.update(log_entry)
+    required_log_keys = {
+        "mixture/router_em_nll",
+        "mixture/component_em_nll",
+        "listwise/top1_acc",
+        "listwise/pairwise_acc",
+    }
+    missing_log_keys = required_log_keys - logged_keys
+    if missing_log_keys:
+        raise RuntimeError(f"Missing LoRA EM-only trainer log metrics: {sorted(missing_log_keys)}")
+
+    print("=" * 80)
+    print("TOY MIXTURE DPO LORA EM-ONLY SMOKE TEST")
+    print("=" * 80)
+    print(f"Train loss: {result.training_loss:.6f}")
+    print("✓ MixtureEMDPOTrainer LoRA EM-only loop completed successfully")
+
+
 if __name__ == "__main__":
     run_toy_training_smoke_test()
     run_toy_lora_adapter_training_smoke_test()
     run_toy_em_only_training_smoke_test()
+    run_toy_lora_em_only_training_smoke_test()

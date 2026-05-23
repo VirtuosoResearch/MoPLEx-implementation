@@ -119,7 +119,6 @@ class RankingEvaluationCallback(TrainerCallback):
         if metrics is not None:
             metrics.update(logged_metrics)
             metrics.update(best_model_aliases)
-        self.trainer.log(logged_metrics)
 
 
 def main(script_args, training_args, model_args):

@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
+import gc
 import inspect
 import math
 import os
@@ -386,27 +387,46 @@ class ListwiseDPOTrainer(DPOTrainer):
         anchor_embeds = anchor_embeds.detach().requires_grad_(True)
         anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
         anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
+        ref_mode = getattr(self.args, "linear_approx_ref_mode", "input_gradient")
+        beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+        exact_ref_logps = None
+        if ref_mode == "exact_score":
+            exact_ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
+                batch_size,
+                num_candidates,
+            )
 
         with torch.enable_grad():
             policy_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
             policy_logps = self._sequence_logps(policy_logits, anchor_labels)
-            ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
-            beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
-            anchor_utilities = beta * (policy_logps - ref_logps)
-            anchor_grads = torch.autograd.grad(
-                anchor_utilities.sum(),
-                anchor_embeds,
-                retain_graph=True,
-                create_graph=False,
-            )[0].detach()
+            if ref_mode == "exact_score":
+                anchor_grads = torch.autograd.grad(
+                    policy_logps.sum(),
+                    anchor_embeds,
+                    retain_graph=True,
+                    create_graph=False,
+                )[0].detach()
+                anchor_scores = policy_logps
+            else:
+                ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
+                anchor_scores = beta * (policy_logps - ref_logps)
+                anchor_grads = torch.autograd.grad(
+                    anchor_scores.sum(),
+                    anchor_embeds,
+                    retain_graph=True,
+                    create_graph=False,
+                )[0].detach()
 
-        return self._linear_approx_from_anchor_tensors(
+        estimates = self._linear_approx_from_anchor_tensors(
             candidate_embeddings,
             candidate_mask,
             anchor_positions,
-            anchor_utilities,
+            anchor_scores,
             anchor_grads,
         )
+        if ref_mode == "exact_score":
+            return beta * (estimates - exact_ref_logps.detach())
+        return estimates
 
     @staticmethod
     def _pl_negative_log_likelihood(
@@ -1055,17 +1075,25 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         anchor_embeds = anchor_embeds.detach().requires_grad_(True)
         anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
         anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
-
-        with torch.enable_grad():
-            ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
-            ref_grads = torch.autograd.grad(
-                ref_logps.sum(),
-                anchor_embeds,
-                retain_graph=False,
-                create_graph=False,
-            )[0].detach()
-
+        ref_mode = getattr(self.mixture_config, "linear_approx_ref_mode", "input_gradient")
         beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+
+        if ref_mode == "exact_score":
+            ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
+                batch_size,
+                num_candidates,
+            )
+            ref_grads = None
+        else:
+            with torch.enable_grad():
+                ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
+                ref_grads = torch.autograd.grad(
+                    ref_logps.sum(),
+                    anchor_embeds,
+                    retain_graph=False,
+                    create_graph=False,
+                )[0].detach()
+
         reward_tensors = []
         for adapter_name in self.mixture_adapter_names:
             self._set_active_adapter(adapter_name)
@@ -1078,18 +1106,23 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
                     retain_graph=True,
                     create_graph=False,
                 )[0].detach()
-                anchor_utilities = beta * (adapter_logps - ref_logps.detach())
-                anchor_utility_grads = beta * (adapter_grads - ref_grads)
+                if ref_mode == "exact_score":
+                    anchor_scores = adapter_logps
+                    anchor_grads = adapter_grads
+                else:
+                    anchor_scores = beta * (adapter_logps - ref_logps.detach())
+                    anchor_grads = beta * (adapter_grads - ref_grads)
 
-            reward_tensors.append(
-                self._linear_approx_from_anchor_tensors(
-                    candidate_embeddings,
-                    candidate_mask,
-                    anchor_positions,
-                    anchor_utilities,
-                    anchor_utility_grads,
-                )
+            estimates = self._linear_approx_from_anchor_tensors(
+                candidate_embeddings,
+                candidate_mask,
+                anchor_positions,
+                anchor_scores,
+                anchor_grads,
             )
+            if ref_mode == "exact_score":
+                estimates = beta * (estimates - ref_logps.detach())
+            reward_tensors.append(estimates)
 
         self._set_active_adapter(self.policy_adapter_name)
         self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
@@ -1668,6 +1701,14 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
         except (TypeError, ValueError):
             return 0
 
+    def _release_cuda_cache_after_eval_or_save(self) -> None:
+        """Release cached CUDA blocks after memory-heavy eval/checkpoint phases."""
+        if not torch.cuda.is_available():
+            return
+        self.accelerator.wait_for_everyone()
+        gc.collect()
+        torch.cuda.empty_cache()
+
     def _update_best_metric_for_legacy_checkpointing(self, metrics: Optional[dict[str, float]]) -> None:
         """Update TrainerState best fields for Trainer versions whose _save_checkpoint lacks metrics=."""
         if not metrics:
@@ -1703,6 +1744,7 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
 
         if should_eval and self.eval_dataset is not None:
             eval_metrics = self.evaluate()
+            self._release_cuda_cache_after_eval_or_save()
 
         should_save = False
         if force_epoch:
@@ -1718,6 +1760,7 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                 and self.eval_dataset is not None
             ):
                 eval_metrics = self.evaluate()
+                self._release_cuda_cache_after_eval_or_save()
             try:
                 self._save_checkpoint(self.model, trial=trial, metrics=eval_metrics)
             except TypeError as exc:
@@ -1726,6 +1769,7 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                 self._update_best_metric_for_legacy_checkpointing(eval_metrics)
                 self._save_checkpoint(self.model, trial=trial)
             self.control = self.callback_handler.on_save(self.args, self.state, self.control)
+            self._release_cuda_cache_after_eval_or_save()
 
     def train(self, resume_from_checkpoint=None, trial=None, ignore_keys_for_eval=None, **kwargs):  # noqa: D401
         del ignore_keys_for_eval, kwargs

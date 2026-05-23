@@ -12,6 +12,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from alignment.listwise_dpo import ListwiseDPOTrainer
+from alignment.configs import MixturePLConfig
 from alignment.mixture_pl_components import (
     pl_log_prob,
     mixture_pl_nll,
@@ -141,6 +142,59 @@ class TestLinearApproximationHelper(unittest.TestCase):
 
         self.assertTrue(torch.allclose(estimates[0, :, :4], exact_scores[:, :4], atol=1e-6))
         self.assertTrue(torch.all(estimates[0, :, 4] == 0.0))
+
+    def test_exact_ref_score_mode_scalar_formula(self):
+        candidate_embeddings = torch.randn(1, 4, 2, 3)
+        candidate_mask = torch.tensor([[True, True, True, True]])
+        policy_weight = torch.randn(2, 3)
+        policy_logps = (candidate_embeddings[0] * policy_weight).sum(dim=(-1, -2))
+        ref_logps = torch.tensor([[0.5, -0.25, 0.75, -1.0]], dtype=policy_logps.dtype)
+        beta = 0.1
+        anchor_positions = [torch.tensor([0, 2], dtype=torch.long)]
+        anchor_scores = policy_logps[anchor_positions[0]]
+        anchor_grads = policy_weight.expand(anchor_positions[0].numel(), -1, -1).clone()
+
+        estimated_policy = ListwiseDPOTrainer._linear_approx_from_anchor_tensors(
+            candidate_embeddings,
+            candidate_mask,
+            anchor_positions,
+            anchor_scores,
+            anchor_grads,
+        )
+        utilities = beta * (estimated_policy - ref_logps)
+        expected = beta * (policy_logps.unsqueeze(0) - ref_logps)
+
+        self.assertTrue(torch.allclose(utilities, expected, atol=1e-6))
+
+    def test_exact_ref_score_mode_cluster_formula(self):
+        candidate_embeddings = torch.randn(1, 4, 2, 3)
+        candidate_mask = torch.tensor([[True, True, True, True]])
+        adapter_weights = torch.randn(2, 2, 3)
+        adapter_logps = torch.einsum("msh,ksh->km", candidate_embeddings[0], adapter_weights)
+        ref_logps = torch.tensor([[0.25, -0.5, 1.0, -0.75]], dtype=adapter_logps.dtype)
+        beta = 0.2
+        anchor_positions = [torch.tensor([1, 3], dtype=torch.long)]
+        anchor_scores = adapter_logps[:, anchor_positions[0]].transpose(0, 1)
+        anchor_grads = adapter_weights.unsqueeze(0).expand(anchor_positions[0].numel(), -1, -1, -1).clone()
+
+        estimated_adapters = ListwiseDPOTrainer._linear_approx_from_anchor_tensors(
+            candidate_embeddings,
+            candidate_mask,
+            anchor_positions,
+            anchor_scores,
+            anchor_grads,
+        )
+        rewards = beta * (estimated_adapters - ref_logps.unsqueeze(1))
+        expected = beta * (adapter_logps.unsqueeze(0) - ref_logps.unsqueeze(1))
+
+        self.assertTrue(torch.allclose(rewards, expected, atol=1e-6))
+
+    def test_linear_approx_ref_mode_validation(self):
+        MixturePLConfig(use_linear_reward_approx=True, linear_approx_ref_mode="input_gradient", bf16=False)
+        MixturePLConfig(use_linear_reward_approx=True, linear_approx_ref_mode="exact_score", bf16=False)
+
+        with self.assertRaises(ValueError):
+            MixturePLConfig(use_linear_reward_approx=True, linear_approx_ref_mode="bad_mode", bf16=False)
 
 
 class TestMixturePLNLL(unittest.TestCase):
