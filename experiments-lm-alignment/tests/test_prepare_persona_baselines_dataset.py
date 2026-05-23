@@ -20,6 +20,7 @@ def make_args(**overrides):
         split_mode="row_by_persona",
         hard_negative_seed=123,
         num_responses_per_prompt=4,
+        eval_num_responses_per_prompt=None,
         negative_pool="same_split",
         negative_response_source="original",
         hard_negative_persona_pool="all",
@@ -68,6 +69,35 @@ def make_prompt_overlap_rows(num_prompts=12, num_personas=3):
             )
             idx += 1
     return rows
+
+
+def make_split_prompt_rows():
+    rows = []
+    idx = 0
+    for split in ["train", "validation", "test"]:
+        for persona_id in ["p0", "p1", "p2", "p3"]:
+            rows.append(
+                {
+                    "source_split": "train",
+                    "source_index": idx,
+                    "global_index": idx,
+                    "row_id": f"train:{idx}",
+                    "persona_id": persona_id,
+                    "persona_text": f"persona text {persona_id}",
+                    "instruction": f"shared prompt {split}",
+                    "chosen": f"personalized {split} {persona_id}",
+                    "rejected": f"generic answer {split}",
+                }
+            )
+            idx += 1
+    return rows
+
+
+def split_map_for_split_prompt_rows(raw_rows):
+    row_to_split = {}
+    for row in raw_rows:
+        row_to_split[row["row_id"]] = row["instruction"].replace("shared prompt ", "")
+    return row_to_split
 
 
 def test_prompt_split_keeps_each_instruction_in_one_split():
@@ -158,6 +188,46 @@ def test_listwise_can_skip_original_and_use_only_other_persona_negatives():
     assert "generic answer" not in first["responses"]
     assert first["negative_response_source"] == "other_persona"
     assert set(first["negative_persona_ids"]).issubset({"p1", "p2"})
+
+
+def test_listwise_eval_k_applies_only_to_validation_and_test():
+    args = make_args(num_responses_per_prompt=4, eval_num_responses_per_prompt=2, negative_response_source="other_persona")
+    raw_rows = make_split_prompt_rows()
+    rows = persona_prepare.build_persona_rows(
+        raw_rows,
+        ["p0", "p1", "p2", "p3"],
+        args,
+        row_to_split=split_map_for_split_prompt_rows(raw_rows),
+    )
+
+    split_rows, stats = persona_prepare.build_listwise_rows(rows, "instruction_only", args)
+
+    assert stats["kept"] == 12
+    assert all(len(row["responses"]) == 4 for row in split_rows["train"])
+    assert all(len(row["responses"]) == 2 for row in split_rows["validation"])
+    assert all(len(row["responses"]) == 2 for row in split_rows["test"])
+    assert all("generic_original" not in row["negative_persona_ids"] for row in split_rows["validation"])
+    assert all("generic_original" not in row["negative_persona_ids"] for row in split_rows["test"])
+    for split in ["validation", "test"]:
+        for row in split_rows[split]:
+            assert row["negative_persona_ids"][0] != row["persona_id"]
+            assert row["responses"][1].startswith(f"personalized {split} ")
+
+
+def test_listwise_dir_name_includes_eval_k_only_when_different():
+    base_args = make_args(num_responses_per_prompt=4)
+    same_args = make_args(num_responses_per_prompt=4, eval_num_responses_per_prompt=4)
+    eval_args = make_args(num_responses_per_prompt=4, eval_num_responses_per_prompt=2)
+
+    assert persona_prepare.listwise_dir_name("persona_10", "persona_conditioned", base_args).endswith(
+        "_top1_listwise_persona_conditioned_k4"
+    )
+    assert persona_prepare.listwise_dir_name("persona_10", "persona_conditioned", same_args).endswith(
+        "_top1_listwise_persona_conditioned_k4"
+    )
+    assert persona_prepare.listwise_dir_name("persona_10", "persona_conditioned", eval_args).endswith(
+        "_top1_listwise_persona_conditioned_k4_evalk2"
+    )
 
 
 def test_listwise_can_sample_negatives_from_unselected_personas():

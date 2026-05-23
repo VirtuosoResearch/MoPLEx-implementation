@@ -10,11 +10,18 @@ PYTHON="${PYTHON:-python}"
 SOURCE_DATASET="${SOURCE_DATASET:-SynthLabsAI/PERSONA}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/persona_baselines}"
 PROMPT_MODE="${PROMPT_MODE:-instruction_only}"
-NUM_PERSONAS="${NUM_PERSONAS:-20}"
+NUM_PERSONAS="${NUM_PERSONAS:-10}"
 NUM_RESPONSES_PER_PROMPT="${NUM_RESPONSES_PER_PROMPT:-4}"
 HARD_NEGATIVE_PERSONA_POOL="${HARD_NEGATIVE_PERSONA_POOL:-all}"
 NEGATIVE_POOL="${NEGATIVE_POOL:-same_split}"
-NEGATIVE_RESPONSE_SOURCE="${NEGATIVE_RESPONSE_SOURCE:-other_persona}"
+NEGATIVE_RESPONSE_SOURCE="${NEGATIVE_RESPONSE_SOURCE:-other_persona}" # key
+if [[ -z "${EVAL_NUM_RESPONSES_PER_PROMPT+x}" ]]; then
+  if [[ "${NEGATIVE_RESPONSE_SOURCE}" == "other_persona" ]]; then
+    EVAL_NUM_RESPONSES_PER_PROMPT="2"
+  else
+    EVAL_NUM_RESPONSES_PER_PROMPT=""
+  fi
+fi
 SPLIT_MODE="${SPLIT_MODE:-prompt}"
 NUM_CLUSTERS="${NUM_CLUSTERS:-${NUM_PERSONAS}}"
 SEED="${SEED:-42}"
@@ -36,9 +43,17 @@ else
   DATASET_NAME_PREFIX="${DATASET_NAME_PREFIX:-persona_${NUM_PERSONAS}_${NEGATIVE_RESPONSE_SOURCE}}"
 fi
 RUN_TAG="n${NUM_PERSONAS}-${PROMPT_MODE}-${NEGATIVE_RESPONSE_SOURCE}-s${SEED}"
+LISTWISE_K_SUFFIX="k${NUM_RESPONSES_PER_PROMPT}"
+eval_num_responses_args=()
+if [[ -n "${EVAL_NUM_RESPONSES_PER_PROMPT}" ]]; then
+  eval_num_responses_args=(--eval_num_responses_per_prompt "${EVAL_NUM_RESPONSES_PER_PROMPT}")
+  if [[ "${EVAL_NUM_RESPONSES_PER_PROMPT}" != "${NUM_RESPONSES_PER_PROMPT}" ]]; then
+    LISTWISE_K_SUFFIX="${LISTWISE_K_SUFFIX}_evalk${EVAL_NUM_RESPONSES_PER_PROMPT}"
+  fi
+fi
 
 PAIRWISE_DATASET_DIR="${DATA_ROOT}/${DATASET_NAME_PREFIX}_pairwise_${PROMPT_MODE}"
-LISTWISE_DATASET_DIR="${DATA_ROOT}/${DATASET_NAME_PREFIX}_top1_listwise_${PROMPT_MODE}_k${NUM_RESPONSES_PER_PROMPT}"
+LISTWISE_DATASET_DIR="${DATA_ROOT}/${DATASET_NAME_PREFIX}_top1_listwise_${PROMPT_MODE}_${LISTWISE_K_SUFFIX}"
 
 if [[ "${FORCE_PREPARE}" == "true" || ! -d "${PAIRWISE_DATASET_DIR}" || ! -d "${LISTWISE_DATASET_DIR}" ]]; then
   echo "Preparing PERSONA datasets under ${DATA_ROOT}"
@@ -60,6 +75,7 @@ if [[ "${FORCE_PREPARE}" == "true" || ! -d "${PAIRWISE_DATASET_DIR}" || ! -d "${
     --persona_subset_seed "${SEED}" \
     --split_seed "${SEED}" \
     --hard_negative_seed "${SEED}" \
+    "${eval_num_responses_args[@]}" \
     "${overwrite_args[@]}"
 fi
 

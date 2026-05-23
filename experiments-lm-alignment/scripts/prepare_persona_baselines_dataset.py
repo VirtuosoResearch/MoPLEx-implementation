@@ -52,6 +52,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--persona_subset_seed", type=int, default=42)
     parser.add_argument("--num_responses_per_prompt", type=int, default=4)
     parser.add_argument(
+        "--eval_num_responses_per_prompt",
+        type=int,
+        default=None,
+        help=(
+            "Optional PERSONA-only eval K. When set, validation/test listwise rows use this many "
+            "responses while train rows still use --num_responses_per_prompt."
+        ),
+    )
+    parser.add_argument(
         "--prompt_mode",
         choices=("instruction_only", "persona_conditioned", "both"),
         default="both",
@@ -443,6 +452,9 @@ def build_listwise_rows(
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, int]]:
     if args.num_responses_per_prompt < 2:
         raise ValueError("--num_responses_per_prompt must be >= 2")
+    eval_k = getattr(args, "eval_num_responses_per_prompt", None)
+    if eval_k is not None and eval_k < 2:
+        raise ValueError("--eval_num_responses_per_prompt must be >= 2 when provided")
 
     hard_negative_rows = hard_negative_rows if hard_negative_rows is not None else rows
     prompt_pool = build_hard_negative_pool(hard_negative_rows, args)
@@ -452,10 +464,14 @@ def build_listwise_rows(
     split_rows: dict[str, list[dict[str, Any]]] = defaultdict(list)
     stats = Counter()
     for row in rows:
+        row_num_responses = args.num_responses_per_prompt
+        if eval_k is not None and row.split in {"validation", "test"}:
+            row_num_responses = eval_k
+
         excluded_responses = {row.chosen}
         if include_original:
             excluded_responses.add(row.rejected)
-        needed_hard_negatives = args.num_responses_per_prompt - 1 - int(include_original)
+        needed_hard_negatives = row_num_responses - 1 - int(include_original)
         candidates = candidate_hard_negatives(
             row,
             prompt_pool,
@@ -491,6 +507,7 @@ def build_listwise_rows(
             }
         )
         stats["kept"] += 1
+        stats[f"kept_{row.split}"] += 1
     return split_rows, dict(stats)
 
 
@@ -524,6 +541,14 @@ def prompt_modes(args: argparse.Namespace) -> list[str]:
     if args.prompt_mode == "both":
         return ["instruction_only", "persona_conditioned"]
     return [args.prompt_mode]
+
+
+def listwise_dir_name(output_name_prefix: str, prompt_mode: str, args: argparse.Namespace) -> str:
+    suffix = f"k{args.num_responses_per_prompt}"
+    eval_k = getattr(args, "eval_num_responses_per_prompt", None)
+    if eval_k is not None and eval_k != args.num_responses_per_prompt:
+        suffix = f"{suffix}_evalk{eval_k}"
+    return f"{output_name_prefix}_top1_listwise_{prompt_mode}_{suffix}"
 
 
 def main() -> None:
@@ -570,6 +595,7 @@ def main() -> None:
         "num_rows_after_selection": len(persona_rows),
         "rows_per_persona": dict(sorted(persona_counts.items())),
         "num_responses_per_prompt": args.num_responses_per_prompt,
+        "eval_num_responses_per_prompt": args.eval_num_responses_per_prompt,
         "output_name_prefix": args.output_name_prefix,
         "split_mode": args.split_mode,
         "negative_pool": args.negative_pool,
@@ -612,7 +638,7 @@ def main() -> None:
             args,
             hard_negative_rows=hard_negative_rows,
         )
-        listwise_dir = output_root / f"{args.output_name_prefix}_top1_listwise_{mode}_k{args.num_responses_per_prompt}"
+        listwise_dir = output_root / listwise_dir_name(args.output_name_prefix, mode, args)
         save_dataset(
             listwise_rows,
             listwise_dir,
@@ -622,6 +648,7 @@ def main() -> None:
                 "prompt_mode": mode,
                 "num_personas": len(selected_personas),
                 "num_responses_per_prompt": args.num_responses_per_prompt,
+                "eval_num_responses_per_prompt": args.eval_num_responses_per_prompt,
                 "ranked_prefix_length": 1,
                 "split_mode": args.split_mode,
                 "negative_pool": args.negative_pool,
