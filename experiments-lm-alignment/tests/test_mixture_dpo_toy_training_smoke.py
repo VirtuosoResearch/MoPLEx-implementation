@@ -414,8 +414,130 @@ def run_toy_lora_em_only_training_smoke_test() -> None:
     print("✓ MixtureEMDPOTrainer LoRA EM-only loop completed successfully")
 
 
+def run_toy_lora_em_only_linear_approx_smoke_test() -> None:
+    for ref_mode in ("input_gradient", "exact_score"):
+        torch.manual_seed(0)
+
+        tokenizer = TinyTokenizer(vocab_size=128)
+        model_config = GPT2Config(
+            vocab_size=128,
+            n_positions=128,
+            n_ctx=128,
+            n_embd=32,
+            n_layer=1,
+            n_head=2,
+        )
+        model = GPT2LMHeadModel(model_config)
+
+        training_args = MixturePLConfig(
+            output_dir=f"/tmp/mixture_dpo_toy_lora_em_only_linear_approx_{ref_mode}",
+            bf16=False,
+            remove_unused_columns=False,
+            report_to=[],
+            max_steps=1,
+            save_strategy="no",
+            eval_strategy="no",
+            logging_steps=1,
+            per_device_train_batch_size=2,
+            gradient_accumulation_steps=1,
+            learning_rate=5e-4,
+            max_length=96,
+            max_prompt_length=48,
+            use_mixture=True,
+            num_clusters=2,
+            mixture_training_mode="em_only",
+            m_step_updates=1,
+            mixture_reward_backend="lora",
+            mixture_nll_weight=0.1,
+            use_contextual_router=False,
+            router_hidden_size=32,
+            em_temperature=1.0,
+            log_cluster_metrics=True,
+            use_linear_reward_approx=True,
+            linear_approx_num_anchors=1,
+            linear_approx_ref_mode=ref_mode,
+        )
+        peft_config = LoraConfig(
+            r=2,
+            lora_alpha=2,
+            lora_dropout=0.0,
+            target_modules=["c_attn"],
+            task_type="CAUSAL_LM",
+        )
+
+        trainer = MixtureEMDPOTrainer(
+            model=model,
+            ref_model=None,
+            args=training_args,
+            train_dataset=build_toy_listwise_dataset(),
+            eval_dataset=build_toy_listwise_dataset(),
+            processing_class=tokenizer,
+            peft_config=peft_config,
+            mixture_config=training_args,
+            listwise_beta=0.1,
+        )
+
+        active_adapter = {"name": None}
+        original_set_active_adapter = trainer._set_active_adapter
+
+        def tracked_set_active_adapter(adapter_name: str) -> None:
+            active_adapter["name"] = adapter_name
+            original_set_active_adapter(adapter_name)
+
+        original_forward = trainer.model.forward
+        mixture_forward_batches = []
+
+        def tracked_forward(*args, **kwargs):
+            if active_adapter["name"] in set(trainer.mixture_adapter_names):
+                if kwargs.get("inputs_embeds") is not None:
+                    mixture_forward_batches.append(("inputs_embeds", int(kwargs["inputs_embeds"].shape[0])))
+                elif kwargs.get("input_ids") is not None:
+                    mixture_forward_batches.append(("input_ids", int(kwargs["input_ids"].shape[0])))
+            return original_forward(*args, **kwargs)
+
+        trainer._set_active_adapter = tracked_set_active_adapter
+        trainer.model.forward = tracked_forward
+
+        result = trainer.train()
+        if result.global_step != training_args.max_steps:
+            raise RuntimeError(
+                f"Expected {training_args.max_steps} linear-approx LoRA EM optimizer steps, got {result.global_step}."
+            )
+        if not torch.isfinite(torch.tensor(result.training_loss)):
+            raise RuntimeError(f"Linear-approx LoRA EM-only training loss is not finite: {result.training_loss}")
+
+        if not mixture_forward_batches:
+            raise RuntimeError("Linear-approx LoRA EM-only test did not observe mixture adapter forwards.")
+
+        expected_anchor_rows = training_args.per_device_train_batch_size * training_args.linear_approx_num_anchors
+        num_candidates = len(build_toy_listwise_dataset()[0]["responses"])
+        full_candidate_rows = training_args.per_device_train_batch_size * num_candidates
+        full_candidate_adapter_forwards = [
+            batch for batch in mixture_forward_batches if batch[0] == "input_ids" and batch[1] >= full_candidate_rows
+        ]
+        oversized_anchor_forwards = [
+            batch for batch in mixture_forward_batches if batch[0] == "inputs_embeds" and batch[1] > expected_anchor_rows
+        ]
+        if full_candidate_adapter_forwards:
+            raise RuntimeError(
+                "Linear-approx LoRA EM-only path used full-candidate input_ids forwards for mixture adapters: "
+                f"{full_candidate_adapter_forwards}"
+            )
+        if oversized_anchor_forwards:
+            raise RuntimeError(
+                "Linear-approx LoRA EM-only path forwarded more than the selected anchors through mixture adapters: "
+                f"{oversized_anchor_forwards}"
+            )
+
+    print("=" * 80)
+    print("TOY MIXTURE DPO LORA EM-ONLY LINEAR APPROX SMOKE TEST")
+    print("=" * 80)
+    print("✓ MixtureEMDPOTrainer LoRA EM-only linear approximation completed successfully")
+
+
 if __name__ == "__main__":
     run_toy_training_smoke_test()
     run_toy_lora_adapter_training_smoke_test()
     run_toy_em_only_training_smoke_test()
     run_toy_lora_em_only_training_smoke_test()
+    run_toy_lora_em_only_linear_approx_smoke_test()

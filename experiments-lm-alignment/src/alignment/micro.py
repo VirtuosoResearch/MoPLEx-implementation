@@ -21,7 +21,6 @@ from transformers import (
     PreTrainedModel,
 )
 from transformers.trainer_pt_utils import nested_detach
-import jsonlines
 from trl import RewardConfig, RewardTrainer
 from transformers.utils import PaddingStrategy
 from safetensors.torch import load_file as load_safetensors

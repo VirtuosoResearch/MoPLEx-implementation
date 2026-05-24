@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASH_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -11,8 +12,8 @@ ORIGINAL_DATASET_DIR="${ORIGINAL_DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_di
 AUGMENTED_DATASET_DIR="${AUGMENTED_DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_disagreement_train_augmented_Qwen3_0p6B_ds0p25_k8_s42}"
 BASE_STATS_PATH="${BASE_STATS_PATH:-${ORIGINAL_DATASET_DIR}/stats.json}"
 
-DATASET_MODES="${DATASET_MODES:-original augmented}"
-ANCHORS="${ANCHORS:-1 2 4}"
+DATASET_MODES="${DATASET_MODES:-augmented}"
+ANCHORS="${ANCHORS:-2 4}"
 SEEDS="${SEEDS:-42}"
 RANKING_SIZES="${RANKING_SIZES:-4}"
 GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-4 2}"
@@ -25,7 +26,7 @@ MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-lora}"
 ORIGINAL_DOWNSAMPLE_RATIO="${ORIGINAL_DOWNSAMPLE_RATIO:-${DOWNSAMPLE_RATIO:-0.25}}"
 AUGMENTED_DOWNSAMPLE_RATIO="${AUGMENTED_DOWNSAMPLE_RATIO:-${DOWNSAMPLE_RATIO:-1.0}}"
 DOWNSAMPLE_GROUP_KEY="${DOWNSAMPLE_GROUP_KEY:-source_index}"
-METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-ranking_validation/mixture/cluster_acc}"
+METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-mixture_posterior/pairwise_acc}"
 
 # The approximation path calls autograd.grad for input-embedding gradients.
 # This is not compatible with checkpoint recomputation while LoRA adapters are
@@ -193,6 +194,12 @@ for dataset_mode in ${DATASET_MODES}; do
   for anchor in ${ANCHORS}; do
     if [[ "${dataset_mode}" == "augmented" ]]; then
       for generated_ranking_size in ${generated_sizes}; do
+        # skip anchor==2 and generated_ranking_size==4
+        if [[ "${anchor}" -eq 2 && "${ranking_size}" -eq 4 
+          && "${generated_ranking_size}" -eq 4  ]]; then
+          echo "Skipping anchor=${anchor} with ranking_size=${ranking_size} and generated_ranking_size=4." >&2
+          continue
+        fi
         run_one "${dataset_mode}" "${dataset_dir}" "${downsample_ratio}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${m_step_updates}" "${ranking_size}" "${generated_ranking_size}"
       done
     else

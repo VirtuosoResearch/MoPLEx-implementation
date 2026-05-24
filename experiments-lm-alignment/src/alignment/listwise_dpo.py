@@ -186,19 +186,25 @@ class ListwiseDPOTrainer(DPOTrainer):
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         train_eval = "eval" if any(key.startswith("eval_") for key in logs) else "train"
-        stored = getattr(self, "_stored_metrics", {}).get(train_eval, {})
+        if not hasattr(self, "_stored_metrics"):
+            self._stored_metrics = {"train": {}, "eval": {}}
+        self._stored_metrics.setdefault("train", {})
+        self._stored_metrics.setdefault("eval", {})
+        stored = self._stored_metrics.get(train_eval, {})
         prefix = "eval_" if train_eval == "eval" else ""
         for key, values in stored.items():
             if not values:
                 continue
             metric_key = key if key.startswith(prefix) else f"{prefix}{key}"
             logs[metric_key] = torch.tensor(values, dtype=torch.float32).mean().item()
-        if hasattr(self, "_stored_metrics"):
-            self._stored_metrics[train_eval] = {}
+        self._stored_metrics[train_eval] = {}
         try:
-            return super().log(logs, start_time=start_time)
+            result = super().log(logs, start_time=start_time)
         except TypeError:
-            return super().log(logs)
+            result = super().log(logs)
+        self._stored_metrics.setdefault("train", {})
+        self._stored_metrics.setdefault("eval", {})
+        return result
 
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
@@ -1513,32 +1519,145 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         if not closed_form_router:
             self.accelerator.backward(router_loss)
 
-        ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
         beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+        use_linear_m_step = self._use_linear_reward_approx("train") and not self.mixture_config.use_contextual_router
 
-        for cluster_idx, adapter_name in enumerate(self.mixture_adapter_names):
-            self._set_active_adapter(adapter_name)
-            adapter_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
-            adapter_logps = self._sequence_logps(adapter_logits, flat_labels).view(batch_size, num_candidates)
-            rewards = beta * (adapter_logps - ref_logps)
-            comp_logp = pl_log_prob(
-                rewards,
-                rankings,
-                candidate_mask=candidate_mask,
-                ranked_prefix_lengths=ranked_prefix_lengths,
+        if use_linear_m_step:
+            embedding_layer = model.get_input_embeddings()
+            candidate_embeddings = embedding_layer(flat_input_ids).detach().view(
+                batch_size,
+                num_candidates,
+                seq_len,
+                -1,
             )
-            weighted_comp_nll = -(gamma[:, cluster_idx].to(dtype=comp_logp.dtype) * comp_logp)
-            if torch.any(valid_rows):
-                component_loss = weighted_comp_nll[valid_rows].mean()
-            else:
-                component_loss = weighted_comp_nll.sum() * 0.0
+            anchor_positions = self._select_linear_approx_anchors(candidate_mask)
+            anchor_flat_indices = [
+                row_idx * num_candidates + position
+                for row_idx, positions in enumerate(anchor_positions)
+                for position in positions.tolist()
+            ]
 
-            self.accelerator.backward(component_loss)
-            loss_value = float(component_loss.detach().item())
-            component_loss_value += loss_value
-            total_loss_value += loss_value
+            if anchor_flat_indices:
+                anchor_flat_indices_tensor = torch.tensor(
+                    anchor_flat_indices,
+                    device=flat_input_ids.device,
+                    dtype=torch.long,
+                )
+                anchor_embeds = candidate_embeddings.view(batch_size * num_candidates, seq_len, -1).index_select(
+                    0,
+                    anchor_flat_indices_tensor,
+                )
+                anchor_embeds = anchor_embeds.detach().requires_grad_(True)
+                anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
+                anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
 
-            del adapter_logits, adapter_logps, rewards, comp_logp, weighted_comp_nll, component_loss
+                ref_mode = getattr(self.mixture_config, "linear_approx_ref_mode", "input_gradient")
+                if ref_mode == "exact_score":
+                    ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
+                        batch_size,
+                        num_candidates,
+                    )
+                    ref_grads = None
+                else:
+                    with torch.enable_grad():
+                        ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
+                        ref_grads = torch.autograd.grad(
+                            ref_logps.sum(),
+                            anchor_embeds,
+                            retain_graph=False,
+                            create_graph=False,
+                        )[0].detach()
+
+                for cluster_idx, adapter_name in enumerate(self.mixture_adapter_names):
+                    self._set_active_adapter(adapter_name)
+                    with torch.enable_grad():
+                        adapter_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
+                        adapter_logps = self._sequence_logps(adapter_logits, anchor_labels)
+                        adapter_grads = torch.autograd.grad(
+                            adapter_logps.sum(),
+                            anchor_embeds,
+                            retain_graph=True,
+                            create_graph=False,
+                        )[0].detach()
+                        if ref_mode == "exact_score":
+                            anchor_scores = adapter_logps
+                            anchor_grads = adapter_grads
+                        else:
+                            anchor_scores = beta * (adapter_logps - ref_logps.detach())
+                            anchor_grads = beta * (adapter_grads - ref_grads)
+
+                    estimates = self._linear_approx_from_anchor_tensors(
+                        candidate_embeddings,
+                        candidate_mask,
+                        anchor_positions,
+                        anchor_scores,
+                        anchor_grads,
+                    )
+                    rewards = beta * (estimates - ref_logps.detach()) if ref_mode == "exact_score" else estimates
+                    comp_logp = pl_log_prob(
+                        rewards,
+                        rankings,
+                        candidate_mask=candidate_mask,
+                        ranked_prefix_lengths=ranked_prefix_lengths,
+                    )
+                    weighted_comp_nll = -(gamma[:, cluster_idx].to(dtype=comp_logp.dtype) * comp_logp)
+                    if torch.any(valid_rows):
+                        component_loss = weighted_comp_nll[valid_rows].mean()
+                    else:
+                        component_loss = weighted_comp_nll.sum() * 0.0
+
+                    self.accelerator.backward(component_loss)
+                    if anchor_embeds.grad is not None:
+                        anchor_embeds.grad = None
+                    loss_value = float(component_loss.detach().item())
+                    component_loss_value += loss_value
+                    total_loss_value += loss_value
+
+                    del (
+                        adapter_logits,
+                        adapter_logps,
+                        adapter_grads,
+                        anchor_scores,
+                        anchor_grads,
+                        estimates,
+                        rewards,
+                        comp_logp,
+                        weighted_comp_nll,
+                        component_loss,
+                    )
+
+                del anchor_embeds, anchor_attention_mask, anchor_labels
+                if ref_mode == "exact_score":
+                    del ref_logps
+                else:
+                    del ref_logps, ref_grads
+        else:
+            ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
+
+            for cluster_idx, adapter_name in enumerate(self.mixture_adapter_names):
+                self._set_active_adapter(adapter_name)
+                adapter_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
+                adapter_logps = self._sequence_logps(adapter_logits, flat_labels).view(batch_size, num_candidates)
+                rewards = beta * (adapter_logps - ref_logps)
+                comp_logp = pl_log_prob(
+                    rewards,
+                    rankings,
+                    candidate_mask=candidate_mask,
+                    ranked_prefix_lengths=ranked_prefix_lengths,
+                )
+                weighted_comp_nll = -(gamma[:, cluster_idx].to(dtype=comp_logp.dtype) * comp_logp)
+                if torch.any(valid_rows):
+                    component_loss = weighted_comp_nll[valid_rows].mean()
+                else:
+                    component_loss = weighted_comp_nll.sum() * 0.0
+
+                self.accelerator.backward(component_loss)
+                loss_value = float(component_loss.detach().item())
+                component_loss_value += loss_value
+                total_loss_value += loss_value
+
+                del adapter_logits, adapter_logps, rewards, comp_logp, weighted_comp_nll, component_loss
+            del ref_logps
 
         self._set_active_adapter(self.policy_adapter_name)
         self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])

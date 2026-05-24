@@ -13,7 +13,7 @@ RANKING_SIZES="${RANKING_SIZES:-4}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-2e-6}}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-${EM_TEMPERATURE:-1.0}}"
-M_STEP_UPDATES="${M_STEP_UPDATES:-3 1}"
+M_STEP_UPDATES="${M_STEP_UPDATES:-1}"
 MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-em_only}"
 MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-lora}"
 # LoRA mixture switches active adapters inside the loss forward, which is not
@@ -23,7 +23,7 @@ DOWNSAMPLE_RATIO="${DOWNSAMPLE_RATIO:-0.25}"
 DOWNSAMPLE_GROUP_KEY="${DOWNSAMPLE_GROUP_KEY:-source_index}"
 METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-ranking_validation/mixture/cluster_acc}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -109,8 +109,8 @@ for ranking_size in ${RANKING_SIZES}; do
     --per_device_eval_batch_size "${PER_DEVICE_EVAL_BATCH_SIZE:-2}" \
     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-4}" \
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
-    --eval_steps "${EVAL_STEPS:-100}" \
-    --save_steps "${SAVE_STEPS:-100}" \
+    --eval_steps "${EVAL_STEPS:-200}" \
+    --save_steps "${SAVE_STEPS:-200}" \
     --metric_for_best_model "${METRIC_FOR_BEST_MODEL}" \
     --output_dir "${output_dir}" \
     --run_name "${run_name}" \
@@ -122,3 +122,4 @@ done
 done
 done
 done
+

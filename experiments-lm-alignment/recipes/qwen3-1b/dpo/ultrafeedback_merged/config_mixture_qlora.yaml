@@ -9,7 +9,7 @@ attn_implementation: sdpa
 # LoRA arguments
 use_peft: true
 load_in_4bit: true
-lora_r: 64
+lora_r: 32
 lora_alpha: 64
 lora_dropout: 0.05
 lora_target_modules:

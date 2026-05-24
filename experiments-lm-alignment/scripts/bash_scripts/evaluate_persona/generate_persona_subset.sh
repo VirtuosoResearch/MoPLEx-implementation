@@ -11,7 +11,7 @@ SOURCE_DATASET="${SOURCE_DATASET:-SynthLabsAI/PERSONA}"
 DATA_ROOT="${DATA_ROOT:-${REPO_ROOT}/data/persona_datasets}"
 PROMPT_MODE="${PROMPT_MODE:-instruction_only}"
 NUM_PERSONAS="${NUM_PERSONAS:-12}"
-TRAIN_NUM_RESPONSES_PER_PROMPT="${TRAIN_NUM_RESPONSES_PER_PROMPT:-${NUM_RESPONSES_PER_PROMPT:-2}}"
+TRAIN_NUM_RESPONSES_PER_PROMPT="${TRAIN_NUM_RESPONSES_PER_PROMPT:-28 20 12}"
 EVAL_NUM_RESPONSES_PER_PROMPT="${EVAL_NUM_RESPONSES_PER_PROMPT:-2}"
 HARD_NEGATIVE_PERSONA_POOL="${HARD_NEGATIVE_PERSONA_POOL:-all}"
 NEGATIVE_POOL="${NEGATIVE_POOL:-same_split}"
@@ -63,12 +63,13 @@ echo "  eval_num_responses: ${EVAL_NUM_RESPONSES_PER_PROMPT:-same as train}"
 echo "  pairwise: ${PAIRWISE_DATASET_DIR}"
 echo "  listwise: ${LISTWISE_DATASET_DIR}"
 
+for train_num_responses_per_prompt in ${TRAIN_NUM_RESPONSES_PER_PROMPT}; do
 "${PYTHON}" scripts/prepare_persona_baselines_dataset.py \
   --dataset_name "${SOURCE_DATASET}" \
   --output_dir "${DATA_ROOT}" \
   --output_name_prefix "${DATASET_NAME_PREFIX}" \
   --num_personas "${NUM_PERSONAS}" \
-  --num_responses_per_prompt "${TRAIN_NUM_RESPONSES_PER_PROMPT}" \
+  --num_responses_per_prompt "${train_num_responses_per_prompt}" \
   --prompt_mode "${PROMPT_MODE}" \
   --hard_negative_persona_pool "${HARD_NEGATIVE_PERSONA_POOL}" \
   --negative_pool "${NEGATIVE_POOL}" \
@@ -79,6 +80,7 @@ echo "  listwise: ${LISTWISE_DATASET_DIR}"
   --hard_negative_seed "${SEED}" \
   "${eval_num_responses_args[@]}" \
   "${overwrite_args[@]}"
+done
 
 echo "Prepared PERSONA datasets:"
 echo "  pairwise: ${PAIRWISE_DATASET_DIR}"
