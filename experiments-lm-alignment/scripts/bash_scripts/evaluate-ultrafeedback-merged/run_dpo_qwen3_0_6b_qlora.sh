@@ -6,7 +6,7 @@ BASH_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SCRIPTS_DIR="$(cd "${BASH_SCRIPTS_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 
-DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/cyclic_ultrafeedback_merged}"
+DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/cyclic_ultrafeedback_m2_all_pairs_merged}"
 CONFIG_PATH="${CONFIG_PATH:-recipes/qwen3-1b/dpo/ultrafeedback_merged/config_dpo_qlora.yaml}"
 SEED="${SEED:-42}"
 MAX_STEPS="${MAX_STEPS:-1000}"
@@ -32,7 +32,7 @@ ACCELERATE_LOG_LEVEL=info accelerate launch \
   --num_processes="${NUM_PROCESSES:-1}" \
   scripts/dpo.py \
   --config "${CONFIG_PATH}" \
-  --dataset_name "./data/cyclic_ultrafeedback_merged" \
+  --dataset_name "${DATASET_DIR}" \
   --output_dir "${OUTPUT_DIR}" \
   --run_name "${WANDB_NAME}" \
   --report_to wandb \

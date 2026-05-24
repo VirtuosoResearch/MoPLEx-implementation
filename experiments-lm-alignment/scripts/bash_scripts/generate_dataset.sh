@@ -11,7 +11,7 @@ do
         if [[ "${dim1}" != "${dim2}" ]]
         then
         echo "Generating dataset for dimensions: ${dim1}, ${dim2}"
-        PYTHONPATH=src /home/ldy/miniconda3/envs/alignment/bin/python scripts/create_cyclic_ultrafeedback_dataset.py \
+        PYTHONPATH=src /home/michael/anaconda3/envs/dpo/bin/python scripts/create_cyclic_ultrafeedback_dataset.py \
         --dataset_name openbmb/UltraFeedback \
         --source_split train \
         --dimensions ${dim1} ${dim2} \

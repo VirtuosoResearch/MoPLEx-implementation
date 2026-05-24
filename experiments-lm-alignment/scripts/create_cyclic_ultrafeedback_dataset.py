@@ -88,7 +88,32 @@ def main() -> None:
         seed=args.seed,
     )
 
+    metrics = {
+        "dataset_name": args.dataset_name,
+        "dataset_config": args.dataset_config,
+        "source_split": args.source_split,
+        "seed": args.seed,
+        "dimensions": list(selected_dimensions),
+        "dimension_pair": list(args.dimension_pair) if args.dimension_pair is not None else None,
+        "total_rows": stats.total_rows,
+        "eligible_rows": stats.eligible_rows,
+        "valid_score_rows": stats.valid_score_rows,
+        "cycle_rows": stats.cycle_rows,
+        "create_splits": args.create_splits,
+    }
+    metrics["eligible_ratio"] = metrics["eligible_rows"] / max(metrics["total_rows"], 1)
+    metrics["valid_score_ratio"] = metrics["valid_score_rows"] / max(metrics["eligible_rows"], 1)
+    metrics["cycle_ratio"] = metrics["cycle_rows"] / max(metrics["valid_score_rows"], 1)
+
     if not rows:
+        metrics["train_rows"] = 0
+        metrics["validation_rows"] = 0
+        metrics["test_rows"] = 0
+        os.makedirs(args.output_dir, exist_ok=True)
+        metrics_path = os.path.join(args.output_dir, "stats.json")
+        with open(metrics_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=2, sort_keys=True)
+        logger.info("Wrote dataset stats to %s", metrics_path)
         raise ValueError(
             "No rotated cyclic examples found for the selected dimensions. "
             "Try another split, different dimensions, or verify annotation keys."
@@ -103,25 +128,9 @@ def main() -> None:
     os.makedirs(args.output_dir, exist_ok=True)
     dataset_dict.save_to_disk(args.output_dir)
 
-    metrics = {
-        "dataset_name": args.dataset_name,
-        "dataset_config": args.dataset_config,
-        "source_split": args.source_split,
-        "seed": args.seed,
-        "dimensions": list(selected_dimensions),
-        "dimension_pair": list(args.dimension_pair) if args.dimension_pair is not None else None,
-        "total_rows": stats.total_rows,
-        "eligible_rows": stats.eligible_rows,
-        "valid_score_rows": stats.valid_score_rows,
-        "cycle_rows": stats.cycle_rows,
-        "train_rows": len(dataset_dict["train"]),
-        "validation_rows": len(dataset_dict["validation"]) if "validation" in dataset_dict else 0,
-        "test_rows": len(dataset_dict["test"]) if "test" in dataset_dict else 0,
-        "create_splits": args.create_splits,
-    }
-    metrics["eligible_ratio"] = metrics["eligible_rows"] / max(metrics["total_rows"], 1)
-    metrics["valid_score_ratio"] = metrics["valid_score_rows"] / max(metrics["eligible_rows"], 1)
-    metrics["cycle_ratio"] = metrics["cycle_rows"] / max(metrics["valid_score_rows"], 1)
+    metrics["train_rows"] = len(dataset_dict["train"])
+    metrics["validation_rows"] = len(dataset_dict["validation"]) if "validation" in dataset_dict else 0
+    metrics["test_rows"] = len(dataset_dict["test"]) if "test" in dataset_dict else 0
 
     metrics_path = os.path.join(args.output_dir, "stats.json")
     with open(metrics_path, "w", encoding="utf-8") as f:

@@ -1,4 +1,4 @@
-PYTHONPATH=src /home/ldy/miniconda3/envs/alignment/bin/python scripts/merge_cyclic_ultrafeedback_datasets.py \
+PYTHONPATH=src /home/michael/anaconda3/envs/dpo/bin/python scripts/merge_cyclic_ultrafeedback_datasets.py \
   --input_root data \
   --pattern 'cyclic_ultrafeedback_m2_*' \
   --output_dir data/cyclic_ultrafeedback_m2_all_pairs_merged \

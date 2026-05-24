@@ -14,7 +14,7 @@ MAX_STEPS="${MAX_STEPS:-2000}"
 LISTWISE_NUM_RESPONSES="${LISTWISE_NUM_RESPONSES:-4}"
 PAIRWISE_STRATEGY="${PAIRWISE_STRATEGY:-all_pairs}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -49,7 +49,9 @@ for dimension in ${DIMENSIONS}; do
       --preference_dimensions "${dimension}" \
       --listwise_num_responses "${LISTWISE_NUM_RESPONSES}" \
       --pairwise_from_listwise_strategy "${PAIRWISE_STRATEGY}" \
-      --metric_for_best_model rewards/accuracies \
+      --metric_for_best_model ranking_validation/ranking/pairwise_acc \
+      --dataset_downsample_ratio 0.2 \
+      --dataset_downsample_splits validation \
       --output_dir "${output_dir}" \
       --run_name "${run_name}" \
       --report_to wandb \

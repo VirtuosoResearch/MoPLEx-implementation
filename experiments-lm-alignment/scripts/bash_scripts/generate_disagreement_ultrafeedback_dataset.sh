@@ -11,7 +11,7 @@ fi
 
 OUTPUT_DIR="${OUTPUT_DIR:-data/ultrafeedback_disagreement}"
 
-PYTHONPATH=src /home/ldy/miniconda3/envs/alignment/bin/python scripts/create_disagreement_ultrafeedback_dataset.py \
+PYTHONPATH=src /home/michael/anaconda3/envs/dpo/bin/python scripts/create_disagreement_ultrafeedback_dataset.py \
   --output_dir "${OUTPUT_DIR}" \
   --create_splits \
   "${extra_args[@]}"
@@ -23,4 +23,3 @@ PYTHONPATH=src /home/ldy/miniconda3/envs/alignment/bin/python scripts/create_dis
 # MIN_DISTINCT_RANKINGS=4 \
 # OUTPUT_DIR=data/ultrafeedback_disagreement \
 # bash scripts/bash_scripts/generate_disagreement_ultrafeedback_dataset.sh
-# 
