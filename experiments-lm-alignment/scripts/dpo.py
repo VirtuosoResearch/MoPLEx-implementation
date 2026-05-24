@@ -50,6 +50,7 @@ python scripts/dpo.py \
 import logging
 import os
 import sys
+import time
 
 import datasets
 import torch
@@ -75,6 +76,49 @@ from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
 
 
 logger = logging.getLogger(__name__)
+
+
+_BYTES_PER_MIB = 1024**2
+
+
+def _cuda_synchronize() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _reset_cuda_peak_memory() -> None:
+    if torch.cuda.is_available():
+        _cuda_synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _cuda_memory_metrics(prefix: str) -> dict[str, float]:
+    if not torch.cuda.is_available():
+        return {}
+    _cuda_synchronize()
+    device = torch.cuda.current_device()
+    return {
+        f"{prefix}_gpu_memory_allocated_mib": torch.cuda.memory_allocated(device) / _BYTES_PER_MIB,
+        f"{prefix}_gpu_memory_reserved_mib": torch.cuda.memory_reserved(device) / _BYTES_PER_MIB,
+        f"{prefix}_gpu_peak_memory_allocated_mib": torch.cuda.max_memory_allocated(device) / _BYTES_PER_MIB,
+        f"{prefix}_gpu_peak_memory_reserved_mib": torch.cuda.max_memory_reserved(device) / _BYTES_PER_MIB,
+    }
+
+
+def _log_benchmark_metrics(stage: str, metrics: dict[str, float]) -> None:
+    metric_items = []
+    for suffix in (
+        "wall_time_seconds",
+        "gpu_memory_allocated_mib",
+        "gpu_memory_reserved_mib",
+        "gpu_peak_memory_allocated_mib",
+        "gpu_peak_memory_reserved_mib",
+    ):
+        key = f"{stage}_{suffix}"
+        if key in metrics:
+            metric_items.append(f"{key}={metrics[key]:.3f}")
+    if metric_items:
+        logger.info("Benchmark %s: %s", stage, ", ".join(metric_items))
 
 
 def cast_trainable_bf16_params_to_fp32(module: torch.nn.Module) -> int:
@@ -270,20 +314,34 @@ def main(script_args, training_args, model_args):
         checkpoint = training_args.resume_from_checkpoint
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
+    _reset_cuda_peak_memory()
+    train_wall_start = time.perf_counter()
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
+    _cuda_synchronize()
     metrics = train_result.metrics
+    metrics["train_wall_time_seconds"] = time.perf_counter() - train_wall_start
+    metrics.update(_cuda_memory_metrics("train"))
+    _log_benchmark_metrics("train", metrics)
     metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
 
     if training_args.eval_strategy != "no":
+        _reset_cuda_peak_memory()
+        eval_wall_start = time.perf_counter()
         metrics = trainer.evaluate()
+        _cuda_synchronize()
+        metrics["eval_wall_time_seconds"] = time.perf_counter() - eval_wall_start
+        metrics.update(_cuda_memory_metrics("eval"))
+        _log_benchmark_metrics("eval", metrics)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
     if ranking_dataset is not None:
         logger.info("*** Ranking evaluation on available ranking splits ***")
+        _reset_cuda_peak_memory()
+        ranking_wall_start = time.perf_counter()
         ranking_results = evaluate_ranking_splits(
             trainer=trainer,
             ranking_dataset=ranking_dataset,
@@ -291,6 +349,15 @@ def main(script_args, training_args, model_args):
             script_args=script_args,
             training_args=training_args,
         )
+        _cuda_synchronize()
+        ranking_benchmark_metrics = {
+            "ranking_wall_time_seconds": time.perf_counter() - ranking_wall_start,
+            **_cuda_memory_metrics("ranking"),
+        }
+        _log_benchmark_metrics("ranking", ranking_benchmark_metrics)
+        trainer.log(ranking_benchmark_metrics)
+        trainer.log_metrics("ranking_benchmark", ranking_benchmark_metrics)
+        trainer.save_metrics("ranking_benchmark", ranking_benchmark_metrics)
         for split_name, split_metrics in ranking_results.items():
             trainer.log({f"ranking_{split_name}/{key}": value for key, value in split_metrics.items()})
             trainer.log_metrics(f"ranking_{split_name}", split_metrics)
