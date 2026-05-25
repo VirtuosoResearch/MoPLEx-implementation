@@ -19,7 +19,12 @@ import pytest
 from datasets import Dataset, DatasetDict
 
 from alignment import ScriptArguments, get_dataset
-from alignment.data import _maybe_convert_to_listwise, _maybe_downsample_dataset_dict, _to_listwise_dataset
+from alignment.data import (
+    _maybe_convert_to_listwise,
+    _maybe_convert_to_pairwise,
+    _maybe_downsample_dataset_dict,
+    _to_listwise_dataset,
+)
 
 
 class GetDatasetTest(unittest.TestCase):
@@ -297,6 +302,35 @@ class GetDatasetTest(unittest.TestCase):
         converted = _maybe_convert_to_listwise(ds_dict, args)
         self.assertEqual(len(converted["train"]), 1)
         self.assertEqual(set(converted["train"]["preference_dimension"]), {"helpfulness"})
+
+    def test_preformatted_pairwise_split_filters_by_preference_dimension(self):
+        preformatted = Dataset.from_list(
+            [
+                {
+                    "prompt": "p1",
+                    "chosen": "A",
+                    "rejected": "B",
+                    "preference_dimension": "instruction_following",
+                },
+                {
+                    "prompt": "p2",
+                    "chosen": "C",
+                    "rejected": "D",
+                    "preference_dimension": "helpfulness",
+                },
+            ]
+        )
+        ds_dict = DatasetDict({"train": preformatted})
+
+        args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="pairwise",
+            preference_dimensions=["helpfulness"],
+        )
+
+        converted = _maybe_convert_to_pairwise(ds_dict, args)
+        self.assertEqual(len(converted["train"]), 1)
+        self.assertEqual(converted["train"][0]["preference_dimension"], "helpfulness")
 
     def test_preformatted_listwise_split_reduces_with_all_subrankings(self):
         preformatted = Dataset.from_list(

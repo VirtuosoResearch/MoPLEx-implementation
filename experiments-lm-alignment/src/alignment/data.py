@@ -509,9 +509,22 @@ def _maybe_convert_to_pairwise(dataset_dict: DatasetDict, args: ScriptArguments)
         return dataset_dict
 
     converted = {}
+    allowed_dimensions = set(args.preference_dimensions) if args.preference_dimensions is not None else None
     for split_name, split_data in dataset_dict.items():
         if not _is_preformatted_listwise_split(split_data):
-            converted[split_name] = split_data
+            if allowed_dimensions is not None and "preference_dimension" in split_data.column_names:
+                converted[split_name] = split_data.filter(
+                    lambda row: row.get("preference_dimension") in allowed_dimensions,
+                    desc=f"Filtering {split_name} by preference dimension",
+                )
+                logger.info(
+                    "Filtered pairwise split '%s' to %d examples for dimensions '%s'.",
+                    split_name,
+                    len(converted[split_name]),
+                    args.preference_dimensions,
+                )
+            else:
+                converted[split_name] = split_data
             continue
 
         logger.info(
