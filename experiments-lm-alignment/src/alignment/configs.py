@@ -209,6 +209,16 @@ class ScriptArguments(trl.ScriptArguments):
             )
         },
     )
+    ranking_eval_during_training_max_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set, cap the eval split used by the during-training ranking evaluation to this many "
+                "examples (a seeded shuffled subset). The post-training ranking evaluation still uses "
+                "the full splits."
+            )
+        },
+    )
     eval_only_ranking: bool = field(
         default=False,
         metadata={

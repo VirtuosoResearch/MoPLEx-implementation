@@ -137,13 +137,26 @@ class RankingEvaluationCallback(TrainerCallback):
     """Log full ranking metrics on the configured evaluation split during Trainer.evaluate()."""
 
     def __init__(self, ranking_dataset, tokenizer, script_args, training_args):
-        self.ranking_dataset = ranking_dataset
         self.tokenizer = tokenizer
         self.script_args = script_args
         self.training_args = training_args
         self.eval_split = script_args.dataset_test_split
         self.dimension_to_id = _dimension_mapping(script_args.preference_dimensions, ranking_dataset)
         self.trainer = None
+
+        max_samples = getattr(script_args, "ranking_eval_during_training_max_samples", None)
+        if (
+            max_samples is not None
+            and max_samples > 0
+            and self.eval_split in ranking_dataset
+            and len(ranking_dataset[self.eval_split]) > max_samples
+        ):
+            # Copy so the full split is still used by the post-training ranking eval.
+            ranking_dataset = dict(ranking_dataset)
+            ranking_dataset[self.eval_split] = (
+                ranking_dataset[self.eval_split].shuffle(seed=training_args.seed).select(range(max_samples))
+            )
+        self.ranking_dataset = ranking_dataset
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         del args, state, control, kwargs

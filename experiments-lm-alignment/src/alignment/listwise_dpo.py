@@ -261,7 +261,10 @@ class ListwiseDPOTrainer(DPOTrainer):
         valid = shift_labels != -100
 
         safe_labels = shift_labels.masked_fill(~valid, 0)
-        token_logps = F.log_softmax(shift_logits, dim=-1).gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+        # gather + logsumexp keeps peak memory at the logits tensor itself;
+        # log_softmax would materialize a second [B, S, vocab] tensor.
+        label_logits = shift_logits.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+        token_logps = label_logits - torch.logsumexp(shift_logits, dim=-1)
         token_logps = token_logps * valid
         return token_logps.sum(dim=-1)
 
@@ -2063,20 +2066,24 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                             inputs,
                             gamma=gamma,
                         )
-                    metric_context_manager = (
-                        torch.autocast(self.accelerator.device.type)
-                        if self._peft_has_been_casted_to_bf16
-                        else nullcontext()
-                    )
-                    with torch.no_grad(), metric_context_manager:
-                        if self.mixture_reward_backend == "lora":
-                            self._set_active_adapter(self.policy_adapter_name)
-                        _, listwise_metrics = self.get_batch_loss_metrics(
-                            self.model,
-                            inputs,
-                            train_eval="train",
+                    # Policy listwise metrics cost two extra full forwards and, in
+                    # em_only mode, the policy adapter is not updated, so only pay
+                    # for them on logging steps.
+                    if should_log:
+                        metric_context_manager = (
+                            torch.autocast(self.accelerator.device.type)
+                            if self._peft_has_been_casted_to_bf16
+                            else nullcontext()
                         )
-                    metrics.update(listwise_metrics)
+                        with torch.no_grad(), metric_context_manager:
+                            if self.mixture_reward_backend == "lora":
+                                self._set_active_adapter(self.policy_adapter_name)
+                            _, listwise_metrics = self.get_batch_loss_metrics(
+                                self.model,
+                                inputs,
+                                train_eval="train",
+                            )
+                        metrics.update(listwise_metrics)
                     metrics.update(
                         {
                             "em/block_index": float(block_index),

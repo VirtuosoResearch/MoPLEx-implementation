@@ -108,10 +108,10 @@ def _sequence_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
     shift_labels = labels[:, 1:]
     valid = shift_labels != -100
     safe_labels = shift_labels.masked_fill(~valid, 0)
-    token_logps = torch.log_softmax(shift_logits, dim=-1).gather(
-        dim=-1,
-        index=safe_labels.unsqueeze(-1),
-    ).squeeze(-1)
+    # gather + logsumexp keeps peak memory at the logits tensor itself;
+    # log_softmax would materialize a second [B, S, vocab] tensor.
+    label_logits = shift_logits.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+    token_logps = label_logits - torch.logsumexp(shift_logits, dim=-1)
     token_logps = token_logps * valid
     return token_logps.sum(dim=-1)
 
