@@ -375,7 +375,31 @@ class MixturePLConfig(DPOConfig):
     )
     m_step_updates: int = field(
         default=1,
-        metadata={"help": "Number of optimizer updates per E-step when mixture_training_mode='em_only'."},
+        metadata={
+            "help": (
+                "Deprecated for mixture_training_mode='em_only'. Kept for backward compatibility; "
+                "block EM uses em_batches_per_update instead."
+            )
+        },
+    )
+    em_batches_per_update: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of dataloader batches in one block-EM cycle when mixture_training_mode='em_only'. "
+                "The E-step computes responsibilities for this block, then the M-step replays the same block once."
+            )
+        },
+    )
+    em_alpha_update: str = field(
+        default="block_closed_form",
+        metadata={
+            "help": (
+                "How to update mixture weights in EM-only mixture PL training. "
+                "'block_closed_form' sets global alpha to the mean responsibility over the current EM block; "
+                "'gradient' updates alpha/router by backprop in the M-step."
+            )
+        },
     )
     mixture_reward_backend: str = field(
         default="head",
@@ -473,6 +497,19 @@ class MixturePLConfig(DPOConfig):
                 raise ValueError("`mixture_training_mode` must be either 'hybrid_dpo_em' or 'em_only'")
             if self.m_step_updates < 1:
                 raise ValueError("`m_step_updates` must be >= 1")
+            if self.em_batches_per_update < 1:
+                raise ValueError("`em_batches_per_update` must be >= 1")
+            if self.em_alpha_update not in {"block_closed_form", "gradient"}:
+                raise ValueError("`em_alpha_update` must be either 'block_closed_form' or 'gradient'")
+            if (
+                self.mixture_training_mode == "em_only"
+                and self.em_alpha_update == "block_closed_form"
+                and self.use_contextual_router
+            ):
+                raise ValueError(
+                    "`em_alpha_update='block_closed_form'` requires `use_contextual_router=False` "
+                    "because it updates a global mixture prior."
+                )
             if self.mixture_reward_backend not in {"head", "lora"}:
                 raise ValueError("`mixture_reward_backend` must be either 'head' or 'lora'")
             if not self.mixture_lora_adapter_prefix:

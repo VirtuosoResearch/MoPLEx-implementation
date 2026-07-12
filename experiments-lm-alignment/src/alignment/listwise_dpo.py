@@ -23,6 +23,7 @@ import os
 import re
 import time
 from typing import Any, Dict, Literal, Optional, Tuple, Union
+import warnings
 
 from accelerate import PartialState
 from datasets import Dataset, IterableDataset
@@ -91,6 +92,7 @@ class ListwiseDPODataCollator:
         batch_candidate_mask = []
         batch_preference_dimensions = []
         batch_ranked_prefix_lengths = []
+        batch_em_row_ids = []
 
         max_candidates = max(len(feature["responses"]) for feature in features)
 
@@ -98,6 +100,7 @@ class ListwiseDPODataCollator:
             prompt = feature["prompt"]
             responses = feature["responses"]
             batch_preference_dimensions.append(feature.get("preference_dimension", "unknown"))
+            batch_em_row_ids.append(int(feature.get("em_row_id", -1)))
             ranked_prefix_length = feature.get("ranked_prefix_length", len(responses))
             ranked_prefix_length = max(0, min(int(ranked_prefix_length), len(responses)))
             batch_ranked_prefix_lengths.append(ranked_prefix_length)
@@ -145,6 +148,7 @@ class ListwiseDPODataCollator:
             "candidate_mask": torch.tensor(batch_candidate_mask, dtype=torch.bool),
             "preference_dimension": batch_preference_dimensions,
             "ranked_prefix_length": torch.tensor(batch_ranked_prefix_lengths, dtype=torch.long),
+            "em_row_id": torch.tensor(batch_em_row_ids, dtype=torch.long),
         }
 
 
@@ -214,6 +218,7 @@ class ListwiseDPOTrainer(DPOTrainer):
                 "labels",
                 "candidate_mask",
                 "ranked_prefix_length",
+                "em_row_id",
             ]
 
     def _prepare_dataset(
@@ -722,8 +727,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
                 router_hidden_size=mixture_config.router_hidden_size,
             )
             if (
-                not mixture_config.use_contextual_router
-                and getattr(mixture_config, "use_closed_form_router_prior_update", False)
+                self._use_closed_form_alpha_update()
                 and hasattr(self.mixture_head.router, "global_logits")
             ):
                 self.mixture_head.router.global_logits.requires_grad_(False)
@@ -800,8 +804,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             router_hidden_size=self.mixture_config.router_hidden_size,
         )
         if (
-            not self.mixture_config.use_contextual_router
-            and getattr(self.mixture_config, "use_closed_form_router_prior_update", False)
+            self._use_closed_form_alpha_update()
             and hasattr(self.mixture_router, "global_logits")
         ):
             self.mixture_router.global_logits.requires_grad_(False)
@@ -811,20 +814,31 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         self._set_active_adapter(self.policy_adapter_name)
         self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
 
-    def _update_global_router_prior_from_gamma(self, gamma: torch.Tensor) -> None:
-        """Update the non-contextual router logits to the closed-form prior implied by gamma."""
+    def _use_closed_form_alpha_update(self) -> bool:
         if self.mixture_config.use_contextual_router:
-            return
-        if not getattr(self.mixture_config, "use_closed_form_router_prior_update", False):
-            return
+            return False
+        if getattr(self.mixture_config, "mixture_training_mode", None) != "em_only":
+            return False
+        alpha_update = getattr(self.mixture_config, "em_alpha_update", None)
+        if alpha_update is None:
+            return bool(getattr(self.mixture_config, "use_closed_form_router_prior_update", False))
+        return alpha_update == "block_closed_form"
+
+    def _set_global_router_prior(self, prior: torch.Tensor) -> None:
         router = self.mixture_head.router if self.mixture_reward_backend == "head" else self.mixture_router
         if router is None or not hasattr(router, "global_logits"):
             return
 
-        prior = gamma.mean(dim=0)
+        prior = prior.to(device=router.global_logits.device, dtype=router.global_logits.dtype)
         prior = prior / prior.sum().clamp_min(1e-12)
         with torch.no_grad():
             router.global_logits.copy_(torch.log(prior.clamp_min(1e-12)))
+
+    def _update_global_router_prior_from_gamma(self, gamma: torch.Tensor) -> None:
+        """Update the non-contextual router logits to the closed-form prior implied by gamma."""
+        if not self._use_closed_form_alpha_update():
+            return
+        self._set_global_router_prior(gamma.mean(dim=0))
 
     @staticmethod
     def _preference_dimension_sort_key(dimension: str) -> tuple[int, int, str]:
@@ -1498,10 +1512,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
 
         component_loss_value = 0.0
         total_loss_value = 0.0
-        closed_form_router = (
-            not self.mixture_config.use_contextual_router
-            and getattr(self.mixture_config, "use_closed_form_router_prior_update", False)
-        )
+        closed_form_router = self._use_closed_form_alpha_update()
 
         router_context = torch.no_grad() if closed_form_router else nullcontext()
         with router_context:
@@ -1828,6 +1839,92 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
         gc.collect()
         torch.cuda.empty_cache()
 
+    def _ensure_em_row_ids(self) -> None:
+        if isinstance(self.train_dataset, IterableDataset):
+            raise ValueError("Block EM requires a map-style Dataset with stable `em_row_id` values.")
+        if not isinstance(self.train_dataset, Dataset):
+            raise ValueError("Block EM requires a datasets.Dataset training split.")
+        if "em_row_id" not in self.train_dataset.column_names:
+            self.train_dataset = self.train_dataset.add_column("em_row_id", list(range(len(self.train_dataset))))
+
+    @staticmethod
+    def _batch_row_ids(inputs: Dict[str, Any]) -> torch.Tensor:
+        row_ids = inputs.get("em_row_id")
+        if row_ids is None:
+            raise ValueError("Block EM requires `em_row_id` in every training batch.")
+        if not isinstance(row_ids, torch.Tensor):
+            row_ids = torch.tensor(row_ids, dtype=torch.long)
+        row_ids = row_ids.detach().long().view(-1)
+        if torch.any(row_ids < 0):
+            raise ValueError("Block EM found missing `em_row_id`; ensure the listwise collator preserves it.")
+        return row_ids
+
+    @staticmethod
+    def _stage_em_batch_on_cpu(batch: Any) -> Any:
+        if isinstance(batch, torch.Tensor):
+            return batch.detach().cpu()
+        if isinstance(batch, dict):
+            return {key: MixtureEMDPOTrainer._stage_em_batch_on_cpu(value) for key, value in batch.items()}
+        if isinstance(batch, list):
+            return [MixtureEMDPOTrainer._stage_em_batch_on_cpu(value) for value in batch]
+        if isinstance(batch, tuple):
+            return tuple(MixtureEMDPOTrainer._stage_em_batch_on_cpu(value) for value in batch)
+        return batch
+
+    def _gather_gamma_for_prior(self, gamma: torch.Tensor) -> torch.Tensor:
+        try:
+            return self.accelerator.gather_for_metrics(gamma.detach())
+        except Exception:
+            return gamma.detach()
+
+    def _alpha_entropy(self) -> float:
+        router = self.mixture_head.router if self.mixture_reward_backend == "head" else self.mixture_router
+        if router is None or not hasattr(router, "global_logits"):
+            return 0.0
+        probs = torch.softmax(router.global_logits.detach().float(), dim=0)
+        entropy = -(probs * probs.clamp_min(1e-12).log()).sum()
+        return float(entropy.item())
+
+    def _build_em_block_cache(
+        self,
+        raw_batches: list[Dict[str, Any]],
+    ) -> tuple[dict[int, torch.Tensor], torch.Tensor, int]:
+        gamma_cache: dict[int, torch.Tensor] = {}
+        gamma_sum: torch.Tensor | None = None
+        gamma_count = 0
+
+        for raw_batch in raw_batches:
+            inputs = self._prepare_inputs(raw_batch)
+            row_ids = self._batch_row_ids(inputs)
+            with torch.no_grad():
+                _, _, _, gamma = self.get_batch_mixture_em_loss_metrics(
+                    self.model,
+                    inputs,
+                    include_cluster_metrics=False,
+                )
+            gamma = gamma.detach()
+            for local_idx, row_id in enumerate(row_ids.detach().cpu().tolist()):
+                gamma_cache[int(row_id)] = gamma[local_idx]
+
+            gamma_for_prior = self._gather_gamma_for_prior(gamma)
+            gamma_sum = gamma_for_prior.sum(dim=0) if gamma_sum is None else gamma_sum + gamma_for_prior.sum(dim=0)
+            gamma_count += int(gamma_for_prior.shape[0])
+
+        if gamma_sum is None or gamma_count == 0:
+            raise ValueError("Block EM received an empty E-step block.")
+        block_prior = gamma_sum / float(gamma_count)
+        return gamma_cache, block_prior, gamma_count
+
+    def _cached_gamma_for_batch(self, inputs: Dict[str, Any], gamma_cache: dict[int, torch.Tensor]) -> torch.Tensor:
+        row_ids = self._batch_row_ids(inputs)
+        gammas = []
+        for row_id in row_ids.detach().cpu().tolist():
+            row_gamma = gamma_cache.get(int(row_id))
+            if row_gamma is None:
+                raise KeyError(f"Missing cached EM responsibility for em_row_id={int(row_id)}")
+            gammas.append(row_gamma)
+        return torch.stack(gammas, dim=0).to(device=row_ids.device)
+
     def _update_best_metric_for_legacy_checkpointing(self, metrics: Optional[dict[str, float]]) -> None:
         """Update TrainerState best fields for Trainer versions whose _save_checkpoint lacks metrics=."""
         if not metrics:
@@ -1896,9 +1993,16 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
             self._load_from_checkpoint(resume_from_checkpoint)
 
         args = self.args
+        self._ensure_em_row_ids()
         train_dataloader = self.get_train_dataloader()
-        m_step_updates = self.mixture_config.m_step_updates
-        steps_per_epoch = max(len(train_dataloader) * m_step_updates, 1)
+        em_batches_per_update = int(getattr(self.mixture_config, "em_batches_per_update", 1))
+        if getattr(self.mixture_config, "m_step_updates", 1) != 1:
+            warnings.warn(
+                "`m_step_updates` is ignored by MixtureEMDPOTrainer block EM; "
+                "use `em_batches_per_update` to control the E/M block size.",
+                stacklevel=2,
+            )
+        steps_per_epoch = max(len(train_dataloader), 1)
         if args.max_steps > 0:
             max_steps = args.max_steps
             num_train_epochs = math.ceil(max_steps / steps_per_epoch)
@@ -1926,21 +2030,26 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
 
         for epoch in range(num_train_epochs):
             self.model.train()
+            block_batches: list[Dict[str, Any]] = []
+            block_index = 0
             for step, batch in enumerate(train_dataloader):
-                inputs = self._prepare_inputs(batch)
+                block_batches.append(self._stage_em_batch_on_cpu(batch))
+                if len(block_batches) < em_batches_per_update and step + 1 < len(train_dataloader):
+                    continue
 
-                # E-step: infer gamma once with current parameters.
-                with torch.no_grad():
-                    _, _, _, gamma = self.get_batch_mixture_em_loss_metrics(
-                        self.model,
-                        inputs,
-                        include_cluster_metrics=False,
-                    )
-                self._update_global_router_prior_from_gamma(gamma)
+                # E-step: infer responsibilities for a block before any M-step update.
+                gamma_cache, block_prior, block_gamma_count = self._build_em_block_cache(block_batches)
+                if self._use_closed_form_alpha_update():
+                    self._set_global_router_prior(block_prior)
 
-                # M-step: optimize only E_q[log p(z, ranking | x)] for fixed gamma.
-                for m_step in range(m_step_updates):
+                # M-step: replay the same block once with fixed cached responsibilities.
+                for raw_batch in block_batches:
+                    if self.state.global_step >= max_steps:
+                        stop_training = True
+                        break
                     self.model.train()
+                    inputs = self._prepare_inputs(raw_batch)
+                    gamma = self._cached_gamma_for_batch(inputs, gamma_cache)
                     should_log = args.logging_steps > 0 and (self.state.global_step + 1) % args.logging_steps == 0
                     if self.mixture_reward_backend == "lora":
                         loss_value, metrics = self._backward_lora_mixture_em_loss_sequential(
@@ -1968,6 +2077,13 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                             train_eval="train",
                         )
                     metrics.update(listwise_metrics)
+                    metrics.update(
+                        {
+                            "em/block_index": float(block_index),
+                            "em/block_size": float(block_gamma_count),
+                            "em/alpha_entropy": self._alpha_entropy(),
+                        }
+                    )
                     self.store_metrics(metrics, train_eval="train")
 
                     if self.mixture_reward_backend != "lora":
@@ -1989,16 +2105,14 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                             {
                                 "loss": loss_value,
                                 "em/e_step_epoch": float(epoch),
-                                "em/m_step": float(m_step + 1),
+                                "em/block_index": float(block_index),
                             }
                         )
 
                     self._maybe_evaluate_and_save_em(trial=trial)
 
-                    if self.state.global_step >= max_steps:
-                        stop_training = True
-                        break
-
+                block_batches = []
+                block_index += 1
                 if stop_training:
                     break
 

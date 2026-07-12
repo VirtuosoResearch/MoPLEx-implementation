@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# set -euo pipefail
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASH_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -12,11 +12,12 @@ DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_disagreement_train_a
 BASE_STATS_PATH="${BASE_STATS_PATH:-${REPO_ROOT}/data/ultrafeedback_disagreement/stats.json}"
 SEEDS="${SEEDS:-42}"
 RANKING_SIZES="${RANKING_SIZES:-4}"
-GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-4 2}"
+GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-4}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-2e-6}}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-${EM_TEMPERATURE:-1.0}}"
-M_STEP_UPDATES="${M_STEP_UPDATES:-3 1}"
+EM_BATCHES_PER_UPDATES="${EM_BATCHES_PER_UPDATE:-8 32 128}"
+EM_ALPHA_UPDATE="${EM_ALPHA_UPDATE:-block_closed_form}"
 MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-em_only}"
 MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-lora}"
 # LoRA mixture switches active adapters inside the loss forward, which is not
@@ -26,8 +27,8 @@ DOWNSAMPLE_RATIO="${DOWNSAMPLE_RATIO:-1.0}"
 DOWNSAMPLE_GROUP_KEY="${DOWNSAMPLE_GROUP_KEY:-source_index}"
 METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-mixture_posterior/pairwise_acc}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export WANDB_ENTITY="${WANDB_ENTITY:-nerdsresearch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 
@@ -75,15 +76,15 @@ for seed in ${SEEDS}; do
 for learning_rate in ${LEARNING_RATES}; do
 for temperature in ${EM_TEMPERATURES}; do
 for generated_ranking_size in ${GENERATED_RANKING_SIZES}; do
-for m_step_updates in ${M_STEP_UPDATES}; do
 for ranking_size in ${RANKING_SIZES}; do
+for EM_BATCHES_PER_UPDATE in ${EM_BATCHES_PER_UPDATES}; do
   lr_tag="${learning_rate//./p}"
   lr_tag="${lr_tag//-/m}"
   temp_tag="${temperature//./p}"
-  run_name="${BASE_WANDB_NAME}-m${ranking_size}-mp${generated_ranking_size}-ms${m_step_updates}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
-  output_dir="${BASE_OUTPUT_DIR}/m${ranking_size}-mp${generated_ranking_size}-ms${m_step_updates}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
+  run_name="${BASE_WANDB_NAME}-m${ranking_size}-mp${generated_ranking_size}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}-$(date +%Y%m%d-%H%M%S)"
+  output_dir="${BASE_OUTPUT_DIR}/m${ranking_size}-mp${generated_ranking_size}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}-$(date +%Y%m%d-%H%M%S)"
 
-  echo "Launching augmented mixture PL (${MIXTURE_REWARD_BACKEND} backend): dataset=${DATASET_DIR}; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; m=${ranking_size}; m_prime=${generated_ranking_size}; m_step_updates=${m_step_updates}; seed=${seed}; downsample=${DOWNSAMPLE_RATIO}; gradient_checkpointing=${GRADIENT_CHECKPOINTING}"
+  echo "Launching augmented mixture PL (${MIXTURE_REWARD_BACKEND} backend): dataset=${DATASET_DIR}; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; m=${ranking_size}; m_prime=${generated_ranking_size}; em_batches_per_update=${EM_BATCHES_PER_UPDATE}; em_alpha_update=${EM_ALPHA_UPDATE}; seed=${seed}; downsample=${DOWNSAMPLE_RATIO}; gradient_checkpointing=${GRADIENT_CHECKPOINTING}"
 
   ACCELERATE_LOG_LEVEL=info accelerate launch \
     --config_file recipes/accelerate_configs/single.yaml \
@@ -112,7 +113,8 @@ for ranking_size in ${RANKING_SIZES}; do
     --mixture_reward_backend "${MIXTURE_REWARD_BACKEND}" \
     --mixture_nll_weight "${MIXTURE_NLL_WEIGHT:-0.1}" \
     --em_temperature "${temperature}" \
-    --m_step_updates "${m_step_updates}" \
+    --em_batches_per_update "${EM_BATCHES_PER_UPDATE}" \
+    --em_alpha_update "${EM_ALPHA_UPDATE}" \
     --use_contextual_router "${USE_CONTEXTUAL_ROUTER:-false}" \
     --use_closed_form_router_prior_update "${USE_CLOSED_FORM_ROUTER_PRIOR_UPDATE:-false}" \
     --router_hidden_size "${ROUTER_HIDDEN_SIZE:-256}" \

@@ -211,8 +211,11 @@ def main(script_args, training_args, model_args):
     ###################
     # Model & Tokenizer
     ###################
+    peft_config = get_peft_config(model_args)
     model = get_model(model_args, training_args)
-    ref_model = get_model(model_args, training_args)
+    # With PEFT/LoRA, DPOTrainer derives the reference from the base weights via
+    # disable_adapter(), so a separate ref_model is never used — don't allocate it.
+    ref_model = get_model(model_args, training_args) if peft_config is None else None
     tokenizer = get_tokenizer(model_args, training_args)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -247,7 +250,6 @@ def main(script_args, training_args, model_args):
     ##########
     # Training
     ##########
-    peft_config = get_peft_config(model_args)
     # When using PEFT adapters with DPO, don't pass a separate ref_model.
     # DPOTrainer will handle creating the reference model internally.
     use_listwise = script_args.dataset_format == "listwise" or training_args.listwise

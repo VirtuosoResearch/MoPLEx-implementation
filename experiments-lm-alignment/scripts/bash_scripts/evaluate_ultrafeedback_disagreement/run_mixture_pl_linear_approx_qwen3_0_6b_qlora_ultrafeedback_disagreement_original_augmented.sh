@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASH_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -20,7 +20,8 @@ GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-4 2}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-2e-6}}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-${EM_TEMPERATURE:-1.0}}"
-M_STEP_UPDATES="${M_STEP_UPDATES:-3 1}"
+EM_BATCHES_PER_UPDATE="${EM_BATCHES_PER_UPDATE:-8}"
+EM_ALPHA_UPDATE="${EM_ALPHA_UPDATE:-block_closed_form}"
 MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-em_only}"
 MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-lora}"
 ORIGINAL_DOWNSAMPLE_RATIO="${ORIGINAL_DOWNSAMPLE_RATIO:-${DOWNSAMPLE_RATIO:-0.25}}"
@@ -80,9 +81,8 @@ run_one() {
   local seed="$5"
   local learning_rate="$6"
   local temperature="$7"
-  local m_step_updates="$8"
-  local ranking_size="$9"
-  local generated_ranking_size="${10}"
+  local ranking_size="$8"
+  local generated_ranking_size="$9"
 
   local dataset_tag
   local ratio_tag
@@ -106,10 +106,10 @@ run_one() {
     generated_echo="; m_prime=${generated_ranking_size}"
   fi
 
-  run_name="${BASE_WANDB_NAME}-${dataset_mode}-approx-a${anchor}-m${ranking_size}${generated_tag}-ms${m_step_updates}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
-  output_dir="${BASE_OUTPUT_ROOT}/${dataset_mode}/qwen3-0.6b-${dataset_tag}/approx-a${anchor}-m${ranking_size}${generated_tag}-ms${m_step_updates}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
+  run_name="${BASE_WANDB_NAME}-${dataset_mode}-approx-a${anchor}-m${ranking_size}${generated_tag}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
+  output_dir="${BASE_OUTPUT_ROOT}/${dataset_mode}/qwen3-0.6b-${dataset_tag}/approx-a${anchor}-m${ranking_size}${generated_tag}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
 
-  echo "Launching ${dataset_mode} approximate mixture PL (${MIXTURE_REWARD_BACKEND} backend): dataset=${dataset_dir}; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; a=${anchor}; m=${ranking_size}${generated_echo}; m_step_updates=${m_step_updates}; seed=${seed}; downsample=${downsample_ratio}; ref_mode=${LINEAR_APPROX_REF_MODE}; gradient_checkpointing=${GRADIENT_CHECKPOINTING}"
+  echo "Launching ${dataset_mode} approximate mixture PL (${MIXTURE_REWARD_BACKEND} backend): dataset=${dataset_dir}; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; a=${anchor}; m=${ranking_size}${generated_echo}; em_batches_per_update=${EM_BATCHES_PER_UPDATE}; em_alpha_update=${EM_ALPHA_UPDATE}; seed=${seed}; downsample=${downsample_ratio}; ref_mode=${LINEAR_APPROX_REF_MODE}; gradient_checkpointing=${GRADIENT_CHECKPOINTING}"
 
   ACCELERATE_LOG_LEVEL=info accelerate launch \
     --config_file recipes/accelerate_configs/single.yaml \
@@ -138,7 +138,8 @@ run_one() {
     --mixture_reward_backend "${MIXTURE_REWARD_BACKEND}" \
     --mixture_nll_weight "${MIXTURE_NLL_WEIGHT:-0.1}" \
     --em_temperature "${temperature}" \
-    --m_step_updates "${m_step_updates}" \
+    --em_batches_per_update "${EM_BATCHES_PER_UPDATE}" \
+    --em_alpha_update "${EM_ALPHA_UPDATE}" \
     --use_contextual_router "${USE_CONTEXTUAL_ROUTER:-false}" \
     --use_closed_form_router_prior_update "${USE_CLOSED_FORM_ROUTER_PRIOR_UPDATE:-false}" \
     --router_hidden_size "${ROUTER_HIDDEN_SIZE:-256}" \
@@ -189,7 +190,6 @@ for dataset_mode in ${DATASET_MODES}; do
   for seed in ${SEEDS}; do
   for learning_rate in ${LEARNING_RATES}; do
   for temperature in ${EM_TEMPERATURES}; do
-  for m_step_updates in ${M_STEP_UPDATES}; do
   for ranking_size in ${RANKING_SIZES}; do
   for anchor in ${ANCHORS}; do
     if [[ "${dataset_mode}" == "augmented" ]]; then
@@ -200,12 +200,11 @@ for dataset_mode in ${DATASET_MODES}; do
           echo "Skipping anchor=${anchor} with ranking_size=${ranking_size} and generated_ranking_size=4." >&2
           continue
         fi
-        run_one "${dataset_mode}" "${dataset_dir}" "${downsample_ratio}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${m_step_updates}" "${ranking_size}" "${generated_ranking_size}"
+        run_one "${dataset_mode}" "${dataset_dir}" "${downsample_ratio}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${ranking_size}" "${generated_ranking_size}"
       done
     else
-      run_one "${dataset_mode}" "${dataset_dir}" "${downsample_ratio}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${m_step_updates}" "${ranking_size}" ""
+      run_one "${dataset_mode}" "${dataset_dir}" "${downsample_ratio}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${ranking_size}" ""
     fi
-  done
   done
   done
   done
