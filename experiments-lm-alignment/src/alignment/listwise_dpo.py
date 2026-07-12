@@ -410,26 +410,33 @@ class ListwiseDPOTrainer(DPOTrainer):
                 num_candidates,
             )
 
+        # As in the mixture approx path: without an ambient grad mode nothing
+        # backpropagates through the anchor scores, so the anchor graph can be
+        # freed as soon as the input-gradients are taken.
+        needs_graph = torch.is_grad_enabled()
         with torch.enable_grad():
             policy_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
             policy_logps = self._sequence_logps(policy_logits, anchor_labels)
+            del policy_logits
             if ref_mode == "exact_score":
                 anchor_grads = torch.autograd.grad(
                     policy_logps.sum(),
                     anchor_embeds,
-                    retain_graph=True,
+                    retain_graph=needs_graph,
                     create_graph=False,
                 )[0].detach()
-                anchor_scores = policy_logps
+                anchor_scores = policy_logps.detach() if not needs_graph else policy_logps
             else:
                 ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
                 anchor_scores = beta * (policy_logps - ref_logps)
                 anchor_grads = torch.autograd.grad(
                     anchor_scores.sum(),
                     anchor_embeds,
-                    retain_graph=True,
+                    retain_graph=needs_graph,
                     create_graph=False,
                 )[0].detach()
+                if not needs_graph:
+                    anchor_scores = anchor_scores.detach()
 
         estimates = self._linear_approx_from_anchor_tensors(
             candidate_embeddings,
@@ -552,7 +559,15 @@ class ListwiseDPOTrainer(DPOTrainer):
         flat_attention_mask = attention_mask.view(batch_size * num_candidates, seq_len)
         flat_labels = labels.view(batch_size * num_candidates, seq_len)
 
-        if self._use_linear_reward_approx(train_eval):
+        use_approx_utilities = self._use_linear_reward_approx(train_eval)
+        if use_approx_utilities and train_eval == "train" and not torch.is_grad_enabled():
+            # The approximation only pays off when gradients must flow through the
+            # utilities: under no_grad it builds anchor autograd graphs and runs
+            # extra backwards, costing more peak memory than exact scoring. Metric
+            # logging therefore uses exact utilities (matching exact eval).
+            use_approx_utilities = False
+
+        if use_approx_utilities:
             utilities = self._approximate_listwise_utilities(
                 model,
                 input_ids,
@@ -563,6 +578,7 @@ class ListwiseDPOTrainer(DPOTrainer):
         else:
             policy_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
             policy_logps = self._sequence_logps(policy_logits, flat_labels).view(batch_size, num_candidates)
+            del policy_logits
             ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
 
             beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
@@ -1060,6 +1076,12 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         if self.policy_adapter_name is None or self.mixture_router is None:
             raise RuntimeError("LoRA mixture backend was not initialized.")
 
+        # Under an ambient no_grad (block-EM E-step, eval) nothing backpropagates
+        # through the anchor scores, so each cluster's anchor graph can be freed as
+        # soon as its input-gradients are taken instead of staying alive until the
+        # next cluster's forward rebinds it.
+        needs_graph = torch.is_grad_enabled()
+
         router_param = next(self.mixture_router.parameters())
         context = torch.zeros(
             batch_size,
@@ -1123,12 +1145,15 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             with torch.enable_grad():
                 adapter_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
                 adapter_logps = self._sequence_logps(adapter_logits, anchor_labels)
+                del adapter_logits
                 adapter_grads = torch.autograd.grad(
                     adapter_logps.sum(),
                     anchor_embeds,
-                    retain_graph=True,
+                    retain_graph=needs_graph,
                     create_graph=False,
                 )[0].detach()
+                if not needs_graph:
+                    adapter_logps = adapter_logps.detach()
                 if ref_mode == "exact_score":
                     anchor_scores = adapter_logps
                     anchor_grads = adapter_grads

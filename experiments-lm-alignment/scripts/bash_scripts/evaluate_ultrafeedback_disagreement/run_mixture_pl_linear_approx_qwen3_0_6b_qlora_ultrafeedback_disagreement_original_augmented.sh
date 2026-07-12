@@ -14,13 +14,15 @@ BASE_STATS_PATH="${BASE_STATS_PATH:-${ORIGINAL_DATASET_DIR}/stats.json}"
 
 DATASET_MODES="${DATASET_MODES:-augmented}"
 ANCHORS="${ANCHORS:-2 4}"
-SEEDS="${SEEDS:-42}"
+SEEDS="${SEEDS:-42 43}"
 RANKING_SIZES="${RANKING_SIZES:-4}"
-GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-4 2}"
+GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-4}"
+MAX_LENGTH="${MAX_LENGTH:-768}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-384}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-2e-6}}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-${EM_TEMPERATURE:-1.0}}"
-EM_BATCHES_PER_UPDATE="${EM_BATCHES_PER_UPDATE:-8}"
+EM_BATCHES_PER_UPDATE="${EM_BATCHES_PER_UPDATE:-32}"
 EM_ALPHA_UPDATE="${EM_ALPHA_UPDATE:-block_closed_form}"
 MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-em_only}"
 MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-lora}"
@@ -33,10 +35,10 @@ METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-mixture_posterior/pairwise_acc}"
 # This is not compatible with checkpoint recomputation while LoRA adapters are
 # switched inside the mixture loss.
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-false}"
-LINEAR_APPROX_REF_MODE="${LINEAR_APPROX_REF_MODE:-exact_score}"
+LINEAR_APPROX_REF_MODE="${LINEAR_APPROX_REF_MODE:-input_gradient}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
-export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
+export WANDB_ENTITY="${WANDB_ENTITY:-nerdsresearch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 EXTRA_ARGS=("$@")
@@ -150,12 +152,14 @@ run_one() {
     --linear_approx_ref_mode "${LINEAR_APPROX_REF_MODE}" \
     --learning_rate "${learning_rate}" \
     --max_steps "${MAX_STEPS}" \
+    --max_length "${MAX_LENGTH}" \
+    --max_prompt_length "${MAX_PROMPT_LENGTH}" \
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE:-2}" \
     --per_device_eval_batch_size "${PER_DEVICE_EVAL_BATCH_SIZE:-2}" \
-    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-4}" \
+    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
-    --eval_steps "${EVAL_STEPS:-500}" \
-    --save_steps "${SAVE_STEPS:-500}" \
+    --eval_steps "${EVAL_STEPS:-250}" \
+    --save_steps "${SAVE_STEPS:-250}" \
     --metric_for_best_model "${METRIC_FOR_BEST_MODEL}" \
     --output_dir "${output_dir}" \
     --run_name "${run_name}" \

@@ -10,13 +10,15 @@ REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 CONFIG_PATH="${CONFIG_PATH:-recipes/qwen3-1b/dpo/ultrafeedback_merged/config_mixture_qlora.yaml}"
 DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_disagreement_train_augmented_Qwen3_0p6B_ds0p25_k8_s42}"
 BASE_STATS_PATH="${BASE_STATS_PATH:-${REPO_ROOT}/data/ultrafeedback_disagreement/stats.json}"
-SEEDS="${SEEDS:-42}"
+SEEDS="${SEEDS:-42 43}"
 RANKING_SIZES="${RANKING_SIZES:-4}"
-GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-4}"
+GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-1 2 3 4}"
 MAX_STEPS="${MAX_STEPS:-2000}"
-LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-2e-6}}"
+MAX_LENGTH="${MAX_LENGTH:-768}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-384}"
+LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-1e-5}}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-${EM_TEMPERATURE:-1.0}}"
-EM_BATCHES_PER_UPDATES="${EM_BATCHES_PER_UPDATE:-8 32 128}"
+EM_BATCHES_PER_UPDATES="${EM_BATCHES_PER_UPDATE:-32}"
 EM_ALPHA_UPDATE="${EM_ALPHA_UPDATE:-block_closed_form}"
 MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-em_only}"
 MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-lora}"
@@ -81,10 +83,11 @@ for EM_BATCHES_PER_UPDATE in ${EM_BATCHES_PER_UPDATES}; do
   lr_tag="${learning_rate//./p}"
   lr_tag="${lr_tag//-/m}"
   temp_tag="${temperature//./p}"
-  run_name="${BASE_WANDB_NAME}-m${ranking_size}-mp${generated_ranking_size}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}-$(date +%Y%m%d-%H%M%S)"
-  output_dir="${BASE_OUTPUT_DIR}/m${ranking_size}-mp${generated_ranking_size}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}-$(date +%Y%m%d-%H%M%S)"
+  length_tag="ml${MAX_LENGTH}-mpl${MAX_PROMPT_LENGTH}"
+  run_name="${BASE_WANDB_NAME}-m${ranking_size}-mp${generated_ranking_size}-emb${EM_BATCHES_PER_UPDATE}-${length_tag}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}-$(date +%Y%m%d-%H%M%S)"
+  output_dir="${BASE_OUTPUT_DIR}/m${ranking_size}-mp${generated_ranking_size}-emb${EM_BATCHES_PER_UPDATE}-${length_tag}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}-$(date +%Y%m%d-%H%M%S)"
 
-  echo "Launching augmented mixture PL (${MIXTURE_REWARD_BACKEND} backend): dataset=${DATASET_DIR}; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; m=${ranking_size}; m_prime=${generated_ranking_size}; em_batches_per_update=${EM_BATCHES_PER_UPDATE}; em_alpha_update=${EM_ALPHA_UPDATE}; seed=${seed}; downsample=${DOWNSAMPLE_RATIO}; gradient_checkpointing=${GRADIENT_CHECKPOINTING}"
+  echo "Launching augmented mixture PL (${MIXTURE_REWARD_BACKEND} backend): dataset=${DATASET_DIR}; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; m=${ranking_size}; m_prime=${generated_ranking_size}; em_batches_per_update=${EM_BATCHES_PER_UPDATE}; em_alpha_update=${EM_ALPHA_UPDATE}; max_length=${MAX_LENGTH}; max_prompt_length=${MAX_PROMPT_LENGTH}; seed=${seed}; downsample=${DOWNSAMPLE_RATIO}; gradient_checkpointing=${GRADIENT_CHECKPOINTING}"
 
   ACCELERATE_LOG_LEVEL=info accelerate launch \
     --config_file recipes/accelerate_configs/single.yaml \
@@ -121,9 +124,11 @@ for EM_BATCHES_PER_UPDATE in ${EM_BATCHES_PER_UPDATES}; do
     --log_cluster_metrics true \
     --learning_rate "${learning_rate}" \
     --max_steps "${MAX_STEPS}" \
+    --max_length "${MAX_LENGTH}" \
+    --max_prompt_length "${MAX_PROMPT_LENGTH}" \
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE:-2}" \
     --per_device_eval_batch_size "${PER_DEVICE_EVAL_BATCH_SIZE:-2}" \
-    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-4}" \
+    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
     --eval_steps "${EVAL_STEPS:-200}" \
     --save_steps "${SAVE_STEPS:-200}" \
