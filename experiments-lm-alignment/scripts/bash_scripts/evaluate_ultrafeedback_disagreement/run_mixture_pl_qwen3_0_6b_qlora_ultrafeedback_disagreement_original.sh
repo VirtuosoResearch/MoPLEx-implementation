@@ -12,7 +12,9 @@ DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_disagreement}"
 SEEDS="${SEEDS:-42 43}"
 RANKING_SIZES="${RANKING_SIZES:-4}"
 MAX_STEPS="${MAX_STEPS:-2000}"
-LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-2e-6}}"
+MAX_LENGTH="${MAX_LENGTH:-1024}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-512}"
+LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-1e-5}}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-${EM_TEMPERATURE:-1.0}}"
 EM_BATCHES_PER_UPDATES="${EM_BATCHES_PER_UPDATE:-32}"
 EM_ALPHA_UPDATE="${EM_ALPHA_UPDATE:-block_closed_form}"
@@ -25,8 +27,8 @@ DOWNSAMPLE_RATIO="${DOWNSAMPLE_RATIO:-0.25}"
 DOWNSAMPLE_GROUP_KEY="${DOWNSAMPLE_GROUP_KEY:-source_index}"
 METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-ranking_validation/mixture_posterior/pairwise_acc}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-export WANDB_ENTITY="${WANDB_ENTITY:-nerdsresearch}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 
@@ -87,7 +89,7 @@ for EM_BATCHES_PER_UPDATE in ${EM_BATCHES_PER_UPDATES}; do
     --listwise true \
     --listwise_num_responses "${ranking_size}" \
     --listwise_min_responses 2 \
-    --run_ranking_eval true \
+    --run_ranking_eval false \
     --ranking_eval_during_training true \
     --dataset_downsample_ratio "${DOWNSAMPLE_RATIO}" \
     --dataset_downsample_seed "${seed}" \
@@ -108,6 +110,8 @@ for EM_BATCHES_PER_UPDATE in ${EM_BATCHES_PER_UPDATES}; do
     --log_cluster_metrics true \
     --learning_rate "${learning_rate}" \
     --max_steps "${MAX_STEPS}" \
+    --max_length "${MAX_LENGTH}" \
+    --max_prompt_length "${MAX_PROMPT_LENGTH}" \
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE:-2}" \
     --per_device_eval_batch_size "${PER_DEVICE_EVAL_BATCH_SIZE:-2}" \
     --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \

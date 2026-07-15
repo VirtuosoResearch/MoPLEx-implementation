@@ -44,6 +44,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default="single",
     )
     parser.add_argument(
+        "--reference_response_source",
+        choices=("base_generation", "dataset_top_ranked"),
+        default="base_generation",
+        help="Compare policy generations against base-model generations or the dataset's highest-scored response.",
+    )
+    parser.add_argument(
         "--reward_adapter_map_json",
         default=None,
         help="Path to a JSON object, or an inline JSON object, mapping dimensions to reward LoRA adapter paths.",
@@ -236,6 +242,34 @@ def resolve_policy_adapter_path(policy_adapter_path: str, policy_adapter_mode: s
     if policy_adapter_mode != "dimension_mapped_mixture":
         raise ValueError(f"Unknown policy adapter mode: {policy_adapter_mode}")
     return str(Path(policy_adapter_path) / f"mixture_cluster_{_persona_dimension_index(dimension)}")
+
+
+def select_top_ranked_response(row: dict[str, Any]) -> dict[str, Any]:
+    responses = row.get("responses")
+    scores = row.get("scores")
+    if not isinstance(responses, list) or not isinstance(scores, list):
+        raise ValueError("dataset_top_ranked requires each row to contain list-valued `responses` and `scores`.")
+    if not responses or not scores:
+        raise ValueError("dataset_top_ranked requires non-empty `responses` and `scores`.")
+    if len(responses) != len(scores):
+        raise ValueError(
+            "dataset_top_ranked requires `responses` and `scores` to have the same length "
+            f"(got {len(responses)} responses and {len(scores)} scores)."
+        )
+
+    numeric_scores: list[float] = []
+    for idx, score in enumerate(scores):
+        try:
+            numeric_scores.append(float(score))
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Invalid score at index {idx}: {score!r}") from exc
+
+    best_idx = max(range(len(numeric_scores)), key=lambda idx: numeric_scores[idx])
+    return {
+        "response": str(responses[best_idx]),
+        "index": best_idx,
+        "score": numeric_scores[best_idx],
+    }
 
 
 def build_sequence(
@@ -466,7 +500,7 @@ class DPOUtilityRewardScorer:
         for idx, record in enumerate(records):
             dimension = str(record["preference_dimension"])
             prompt = str(record["prompt"])
-            items_by_dimension[dimension].append((idx, prompt, str(record["base_response"])))
+            items_by_dimension[dimension].append((idx, prompt, str(record["reference_response"])))
             items_by_dimension[dimension].append((idx, prompt, str(record["policy_response"])))
 
         for dimension, items in tqdm(
@@ -479,8 +513,14 @@ class DPOUtilityRewardScorer:
             scores = self.score_dimension(dimension, pairs)
             for offset in range(0, len(items), 2):
                 record_idx = items[offset][0]
-                records[record_idx]["base_reward_score"] = scores[offset]
+                reference_score = scores[offset]
+                records[record_idx]["reference_reward_score"] = reference_score
                 records[record_idx]["policy_reward_score"] = scores[offset + 1]
+                source = records[record_idx].get("reference_response_source")
+                if source == "base_generation":
+                    records[record_idx]["base_reward_score"] = reference_score
+                elif source == "dataset_top_ranked":
+                    records[record_idx]["top_ranked_reward_score"] = reference_score
 
 
 def aggregate_metrics(records: list[dict[str, Any]], *, tie_epsilon: float = 0.0) -> dict[str, Any]:
@@ -488,14 +528,14 @@ def aggregate_metrics(records: list[dict[str, Any]], *, tie_epsilon: float = 0.0
         wins = losses = ties = 0
         margins = []
         for row in rows:
-            margin = float(row["policy_reward_score"]) - float(row["base_reward_score"])
+            margin = float(row["policy_reward_score"]) - float(row["reference_reward_score"])
             margins.append(margin)
             if margin > tie_epsilon:
                 wins += 1
                 row["winner"] = "policy"
             elif margin < -tie_epsilon:
                 losses += 1
-                row["winner"] = "base"
+                row["winner"] = "base" if row.get("reference_response_source") == "base_generation" else "reference"
             else:
                 ties += 1
                 row["winner"] = "tie"
@@ -586,7 +626,13 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     LOGGER.info("Loading policy model and adapter(s).")
     generator = PolicyGenerator(args, dimensions)
     prompts = [str(row.get("prompt", "")) for row in examples]
-    base_responses = generator.generate_base(prompts)
+    if args.reference_response_source == "base_generation":
+        reference_items = [
+            {"response": response, "index": None, "score": None}
+            for response in generator.generate_base(prompts)
+        ]
+    else:
+        reference_items = [select_top_ranked_response(row) for row in examples]
     policy_responses = generator.generate_policy_by_dimension(examples)
 
     records = []
@@ -597,20 +643,26 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "seed": args.seed,
         "prompt_format": args.prompt_format,
     }
-    for row, base_response, policy_response in zip(examples, base_responses, policy_responses):
+    for row, reference_item, policy_response in zip(examples, reference_items, policy_responses):
         dimension = str(row.get("preference_dimension", "unknown"))
-        records.append(
-            {
-                "prompt": str(row.get("prompt", "")),
-                "preference_dimension": dimension,
-                "base_response": base_response,
-                "policy_response": policy_response,
-                "policy_adapter_path": generator.dimension_to_path[dimension],
-                "reward_adapter_path": reward_adapter_map[dimension],
-                "generation_settings": generation_settings,
-                "metadata": _record_metadata(row),
-            }
-        )
+        record = {
+            "prompt": str(row.get("prompt", "")),
+            "preference_dimension": dimension,
+            "reference_response_source": args.reference_response_source,
+            "reference_response": reference_item["response"],
+            "policy_response": policy_response,
+            "policy_adapter_path": generator.dimension_to_path[dimension],
+            "reward_adapter_path": reward_adapter_map[dimension],
+            "generation_settings": generation_settings,
+            "metadata": _record_metadata(row),
+        }
+        if args.reference_response_source == "base_generation":
+            record["base_response"] = reference_item["response"]
+        else:
+            record["reference_response_index"] = reference_item["index"]
+            record["reference_dataset_score"] = reference_item["score"]
+            record["top_ranked_response"] = reference_item["response"]
+        records.append(record)
 
     del generator
     gc.collect()
@@ -627,6 +679,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
             "split": args.split,
             "policy_adapter_path": args.policy_adapter_path,
             "policy_adapter_mode": args.policy_adapter_mode,
+            "reference_response_source": args.reference_response_source,
             "reward_beta": args.reward_beta,
             "tie_epsilon": args.tie_epsilon,
         }

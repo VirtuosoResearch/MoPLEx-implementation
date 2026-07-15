@@ -8,11 +8,12 @@ SCRIPTS_DIR="$(cd "${BASH_SCRIPTS_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
 
 CONFIG_PATH="${CONFIG_PATH:-recipes/qwen3-1b/dpo/ultrafeedback_merged/config_mixture_qlora.yaml}"
-DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_disagreement_train_augmented_Qwen3_0p6B_ds0p25_k8_s42}"
+DATASET_DIR="${DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_disagreement_train_augmented_Qwen3_0p6B_ds0p25_k8_s42_temp1p0}"
 BASE_STATS_PATH="${BASE_STATS_PATH:-${REPO_ROOT}/data/ultrafeedback_disagreement/stats.json}"
-SEEDS="${SEEDS:-42 43}"
+SEEDS="${SEEDS:-43}"
 RANKING_SIZES="${RANKING_SIZES:-4}"
-GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-1 2 3 4}"
+GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-2}"
+LISTWISE_AUGMENTED_SUBSET_STRATEGY="${LISTWISE_AUGMENTED_SUBSET_STRATEGY:-first}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 MAX_LENGTH="${MAX_LENGTH:-768}"
 MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-384}"
@@ -30,7 +31,7 @@ DOWNSAMPLE_GROUP_KEY="${DOWNSAMPLE_GROUP_KEY:-source_index}"
 METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-mixture_posterior/pairwise_acc}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
-export WANDB_ENTITY="${WANDB_ENTITY:-nerdsresearch}"
+export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
 export WANDB_MODE="${WANDB_MODE:-online}"
 
@@ -102,8 +103,9 @@ for EM_BATCHES_PER_UPDATE in ${EM_BATCHES_PER_UPDATES}; do
     --listwise true \
     --listwise_num_responses "${ranking_size}" \
     --listwise_num_generated_responses "${generated_ranking_size}" \
+    --listwise_augmented_subset_strategy "${LISTWISE_AUGMENTED_SUBSET_STRATEGY}" \
     --listwise_min_responses 2 \
-    --run_ranking_eval true \
+    --run_ranking_eval false \
     --ranking_eval_during_training true \
     --dataset_downsample_ratio "${DOWNSAMPLE_RATIO}" \
     --dataset_downsample_seed "${seed}" \

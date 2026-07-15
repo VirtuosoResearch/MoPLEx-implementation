@@ -113,6 +113,15 @@ class ScriptArguments(trl.ScriptArguments):
             )
         },
     )
+    listwise_augmented_subset_strategy: str = field(
+        default="all_combinations",
+        metadata={
+            "help": (
+                "How to select original/generated candidates when reducing augmented preformatted listwise data. "
+                "'all_combinations' emits every subset; 'first' emits one deterministic subset per row."
+            )
+        },
+    )
     listwise_prompt_column: str = field(
         default="instruction",
         metadata={"help": "Prompt column in the raw listwise dataset."},
@@ -253,6 +262,8 @@ class ScriptArguments(trl.ScriptArguments):
             raise ValueError("`listwise_num_responses` must be >= 2")
         if self.listwise_num_generated_responses < 0:
             raise ValueError("`listwise_num_generated_responses` must be >= 0")
+        if self.listwise_augmented_subset_strategy not in {"all_combinations", "first"}:
+            raise ValueError("`listwise_augmented_subset_strategy` must be either 'all_combinations' or 'first'")
         if self.listwise_min_responses < 2:
             raise ValueError("`listwise_min_responses` must be >= 2")
         if self.dataset_downsample_ratio <= 0 or self.dataset_downsample_ratio > 1:
@@ -411,6 +422,15 @@ class MixturePLConfig(DPOConfig):
             )
         },
     )
+    em_exact_e_step: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Compute block-EM E-step responsibilities with exact scoring and dropout disabled, "
+                "even when use_linear_reward_approx is enabled for the M-step."
+            )
+        },
+    )
     mixture_reward_backend: str = field(
         default="head",
         metadata={
@@ -474,6 +494,15 @@ class MixturePLConfig(DPOConfig):
     linear_approx_exact_eval: bool = field(
         default=True,
         metadata={"help": "If True, validation/evaluation uses exact scoring even when approximation is enabled."},
+    )
+    linear_approx_length_matched: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Estimate non-anchor scores on the min(anchor, candidate) response-token prefix and pair "
+                "with matched-length reference scores, removing the length bias of full-grid extrapolation."
+            )
+        },
     )
     linear_approx_ref_mode: str = field(
         default="input_gradient",

@@ -124,6 +124,7 @@ def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) 
     rows: list[dict[str, Any]] = []
     target_k = args.listwise_num_responses
     generated_k = getattr(args, "listwise_num_generated_responses", 0)
+    augmented_subset_strategy = getattr(args, "listwise_augmented_subset_strategy", "all_combinations")
     min_k = args.listwise_min_responses
     allowed_dimensions = set(args.preference_dimensions) if args.preference_dimensions is not None else None
 
@@ -160,13 +161,21 @@ def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) 
             if generated_indices:
                 if len(generated_indices) < generated_k:
                     continue
-                subset_indices_iter = (
-                    original_subset + generated_subset
-                    for original_subset in combinations(original_indices, target_k)
-                    for generated_subset in combinations(generated_indices, generated_k)
-                )
+                if augmented_subset_strategy == "first":
+                    subset_indices_iter = (
+                        original_indices[:target_k] + generated_indices[:generated_k],
+                    )
+                else:
+                    subset_indices_iter = (
+                        original_subset + generated_subset
+                        for original_subset in combinations(original_indices, target_k)
+                        for generated_subset in combinations(generated_indices, generated_k)
+                    )
             else:
-                subset_indices_iter = combinations(original_indices, target_k)
+                if augmented_subset_strategy == "first":
+                    subset_indices_iter = (original_indices[:target_k],)
+                else:
+                    subset_indices_iter = combinations(original_indices, target_k)
 
             for idxs in subset_indices_iter:
                 new_row = dict(row)

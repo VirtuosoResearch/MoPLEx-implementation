@@ -543,6 +543,36 @@ class GetDatasetTest(unittest.TestCase):
         observed_original_pairs = {tuple(responses[:2]) for responses in converted["responses"]}
         self.assertEqual(observed_original_pairs, expected_original_pairs)
 
+    def test_augmented_listwise_reduction_first_subset_avoids_expansion(self):
+        preformatted = Dataset.from_list(
+            [
+                {
+                    "prompt": "p1",
+                    "responses": ["A", "B", "C", "D", "G1", "G2", "G3", "G4"],
+                    "scores": [4.0, 3.0, 2.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+                    "preference_dimension": "helpfulness",
+                    "source_index": 0,
+                    "ranked_prefix_length": 4,
+                }
+            ]
+        )
+        args = ScriptArguments(
+            dataset_name="dummy",
+            dataset_format="listwise",
+            preference_dimensions=["helpfulness"],
+            listwise_num_responses=4,
+            listwise_num_generated_responses=2,
+            listwise_augmented_subset_strategy="first",
+            listwise_min_responses=2,
+        )
+
+        converted = _maybe_convert_to_listwise(DatasetDict({"train": preformatted}), args)["train"]
+
+        self.assertEqual(len(converted), 1)
+        self.assertEqual(converted[0]["responses"], ["A", "B", "C", "D", "G1", "G2"])
+        self.assertEqual(converted[0]["scores"], [4.0, 3.0, 2.0, 1.0, 0.0, 0.0])
+        self.assertEqual(converted[0]["ranked_prefix_length"], 4)
+
     def test_augmented_listwise_reduction_falls_back_for_unaugmented_rows(self):
         preformatted = Dataset.from_list(
             [

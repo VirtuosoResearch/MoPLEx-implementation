@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASH_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -20,7 +20,9 @@ SEEDS="${SEEDS:-42 43}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-2e-6}}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-1.0}"
-M_STEP_UPDATES="${M_STEP_UPDATES:-3 1}"
+EM_BATCHES_PER_UPDATE="${EM_BATCHES_PER_UPDATE:-8}"
+EM_ALPHA_UPDATE="${EM_ALPHA_UPDATE:-block_closed_form}"
+EM_EXACT_E_STEP="${EM_EXACT_E_STEP:-true}"
 MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-em_only}"
 MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-lora}"
 MIXTURE_NLL_WEIGHT="${MIXTURE_NLL_WEIGHT:-0.1}"
@@ -108,7 +110,6 @@ run_one() {
   local seed="$4"
   local learning_rate="$5"
   local temperature="$6"
-  local m_step_updates="$7"
 
   local dataset_tag
   local lr_tag
@@ -123,10 +124,10 @@ run_one() {
   temp_tag="${temperature//./p}"
   ratio_tag="${DATASET_DOWNSAMPLE_RATIO//./p}"
 
-  run_name="qwen3-0.6b-persona12-mixture-pl-top1-linear-approx-k${train_k}-a${anchor}-ms${m_step_updates}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
-  output_dir="${OUTPUT_ROOT:-outputs/persona/mixture-pl-top1-linear-approx}/${dataset_tag}/k${train_k}-a${anchor}-ms${m_step_updates}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
+  run_name="qwen3-0.6b-persona12-mixture-pl-top1-linear-approx-k${train_k}-a${anchor}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
+  output_dir="${OUTPUT_ROOT:-outputs/persona/mixture-pl-top1-linear-approx}/${dataset_tag}/k${train_k}-a${anchor}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
 
-  echo "Launching PERSONA-12 top-1 mixture PL linear approximation: dataset=${dataset_dir}; train_k=${train_k}; ranked_prefix_length=1; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; anchors=${anchor}; m_step_updates=${m_step_updates}; seed=${seed}; lr=${learning_rate}; temp=${temperature}; downsample=${DATASET_DOWNSAMPLE_RATIO}; ref_mode=${LINEAR_APPROX_REF_MODE}"
+  echo "Launching PERSONA-12 top-1 mixture PL linear approximation: dataset=${dataset_dir}; train_k=${train_k}; ranked_prefix_length=1; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; anchors=${anchor}; em_batches_per_update=${EM_BATCHES_PER_UPDATE}; em_alpha_update=${EM_ALPHA_UPDATE}; seed=${seed}; lr=${learning_rate}; temp=${temperature}; downsample=${DATASET_DOWNSAMPLE_RATIO}; ref_mode=${LINEAR_APPROX_REF_MODE}"
 
   ACCELERATE_LOG_LEVEL=info accelerate launch \
     --config_file "${ACCELERATE_CONFIG:-recipes/accelerate_configs/single.yaml}" \
@@ -153,7 +154,9 @@ run_one() {
     --mixture_reward_backend "${MIXTURE_REWARD_BACKEND}" \
     --mixture_nll_weight "${MIXTURE_NLL_WEIGHT}" \
     --em_temperature "${temperature}" \
-    --m_step_updates "${m_step_updates}" \
+    --em_batches_per_update "${EM_BATCHES_PER_UPDATE}" \
+    --em_alpha_update "${EM_ALPHA_UPDATE}" \
+    --em_exact_e_step "${EM_EXACT_E_STEP}" \
     --use_contextual_router "${USE_CONTEXTUAL_ROUTER:-false}" \
     --use_closed_form_router_prior_update "${USE_CLOSED_FORM_ROUTER_PRIOR_UPDATE:-false}" \
     --router_hidden_size "${ROUTER_HIDDEN_SIZE:-256}" \
@@ -181,14 +184,12 @@ run_one() {
 
 for learning_rate in ${LEARNING_RATES}; do
 for temperature in ${EM_TEMPERATURES}; do
-for m_step_updates in ${M_STEP_UPDATES}; do
 for anchor in ${ANCHORS}; do
 for train_k in ${TRAIN_RESPONSE_COUNTS}; do
 for seed in ${SEEDS}; do
 dataset_dir="$(listwise_dataset_dir_for_k "${train_k}")"
 require_dataset_for_k "${train_k}" "${dataset_dir}"
-  run_one "${train_k}" "${dataset_dir}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${m_step_updates}"
-done
+  run_one "${train_k}" "${dataset_dir}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}"
 done
 done
 done
