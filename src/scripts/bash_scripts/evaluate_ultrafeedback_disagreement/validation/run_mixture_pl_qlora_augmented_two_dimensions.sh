@@ -30,7 +30,7 @@ export WANDB_MODE="${WANDB_MODE:-online}"
 
 if [[ ! -d "${DATASET_DIR}" ]]; then
   echo "Missing augmented disagreement dataset directory: ${DATASET_DIR}" >&2
-  echo "Generate it with scripts/bash_scripts/augment_ultrafeedback_disagreement/augment_train_downsampled_qwen3_0_6b.sh first, or set DATASET_DIR." >&2
+  echo "Generate it with scripts/bash_scripts/augment_ultrafeedback_disagreement/augment_train_downsampled.sh first, or set DATASET_DIR." >&2
   exit 1
 fi
 
