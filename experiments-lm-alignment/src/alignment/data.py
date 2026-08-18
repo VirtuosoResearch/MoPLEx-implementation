@@ -124,6 +124,7 @@ def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) 
     rows: list[dict[str, Any]] = []
     target_k = args.listwise_num_responses
     generated_k = getattr(args, "listwise_num_generated_responses", 0)
+    augmented_subset_strategy = getattr(args, "listwise_augmented_subset_strategy", "all_combinations")
     min_k = args.listwise_min_responses
     allowed_dimensions = set(args.preference_dimensions) if args.preference_dimensions is not None else None
 
@@ -160,13 +161,21 @@ def _limit_preformatted_listwise_split(dataset: Dataset, args: ScriptArguments) 
             if generated_indices:
                 if len(generated_indices) < generated_k:
                     continue
-                subset_indices_iter = (
-                    original_subset + generated_subset
-                    for original_subset in combinations(original_indices, target_k)
-                    for generated_subset in combinations(generated_indices, generated_k)
-                )
+                if augmented_subset_strategy == "first":
+                    subset_indices_iter = (
+                        original_indices[:target_k] + generated_indices[:generated_k],
+                    )
+                else:
+                    subset_indices_iter = (
+                        original_subset + generated_subset
+                        for original_subset in combinations(original_indices, target_k)
+                        for generated_subset in combinations(generated_indices, generated_k)
+                    )
             else:
-                subset_indices_iter = combinations(original_indices, target_k)
+                if augmented_subset_strategy == "first":
+                    subset_indices_iter = (original_indices[:target_k],)
+                else:
+                    subset_indices_iter = combinations(original_indices, target_k)
 
             for idxs in subset_indices_iter:
                 new_row = dict(row)
@@ -509,9 +518,22 @@ def _maybe_convert_to_pairwise(dataset_dict: DatasetDict, args: ScriptArguments)
         return dataset_dict
 
     converted = {}
+    allowed_dimensions = set(args.preference_dimensions) if args.preference_dimensions is not None else None
     for split_name, split_data in dataset_dict.items():
         if not _is_preformatted_listwise_split(split_data):
-            converted[split_name] = split_data
+            if allowed_dimensions is not None and "preference_dimension" in split_data.column_names:
+                converted[split_name] = split_data.filter(
+                    lambda row: row.get("preference_dimension") in allowed_dimensions,
+                    desc=f"Filtering {split_name} by preference dimension",
+                )
+                logger.info(
+                    "Filtered pairwise split '%s' to %d examples for dimensions '%s'.",
+                    split_name,
+                    len(converted[split_name]),
+                    args.preference_dimensions,
+                )
+            else:
+                converted[split_name] = split_data
             continue
 
         logger.info(

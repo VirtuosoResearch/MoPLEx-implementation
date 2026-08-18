@@ -50,6 +50,7 @@ python scripts/dpo.py \
 import logging
 import os
 import sys
+import time
 
 import datasets
 import torch
@@ -82,6 +83,49 @@ from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
 logger = logging.getLogger(__name__)
 
 
+_BYTES_PER_MIB = 1024**2
+
+
+def _cuda_synchronize() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
+def _reset_cuda_peak_memory() -> None:
+    if torch.cuda.is_available():
+        _cuda_synchronize()
+        torch.cuda.reset_peak_memory_stats()
+
+
+def _cuda_memory_metrics(prefix: str) -> dict[str, float]:
+    if not torch.cuda.is_available():
+        return {}
+    _cuda_synchronize()
+    device = torch.cuda.current_device()
+    return {
+        f"{prefix}_gpu_memory_allocated_mib": torch.cuda.memory_allocated(device) / _BYTES_PER_MIB,
+        f"{prefix}_gpu_memory_reserved_mib": torch.cuda.memory_reserved(device) / _BYTES_PER_MIB,
+        f"{prefix}_gpu_peak_memory_allocated_mib": torch.cuda.max_memory_allocated(device) / _BYTES_PER_MIB,
+        f"{prefix}_gpu_peak_memory_reserved_mib": torch.cuda.max_memory_reserved(device) / _BYTES_PER_MIB,
+    }
+
+
+def _log_benchmark_metrics(stage: str, metrics: dict[str, float]) -> None:
+    metric_items = []
+    for suffix in (
+        "wall_time_seconds",
+        "gpu_memory_allocated_mib",
+        "gpu_memory_reserved_mib",
+        "gpu_peak_memory_allocated_mib",
+        "gpu_peak_memory_reserved_mib",
+    ):
+        key = f"{stage}_{suffix}"
+        if key in metrics:
+            metric_items.append(f"{key}={metrics[key]:.3f}")
+    if metric_items:
+        logger.info("Benchmark %s: %s", stage, ", ".join(metric_items))
+
+
 def cast_trainable_bf16_params_to_fp32(module: torch.nn.Module) -> int:
     """Avoid fp16 GradScaler failures on trainable bf16 parameters."""
     converted = 0
@@ -98,13 +142,26 @@ class RankingEvaluationCallback(TrainerCallback):
     """Log full ranking metrics on the configured evaluation split during Trainer.evaluate()."""
 
     def __init__(self, ranking_dataset, tokenizer, script_args, training_args):
-        self.ranking_dataset = ranking_dataset
         self.tokenizer = tokenizer
         self.script_args = script_args
         self.training_args = training_args
         self.eval_split = script_args.dataset_test_split
         self.dimension_to_id = _dimension_mapping(script_args.preference_dimensions, ranking_dataset)
         self.trainer = None
+
+        max_samples = getattr(script_args, "ranking_eval_during_training_max_samples", None)
+        if (
+            max_samples is not None
+            and max_samples > 0
+            and self.eval_split in ranking_dataset
+            and len(ranking_dataset[self.eval_split]) > max_samples
+        ):
+            # Copy so the full split is still used by the post-training ranking eval.
+            ranking_dataset = dict(ranking_dataset)
+            ranking_dataset[self.eval_split] = (
+                ranking_dataset[self.eval_split].shuffle(seed=training_args.seed).select(range(max_samples))
+            )
+        self.ranking_dataset = ranking_dataset
 
     def on_evaluate(self, args, state, control, metrics=None, **kwargs):
         del args, state, control, kwargs
@@ -176,8 +233,11 @@ def main(script_args, training_args, model_args):
     ###################
     # Model & Tokenizer
     ###################
+    peft_config = get_peft_config(model_args)
     model = get_model(model_args, training_args)
-    ref_model = get_model(model_args, training_args)
+    # With PEFT/LoRA, DPOTrainer derives the reference from the base weights via
+    # disable_adapter(), so a separate ref_model is never used — don't allocate it.
+    ref_model = get_model(model_args, training_args) if peft_config is None else None
     tokenizer = get_tokenizer(model_args, training_args)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -212,7 +272,6 @@ def main(script_args, training_args, model_args):
     ##########
     # Training
     ##########
-    peft_config = get_peft_config(model_args)
     # When using PEFT adapters with DPO, don't pass a separate ref_model.
     # DPOTrainer will handle creating the reference model internally.
     use_listwise = script_args.dataset_format == "listwise" or training_args.listwise
@@ -312,20 +371,34 @@ def main(script_args, training_args, model_args):
         checkpoint = training_args.resume_from_checkpoint
     elif last_checkpoint is not None:
         checkpoint = last_checkpoint
+    _reset_cuda_peak_memory()
+    train_wall_start = time.perf_counter()
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
+    _cuda_synchronize()
     metrics = train_result.metrics
+    metrics["train_wall_time_seconds"] = time.perf_counter() - train_wall_start
+    metrics.update(_cuda_memory_metrics("train"))
+    _log_benchmark_metrics("train", metrics)
     metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
 
     if training_args.eval_strategy != "no":
+        _reset_cuda_peak_memory()
+        eval_wall_start = time.perf_counter()
         metrics = trainer.evaluate()
+        _cuda_synchronize()
+        metrics["eval_wall_time_seconds"] = time.perf_counter() - eval_wall_start
+        metrics.update(_cuda_memory_metrics("eval"))
+        _log_benchmark_metrics("eval", metrics)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
 
     if ranking_dataset is not None:
         logger.info("*** Ranking evaluation on available ranking splits ***")
+        _reset_cuda_peak_memory()
+        ranking_wall_start = time.perf_counter()
         ranking_results = evaluate_ranking_splits(
             trainer=trainer,
             ranking_dataset=ranking_dataset,
@@ -333,6 +406,15 @@ def main(script_args, training_args, model_args):
             script_args=script_args,
             training_args=training_args,
         )
+        _cuda_synchronize()
+        ranking_benchmark_metrics = {
+            "ranking_wall_time_seconds": time.perf_counter() - ranking_wall_start,
+            **_cuda_memory_metrics("ranking"),
+        }
+        _log_benchmark_metrics("ranking", ranking_benchmark_metrics)
+        trainer.log(ranking_benchmark_metrics)
+        trainer.log_metrics("ranking_benchmark", ranking_benchmark_metrics)
+        trainer.save_metrics("ranking_benchmark", ranking_benchmark_metrics)
         for split_name, split_metrics in ranking_results.items():
             trainer.log({f"ranking_{split_name}/{key}": value for key, value in split_metrics.items()})
             trainer.log_metrics(f"ranking_{split_name}", split_metrics)

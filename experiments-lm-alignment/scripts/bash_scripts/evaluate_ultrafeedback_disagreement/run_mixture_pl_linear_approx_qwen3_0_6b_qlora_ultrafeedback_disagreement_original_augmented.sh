@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# set -euo pipefail
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASH_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -11,29 +12,35 @@ ORIGINAL_DATASET_DIR="${ORIGINAL_DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_di
 AUGMENTED_DATASET_DIR="${AUGMENTED_DATASET_DIR:-${REPO_ROOT}/data/ultrafeedback_disagreement_train_augmented_Qwen3_0p6B_ds0p25_k8_s42}"
 BASE_STATS_PATH="${BASE_STATS_PATH:-${ORIGINAL_DATASET_DIR}/stats.json}"
 
-DATASET_MODES="${DATASET_MODES:-original augmented}"
-ANCHORS="${ANCHORS:-1 2 4}"
+DATASET_MODES="${DATASET_MODES:-augmented}"
+ANCHORS="${ANCHORS:-4}"
 SEEDS="${SEEDS:-42}"
 RANKING_SIZES="${RANKING_SIZES:-4}"
-GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-4 2}"
-MAX_STEPS="${MAX_STEPS:-2000}"
-LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-2e-6}}"
+GENERATED_RANKING_SIZES="${GENERATED_RANKING_SIZES:-4}"
+LISTWISE_AUGMENTED_SUBSET_STRATEGY="${LISTWISE_AUGMENTED_SUBSET_STRATEGY:-first}"
+MAX_LENGTH="${MAX_LENGTH:-768}"
+MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-384}"
+MAX_STEPS="${MAX_STEPS:-1000}"
+LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-1e-5}}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-${EM_TEMPERATURE:-1.0}}"
-M_STEP_UPDATES="${M_STEP_UPDATES:-3 1}"
+EM_BATCHES_PER_UPDATE="${EM_BATCHES_PER_UPDATE:-32}"
+EM_ALPHA_UPDATE="${EM_ALPHA_UPDATE:-block_closed_form}"
+EM_EXACT_E_STEP="${EM_EXACT_E_STEP:-true}"
 MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-em_only}"
 MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-lora}"
 ORIGINAL_DOWNSAMPLE_RATIO="${ORIGINAL_DOWNSAMPLE_RATIO:-${DOWNSAMPLE_RATIO:-0.25}}"
 AUGMENTED_DOWNSAMPLE_RATIO="${AUGMENTED_DOWNSAMPLE_RATIO:-${DOWNSAMPLE_RATIO:-1.0}}"
 DOWNSAMPLE_GROUP_KEY="${DOWNSAMPLE_GROUP_KEY:-source_index}"
-METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-ranking_validation/mixture/cluster_acc}"
-
+METRIC_FOR_BEST_MODEL="${METRIC_FOR_BEST_MODEL:-mixture_posterior/pairwise_acc}"
+BETAS="${BETAS:-0.2 0.02 0.1 0.05}"
 # The approximation path calls autograd.grad for input-embedding gradients.
 # This is not compatible with checkpoint recomputation while LoRA adapters are
 # switched inside the mixture loss.
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-false}"
-LINEAR_APPROX_REF_MODE="${LINEAR_APPROX_REF_MODE:-exact_score}"
+LINEAR_APPROX_REF_MODE="${LINEAR_APPROX_REF_MODE:-input_gradient}"
+LINEAR_APPROX_LENGTH_MATCHED="${LINEAR_APPROX_LENGTH_MATCHED:-true}"
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export WANDB_ENTITY="${WANDB_ENTITY:-VirtuosoResearch}"
 export WANDB_PROJECT="${WANDB_PROJECT:-multimodal-preference-optimization}"
 export WANDB_MODE="${WANDB_MODE:-online}"
@@ -79,9 +86,9 @@ run_one() {
   local seed="$5"
   local learning_rate="$6"
   local temperature="$7"
-  local m_step_updates="$8"
-  local ranking_size="$9"
-  local generated_ranking_size="${10}"
+  local ranking_size="$8"
+  local generated_ranking_size="$9"
+  local listwise_beta="${10}"
 
   local dataset_tag
   local ratio_tag
@@ -105,10 +112,15 @@ run_one() {
     generated_echo="; m_prime=${generated_ranking_size}"
   fi
 
-  run_name="${BASE_WANDB_NAME}-${dataset_mode}-approx-a${anchor}-m${ranking_size}${generated_tag}-ms${m_step_updates}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
-  output_dir="${BASE_OUTPUT_ROOT}/${dataset_mode}/qwen3-0.6b-${dataset_tag}/approx-a${anchor}-m${ranking_size}${generated_tag}-ms${m_step_updates}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
+  local lm_tag=""
+  if [[ "${LINEAR_APPROX_LENGTH_MATCHED}" == "true" ]]; then
+    lm_tag="-lm"
+  fi
 
-  echo "Launching ${dataset_mode} approximate mixture PL (${MIXTURE_REWARD_BACKEND} backend): dataset=${dataset_dir}; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; a=${anchor}; m=${ranking_size}${generated_echo}; m_step_updates=${m_step_updates}; seed=${seed}; downsample=${downsample_ratio}; ref_mode=${LINEAR_APPROX_REF_MODE}; gradient_checkpointing=${GRADIENT_CHECKPOINTING}"
+  run_name="${BASE_WANDB_NAME}-${dataset_mode}-approx${lm_tag}-a${anchor}-m${ranking_size}${generated_tag}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}-$(date +%Y%m%d-%H%M%S)"
+  output_dir="${BASE_OUTPUT_ROOT}/${dataset_mode}/qwen3-0.6b-${dataset_tag}/approx${lm_tag}-a${anchor}-m${ranking_size}${generated_tag}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}-$(date +%Y%m%d-%H%M%S)"
+
+  echo "Launching ${dataset_mode} approximate mixture PL (${MIXTURE_REWARD_BACKEND} backend): dataset=${dataset_dir}; dims=${DIMENSIONS}; clusters=${NUM_CLUSTERS}; a=${anchor}; m=${ranking_size}${generated_echo}; em_batches_per_update=${EM_BATCHES_PER_UPDATE}; em_alpha_update=${EM_ALPHA_UPDATE}; seed=${seed}; downsample=${downsample_ratio}; ref_mode=${LINEAR_APPROX_REF_MODE}; gradient_checkpointing=${GRADIENT_CHECKPOINTING}"
 
   ACCELERATE_LOG_LEVEL=info accelerate launch \
     --config_file recipes/accelerate_configs/single.yaml \
@@ -122,9 +134,12 @@ run_one() {
     --preference_dimensions "${dimension_args[@]}" \
     --listwise true \
     --listwise_num_responses "${ranking_size}" \
+    --beta "${listwise_beta}" \
+    --listwise_beta "${listwise_beta}" \
     "${generated_args[@]}" \
+     --listwise_augmented_subset_strategy "${LISTWISE_AUGMENTED_SUBSET_STRATEGY}" \
     --listwise_min_responses 2 \
-    --run_ranking_eval true \
+    --run_ranking_eval false \
     --ranking_eval_during_training true \
     --dataset_downsample_ratio "${downsample_ratio}" \
     --dataset_downsample_seed "${seed}" \
@@ -137,7 +152,9 @@ run_one() {
     --mixture_reward_backend "${MIXTURE_REWARD_BACKEND}" \
     --mixture_nll_weight "${MIXTURE_NLL_WEIGHT:-0.1}" \
     --em_temperature "${temperature}" \
-    --m_step_updates "${m_step_updates}" \
+    --em_batches_per_update "${EM_BATCHES_PER_UPDATE}" \
+    --em_alpha_update "${EM_ALPHA_UPDATE}" \
+    --em_exact_e_step "${EM_EXACT_E_STEP}" \
     --use_contextual_router "${USE_CONTEXTUAL_ROUTER:-false}" \
     --use_closed_form_router_prior_update "${USE_CLOSED_FORM_ROUTER_PRIOR_UPDATE:-false}" \
     --router_hidden_size "${ROUTER_HIDDEN_SIZE:-256}" \
@@ -146,14 +163,17 @@ run_one() {
     --linear_approx_num_anchors "${anchor}" \
     --linear_approx_exact_eval true \
     --linear_approx_ref_mode "${LINEAR_APPROX_REF_MODE}" \
+    --linear_approx_length_matched "${LINEAR_APPROX_LENGTH_MATCHED}" \
     --learning_rate "${learning_rate}" \
     --max_steps "${MAX_STEPS}" \
+    --max_length "${MAX_LENGTH}" \
+    --max_prompt_length "${MAX_PROMPT_LENGTH}" \
     --per_device_train_batch_size "${PER_DEVICE_TRAIN_BATCH_SIZE:-2}" \
     --per_device_eval_batch_size "${PER_DEVICE_EVAL_BATCH_SIZE:-2}" \
-    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-4}" \
+    --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS:-1}" \
     --gradient_checkpointing "${GRADIENT_CHECKPOINTING}" \
-    --eval_steps "${EVAL_STEPS:-500}" \
-    --save_steps "${SAVE_STEPS:-500}" \
+    --eval_steps "${EVAL_STEPS:-250}" \
+    --save_steps "${SAVE_STEPS:-250}" \
     --metric_for_best_model "${METRIC_FOR_BEST_MODEL}" \
     --output_dir "${output_dir}" \
     --run_name "${run_name}" \
@@ -188,20 +208,26 @@ for dataset_mode in ${DATASET_MODES}; do
   for seed in ${SEEDS}; do
   for learning_rate in ${LEARNING_RATES}; do
   for temperature in ${EM_TEMPERATURES}; do
-  for m_step_updates in ${M_STEP_UPDATES}; do
   for ranking_size in ${RANKING_SIZES}; do
   for anchor in ${ANCHORS}; do
+  for listwise_beta in ${BETAS}; do
     if [[ "${dataset_mode}" == "augmented" ]]; then
       for generated_ranking_size in ${generated_sizes}; do
-        run_one "${dataset_mode}" "${dataset_dir}" "${downsample_ratio}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${m_step_updates}" "${ranking_size}" "${generated_ranking_size}"
+        # skip anchor==2 and generated_ranking_size==4
+        # if [[ "${anchor}" -eq 2 && "${ranking_size}" -eq 4 
+        #   && "${generated_ranking_size}" -eq 4  ]]; then
+        #   echo "Skipping anchor=${anchor} with ranking_size=${ranking_size} and generated_ranking_size=4." >&2
+        #   continue
+        # fi
+        run_one "${dataset_mode}" "${dataset_dir}" "${downsample_ratio}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${ranking_size}" "${generated_ranking_size}" "${listwise_beta}"
       done
     else
-      run_one "${dataset_mode}" "${dataset_dir}" "${downsample_ratio}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${m_step_updates}" "${ranking_size}" ""
+      run_one "${dataset_mode}" "${dataset_dir}" "${downsample_ratio}" "${anchor}" "${seed}" "${learning_rate}" "${temperature}" "${ranking_size}" "" "${listwise_beta}"
     fi
   done
   done
   done
   done
-  done
+done
 done
 done

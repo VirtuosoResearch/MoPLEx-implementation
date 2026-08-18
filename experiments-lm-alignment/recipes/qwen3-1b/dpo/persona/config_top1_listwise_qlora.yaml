@@ -60,6 +60,6 @@ report_to:
 run_name: qwen3-0.6b-persona-single-top1-listdpo
 save_strategy: steps
 save_steps: 50
-save_total_limit: 3
+save_total_limit: 1
 seed: 42
 warmup_ratio: 0.1

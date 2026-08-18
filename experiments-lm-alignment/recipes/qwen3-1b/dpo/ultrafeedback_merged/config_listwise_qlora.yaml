@@ -8,8 +8,8 @@ attn_implementation: sdpa
 
 # LoRA arguments
 use_peft: true
-load_in_4bit: true
-lora_r: 64
+load_in_4bit: false
+lora_r: 32
 lora_alpha: 64
 lora_dropout: 0.05
 lora_target_modules:
@@ -39,9 +39,9 @@ dataset_num_proc: 12
 
 # DPOTrainer arguments
 bf16: true
-beta: 0.01
+beta: 0.2
 listwise: true
-listwise_beta: 0.01
+listwise_beta: 0.2
 do_eval: true
 eval_strategy: steps
 eval_steps: 50
@@ -70,6 +70,6 @@ report_to:
 run_name: qwen3-0.6b-listwise-dpo-qlora-ultrafeedback-merged
 save_strategy: steps
 save_steps: 50
-save_total_limit: 3
+save_total_limit: 1
 seed: 42
 warmup_ratio: 0.1

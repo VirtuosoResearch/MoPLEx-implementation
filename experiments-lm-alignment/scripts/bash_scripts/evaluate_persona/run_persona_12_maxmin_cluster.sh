@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASH_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SCRIPTS_DIR="$(cd "${BASH_SCRIPTS_DIR}/.." && pwd)"
 REPO_ROOT="$(cd "${SCRIPTS_DIR}/.." && pwd)"
+WORKSPACE_ROOT="$(cd "${REPO_ROOT}/.." && pwd)"
+MICRO_ROOT="${MICRO_ROOT:-${WORKSPACE_ROOT}/MiCRo}"
 
 lr="${LR:-2e-3}"
 gradient_accumulation_steps="${GRADIENT_ACCUMULATION_STEPS:-1}"
@@ -27,7 +29,7 @@ fi
 
 mkdir -p "${log_dir}"
 cd "${REPO_ROOT}"
-export PYTHONPATH="${REPO_ROOT}/src:${PYTHONPATH:-}"
+export PYTHONPATH="${REPO_ROOT}/src:${MICRO_ROOT}:${PYTHONPATH:-}"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 
 for seed in ${seeds}; do

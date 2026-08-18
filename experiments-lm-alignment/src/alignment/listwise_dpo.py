@@ -23,6 +23,7 @@ import os
 import re
 import time
 from typing import Any, Dict, Literal, Optional, Tuple, Union
+import warnings
 
 from accelerate import PartialState
 from datasets import Dataset, IterableDataset
@@ -91,6 +92,7 @@ class ListwiseDPODataCollator:
         batch_candidate_mask = []
         batch_preference_dimensions = []
         batch_ranked_prefix_lengths = []
+        batch_em_row_ids = []
 
         max_candidates = max(len(feature["responses"]) for feature in features)
 
@@ -98,6 +100,7 @@ class ListwiseDPODataCollator:
             prompt = feature["prompt"]
             responses = feature["responses"]
             batch_preference_dimensions.append(feature.get("preference_dimension", "unknown"))
+            batch_em_row_ids.append(int(feature.get("em_row_id", -1)))
             ranked_prefix_length = feature.get("ranked_prefix_length", len(responses))
             ranked_prefix_length = max(0, min(int(ranked_prefix_length), len(responses)))
             batch_ranked_prefix_lengths.append(ranked_prefix_length)
@@ -145,6 +148,7 @@ class ListwiseDPODataCollator:
             "candidate_mask": torch.tensor(batch_candidate_mask, dtype=torch.bool),
             "preference_dimension": batch_preference_dimensions,
             "ranked_prefix_length": torch.tensor(batch_ranked_prefix_lengths, dtype=torch.long),
+            "em_row_id": torch.tensor(batch_em_row_ids, dtype=torch.long),
         }
 
 
@@ -186,19 +190,25 @@ class ListwiseDPOTrainer(DPOTrainer):
 
     def log(self, logs: Dict[str, float], start_time: Optional[float] = None) -> None:
         train_eval = "eval" if any(key.startswith("eval_") for key in logs) else "train"
-        stored = getattr(self, "_stored_metrics", {}).get(train_eval, {})
+        if not hasattr(self, "_stored_metrics"):
+            self._stored_metrics = {"train": {}, "eval": {}}
+        self._stored_metrics.setdefault("train", {})
+        self._stored_metrics.setdefault("eval", {})
+        stored = self._stored_metrics.get(train_eval, {})
         prefix = "eval_" if train_eval == "eval" else ""
         for key, values in stored.items():
             if not values:
                 continue
             metric_key = key if key.startswith(prefix) else f"{prefix}{key}"
             logs[metric_key] = torch.tensor(values, dtype=torch.float32).mean().item()
-        if hasattr(self, "_stored_metrics"):
-            self._stored_metrics[train_eval] = {}
+        self._stored_metrics[train_eval] = {}
         try:
-            return super().log(logs, start_time=start_time)
+            result = super().log(logs, start_time=start_time)
         except TypeError:
-            return super().log(logs)
+            result = super().log(logs)
+        self._stored_metrics.setdefault("train", {})
+        self._stored_metrics.setdefault("eval", {})
+        return result
 
     def _set_signature_columns_if_needed(self):
         if self._signature_columns is None:
@@ -208,6 +218,7 @@ class ListwiseDPOTrainer(DPOTrainer):
                 "labels",
                 "candidate_mask",
                 "ranked_prefix_length",
+                "em_row_id",
             ]
 
     def _prepare_dataset(
@@ -244,23 +255,38 @@ class ListwiseDPOTrainer(DPOTrainer):
         return dataset
 
     @staticmethod
-    def _sequence_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    def _sequence_token_logps(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        """Per-token label log-probs, [N, S-1]; zero at prompt/padding positions."""
         shift_logits = logits[:, :-1, :]
         shift_labels = labels[:, 1:]
         valid = shift_labels != -100
 
         safe_labels = shift_labels.masked_fill(~valid, 0)
-        token_logps = F.log_softmax(shift_logits, dim=-1).gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
-        token_logps = token_logps * valid
-        return token_logps.sum(dim=-1)
+        # gather + logsumexp keeps peak memory at the logits tensor itself;
+        # log_softmax would materialize a second [B, S, vocab] tensor.
+        label_logits = shift_logits.gather(dim=-1, index=safe_labels.unsqueeze(-1)).squeeze(-1)
+        token_logps = label_logits - torch.logsumexp(shift_logits, dim=-1)
+        return token_logps * valid
 
-    def _forward_ref(self, input_ids: torch.Tensor, attention_mask: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    @classmethod
+    def _sequence_logps(cls, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+        return cls._sequence_token_logps(logits, labels).sum(dim=-1)
+
+    def _forward_ref(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        labels: torch.Tensor,
+        return_token_logps: bool = False,
+    ) -> torch.Tensor:
         with torch.no_grad():
             if self.ref_model is None:
                 with self.model.disable_adapter():
                     ref_logits = self.model(input_ids=input_ids, attention_mask=attention_mask).logits
             else:
                 ref_logits = self.ref_model(input_ids=input_ids, attention_mask=attention_mask).logits
+        if return_token_logps:
+            return self._sequence_token_logps(ref_logits, labels)
         return self._sequence_logps(ref_logits, labels)
 
     def _forward_ref_from_embeds(
@@ -268,6 +294,7 @@ class ListwiseDPOTrainer(DPOTrainer):
         inputs_embeds: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: torch.Tensor,
+        return_token_logps: bool = False,
     ) -> torch.Tensor:
         ref_model = self.model if self.ref_model is None else self.ref_model
         ref_params = tuple(ref_model.parameters())
@@ -283,6 +310,8 @@ class ListwiseDPOTrainer(DPOTrainer):
         finally:
             for param, requires_grad in zip(ref_params, original_requires_grad):
                 param.requires_grad_(requires_grad)
+        if return_token_logps:
+            return self._sequence_token_logps(ref_logits, labels)
         return self._sequence_logps(ref_logits, labels)
 
     def _use_linear_reward_approx(self, train_eval: Literal["train", "eval"]) -> bool:
@@ -356,6 +385,110 @@ class ListwiseDPOTrainer(DPOTrainer):
             return estimates.masked_fill(~candidate_mask, 0.0)
         return estimates.masked_fill(~candidate_mask.unsqueeze(1), 0.0)
 
+    @staticmethod
+    def _response_spans(labels: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Response span per sequence in the shifted token-logp frame.
+
+        Returns (starts, lengths), both [N]: `starts` is the first index of
+        `labels[:, 1:] != -100` (0 when the sequence has no response tokens)
+        and `lengths` the count. Response tokens are contiguous, so the first
+        L tokens occupy token-logp indices [start, start + L).
+        """
+        valid = labels[:, 1:] != -100
+        lengths = valid.long().sum(dim=-1)
+        starts = torch.where(
+            lengths > 0,
+            valid.long().argmax(dim=-1),
+            torch.zeros_like(lengths),
+        )
+        return starts, lengths
+
+    @staticmethod
+    def _linear_approx_length_matched(
+        candidate_embeddings: torch.Tensor,
+        candidate_mask: torch.Tensor,
+        anchor_positions: list[torch.Tensor],
+        anchor_token_scores: torch.Tensor,
+        anchor_grads: torch.Tensor,
+        response_starts: torch.Tensor,
+        response_lengths: torch.Tensor,
+        ref_token_logps: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Length-matched first-order estimates: each (anchor a, candidate j) pair is
+        scored on the common prefix L = min(len_a, len_j) response tokens — anchor
+        partial value plus an input-gradient dot restricted to the positions that
+        influence that prefix — and, when `ref_token_logps` is given, paired with
+        the candidate's reference partial score at the same L (score-difference
+        output; caller applies beta). Without `ref_token_logps` the token scores
+        are assumed to already be utility contributions and the matched-prefix sum
+        is returned as the full-utility estimate. Anchor entries are exact and
+        full-length; non-anchor estimates are stop-gradient constants.
+
+        Shapes:
+            candidate_embeddings: [B, M, S, H]
+            anchor_token_scores: [N, S-1] (graph-carrying at anchors)
+            anchor_grads: [N, S, H]
+            response_starts / response_lengths: [B, M] (shifted frame)
+            ref_token_logps: optional [B, M, S-1]
+        """
+        batch_size, num_candidates = candidate_mask.shape
+        seq_len = candidate_embeddings.shape[2]
+        token_len = anchor_token_scores.shape[1]
+        estimates = anchor_token_scores.new_zeros((batch_size, num_candidates))
+        positions = torch.arange(seq_len, device=candidate_embeddings.device)
+
+        offset = 0
+        for row_idx, row_anchor_positions in enumerate(anchor_positions):
+            num_row_anchors = row_anchor_positions.numel()
+            if num_row_anchors == 0:
+                continue
+
+            row_token_scores = anchor_token_scores[offset : offset + num_row_anchors]
+            row_grads = anchor_grads[offset : offset + num_row_anchors]
+            row_embeddings = candidate_embeddings[row_idx].to(dtype=row_grads.dtype)
+            anchor_embeddings = row_embeddings.index_select(0, row_anchor_positions)
+            deltas = row_embeddings.unsqueeze(0) - anchor_embeddings.unsqueeze(1)
+
+            row_starts = response_starts[row_idx]
+            row_lengths = response_lengths[row_idx]
+            anchor_starts = row_starts.index_select(0, row_anchor_positions)
+            anchor_lengths = row_lengths.index_select(0, row_anchor_positions)
+            matched = torch.minimum(anchor_lengths.unsqueeze(1), row_lengths.unsqueeze(0)).clamp(min=1)
+
+            # The L-th response token sits at input position start + L, so the
+            # prefix depends on embeddings at positions < start + L.
+            dot_mask = positions.view(1, 1, -1) < (anchor_starts.unsqueeze(1) + matched).unsqueeze(-1)
+            dot_terms = (
+                (row_grads.unsqueeze(1) * deltas).sum(dim=-1) * dot_mask.to(dtype=row_grads.dtype)
+            ).sum(dim=-1)
+
+            anchor_cumsum = torch.cumsum(row_token_scores, dim=-1)
+            prefix_index = (anchor_starts.unsqueeze(1) + matched - 1).clamp(min=0, max=token_len - 1)
+            anchor_prefix = anchor_cumsum.gather(1, prefix_index)
+
+            row_estimates = anchor_prefix.detach() + dot_terms
+            anchor_full = row_token_scores.sum(dim=-1)
+
+            if ref_token_logps is not None:
+                ref_cumsum = torch.cumsum(ref_token_logps[row_idx], dim=-1)
+                ref_prefix_index = (row_starts.unsqueeze(1) + matched.transpose(0, 1) - 1).clamp(
+                    min=0, max=token_len - 1
+                )
+                ref_prefix = ref_cumsum.gather(1, ref_prefix_index).transpose(0, 1)
+                row_estimates = row_estimates - ref_prefix.detach()
+
+                ref_full = ref_cumsum[:, -1]
+                anchor_full = anchor_full - ref_full.index_select(0, row_anchor_positions).detach()
+
+            row_estimates = row_estimates.mean(dim=0)
+            row_estimates[row_anchor_positions] = anchor_full
+            estimates[row_idx] = row_estimates.to(dtype=estimates.dtype)
+
+            offset += num_row_anchors
+
+        return estimates.masked_fill(~candidate_mask, 0.0)
+
     def _approximate_listwise_utilities(
         self,
         model,
@@ -388,34 +521,80 @@ class ListwiseDPOTrainer(DPOTrainer):
         anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
         anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
         ref_mode = getattr(self.args, "linear_approx_ref_mode", "input_gradient")
+        length_matched = bool(getattr(self.args, "linear_approx_length_matched", False))
         beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
         exact_ref_logps = None
+        exact_ref_token_logps = None
         if ref_mode == "exact_score":
-            exact_ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
-                batch_size,
-                num_candidates,
-            )
+            if length_matched:
+                exact_ref_token_logps = self._forward_ref(
+                    flat_input_ids, flat_attention_mask, flat_labels, return_token_logps=True
+                ).view(batch_size, num_candidates, -1)
+            else:
+                exact_ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
+                    batch_size,
+                    num_candidates,
+                )
 
+        # As in the mixture approx path: without an ambient grad mode nothing
+        # backpropagates through the anchor scores, so the anchor graph can be
+        # freed as soon as the input-gradients are taken.
+        needs_graph = torch.is_grad_enabled()
         with torch.enable_grad():
             policy_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
-            policy_logps = self._sequence_logps(policy_logits, anchor_labels)
+            policy_token_logps = self._sequence_token_logps(policy_logits, anchor_labels)
+            del policy_logits
+            anchor_scores = None
+            anchor_token_scores = None
             if ref_mode == "exact_score":
                 anchor_grads = torch.autograd.grad(
-                    policy_logps.sum(),
+                    policy_token_logps.sum(),
                     anchor_embeds,
-                    retain_graph=True,
+                    retain_graph=needs_graph,
                     create_graph=False,
                 )[0].detach()
-                anchor_scores = policy_logps
+                if not needs_graph:
+                    policy_token_logps = policy_token_logps.detach()
+                anchor_token_scores = policy_token_logps
+                anchor_scores = policy_token_logps.sum(dim=-1)
+            elif length_matched:
+                ref_token_logps = self._forward_ref_from_embeds(
+                    anchor_embeds, anchor_attention_mask, anchor_labels, return_token_logps=True
+                )
+                anchor_token_scores = beta * (policy_token_logps - ref_token_logps)
+                anchor_grads = torch.autograd.grad(
+                    anchor_token_scores.sum(),
+                    anchor_embeds,
+                    retain_graph=needs_graph,
+                    create_graph=False,
+                )[0].detach()
+                if not needs_graph:
+                    anchor_token_scores = anchor_token_scores.detach()
             else:
                 ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
-                anchor_scores = beta * (policy_logps - ref_logps)
+                anchor_scores = beta * (policy_token_logps.sum(dim=-1) - ref_logps)
                 anchor_grads = torch.autograd.grad(
                     anchor_scores.sum(),
                     anchor_embeds,
-                    retain_graph=True,
+                    retain_graph=needs_graph,
                     create_graph=False,
                 )[0].detach()
+                if not needs_graph:
+                    anchor_scores = anchor_scores.detach()
+
+        if length_matched:
+            response_starts, response_lengths = self._response_spans(flat_labels)
+            diffs = self._linear_approx_length_matched(
+                candidate_embeddings,
+                candidate_mask,
+                anchor_positions,
+                anchor_token_scores,
+                anchor_grads,
+                response_starts.view(batch_size, num_candidates),
+                response_lengths.view(batch_size, num_candidates),
+                ref_token_logps=exact_ref_token_logps,
+            )
+            return beta * diffs if ref_mode == "exact_score" else diffs
 
         estimates = self._linear_approx_from_anchor_tensors(
             candidate_embeddings,
@@ -538,7 +717,15 @@ class ListwiseDPOTrainer(DPOTrainer):
         flat_attention_mask = attention_mask.view(batch_size * num_candidates, seq_len)
         flat_labels = labels.view(batch_size * num_candidates, seq_len)
 
-        if self._use_linear_reward_approx(train_eval):
+        use_approx_utilities = self._use_linear_reward_approx(train_eval)
+        if use_approx_utilities and train_eval == "train" and not torch.is_grad_enabled():
+            # The approximation only pays off when gradients must flow through the
+            # utilities: under no_grad it builds anchor autograd graphs and runs
+            # extra backwards, costing more peak memory than exact scoring. Metric
+            # logging therefore uses exact utilities (matching exact eval).
+            use_approx_utilities = False
+
+        if use_approx_utilities:
             utilities = self._approximate_listwise_utilities(
                 model,
                 input_ids,
@@ -549,6 +736,7 @@ class ListwiseDPOTrainer(DPOTrainer):
         else:
             policy_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
             policy_logps = self._sequence_logps(policy_logits, flat_labels).view(batch_size, num_candidates)
+            del policy_logits
             ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
 
             beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
@@ -716,8 +904,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
                 router_hidden_size=mixture_config.router_hidden_size,
             )
             if (
-                not mixture_config.use_contextual_router
-                and getattr(mixture_config, "use_closed_form_router_prior_update", False)
+                self._use_closed_form_alpha_update()
                 and hasattr(self.mixture_head.router, "global_logits")
             ):
                 self.mixture_head.router.global_logits.requires_grad_(False)
@@ -794,8 +981,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
             router_hidden_size=self.mixture_config.router_hidden_size,
         )
         if (
-            not self.mixture_config.use_contextual_router
-            and getattr(self.mixture_config, "use_closed_form_router_prior_update", False)
+            self._use_closed_form_alpha_update()
             and hasattr(self.mixture_router, "global_logits")
         ):
             self.mixture_router.global_logits.requires_grad_(False)
@@ -805,20 +991,31 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         self._set_active_adapter(self.policy_adapter_name)
         self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
 
-    def _update_global_router_prior_from_gamma(self, gamma: torch.Tensor) -> None:
-        """Update the non-contextual router logits to the closed-form prior implied by gamma."""
+    def _use_closed_form_alpha_update(self) -> bool:
         if self.mixture_config.use_contextual_router:
-            return
-        if not getattr(self.mixture_config, "use_closed_form_router_prior_update", False):
-            return
+            return False
+        if getattr(self.mixture_config, "mixture_training_mode", None) != "em_only":
+            return False
+        alpha_update = getattr(self.mixture_config, "em_alpha_update", None)
+        if alpha_update is None:
+            return bool(getattr(self.mixture_config, "use_closed_form_router_prior_update", False))
+        return alpha_update == "block_closed_form"
+
+    def _set_global_router_prior(self, prior: torch.Tensor) -> None:
         router = self.mixture_head.router if self.mixture_reward_backend == "head" else self.mixture_router
         if router is None or not hasattr(router, "global_logits"):
             return
 
-        prior = gamma.mean(dim=0)
+        prior = prior.to(device=router.global_logits.device, dtype=router.global_logits.dtype)
         prior = prior / prior.sum().clamp_min(1e-12)
         with torch.no_grad():
             router.global_logits.copy_(torch.log(prior.clamp_min(1e-12)))
+
+    def _update_global_router_prior_from_gamma(self, gamma: torch.Tensor) -> None:
+        """Update the non-contextual router logits to the closed-form prior implied by gamma."""
+        if not self._use_closed_form_alpha_update():
+            return
+        self._set_global_router_prior(gamma.mean(dim=0))
 
     @staticmethod
     def _preference_dimension_sort_key(dimension: str) -> tuple[int, int, str]:
@@ -1037,6 +1234,12 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         if self.policy_adapter_name is None or self.mixture_router is None:
             raise RuntimeError("LoRA mixture backend was not initialized.")
 
+        # Under an ambient no_grad (block-EM E-step, eval) nothing backpropagates
+        # through the anchor scores, so each cluster's anchor graph can be freed as
+        # soon as its input-gradients are taken instead of staying alive until the
+        # next cluster's forward rebinds it.
+        needs_graph = torch.is_grad_enabled()
+
         router_param = next(self.mixture_router.parameters())
         context = torch.zeros(
             batch_size,
@@ -1076,52 +1279,102 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
         anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
         ref_mode = getattr(self.mixture_config, "linear_approx_ref_mode", "input_gradient")
+        length_matched = bool(getattr(self.mixture_config, "linear_approx_length_matched", False))
         beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
 
+        response_starts = response_lengths = None
+        if length_matched:
+            span_starts, span_lengths = self._response_spans(flat_labels)
+            response_starts = span_starts.view(batch_size, num_candidates)
+            response_lengths = span_lengths.view(batch_size, num_candidates)
+
+        ref_logps = None
+        ref_grads = None
+        ref_token_logps_full = None
+        ref_token_logps_anchor = None
         if ref_mode == "exact_score":
-            ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
-                batch_size,
-                num_candidates,
-            )
-            ref_grads = None
+            if length_matched:
+                ref_token_logps_full = self._forward_ref(
+                    flat_input_ids, flat_attention_mask, flat_labels, return_token_logps=True
+                ).view(batch_size, num_candidates, -1)
+            else:
+                ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
+                    batch_size,
+                    num_candidates,
+                )
         else:
             with torch.enable_grad():
-                ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
-                ref_grads = torch.autograd.grad(
-                    ref_logps.sum(),
-                    anchor_embeds,
-                    retain_graph=False,
-                    create_graph=False,
-                )[0].detach()
+                if length_matched:
+                    ref_token_logps_anchor = self._forward_ref_from_embeds(
+                        anchor_embeds, anchor_attention_mask, anchor_labels, return_token_logps=True
+                    )
+                    ref_grads = torch.autograd.grad(
+                        ref_token_logps_anchor.sum(),
+                        anchor_embeds,
+                        retain_graph=False,
+                        create_graph=False,
+                    )[0].detach()
+                    ref_token_logps_anchor = ref_token_logps_anchor.detach()
+                else:
+                    ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
+                    ref_grads = torch.autograd.grad(
+                        ref_logps.sum(),
+                        anchor_embeds,
+                        retain_graph=False,
+                        create_graph=False,
+                    )[0].detach()
 
         reward_tensors = []
         for adapter_name in self.mixture_adapter_names:
             self._set_active_adapter(adapter_name)
             with torch.enable_grad():
                 adapter_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
-                adapter_logps = self._sequence_logps(adapter_logits, anchor_labels)
+                adapter_token_logps = self._sequence_token_logps(adapter_logits, anchor_labels)
+                del adapter_logits
                 adapter_grads = torch.autograd.grad(
-                    adapter_logps.sum(),
+                    adapter_token_logps.sum(),
                     anchor_embeds,
-                    retain_graph=True,
+                    retain_graph=needs_graph,
                     create_graph=False,
                 )[0].detach()
+                if not needs_graph:
+                    adapter_token_logps = adapter_token_logps.detach()
+                anchor_scores = None
+                anchor_token_scores = None
                 if ref_mode == "exact_score":
-                    anchor_scores = adapter_logps
+                    anchor_token_scores = adapter_token_logps
+                    anchor_scores = adapter_token_logps.sum(dim=-1)
                     anchor_grads = adapter_grads
+                elif length_matched:
+                    anchor_token_scores = beta * (adapter_token_logps - ref_token_logps_anchor)
+                    anchor_grads = beta * (adapter_grads - ref_grads)
                 else:
-                    anchor_scores = beta * (adapter_logps - ref_logps.detach())
+                    anchor_scores = beta * (adapter_token_logps.sum(dim=-1) - ref_logps.detach())
                     anchor_grads = beta * (adapter_grads - ref_grads)
 
-            estimates = self._linear_approx_from_anchor_tensors(
-                candidate_embeddings,
-                candidate_mask,
-                anchor_positions,
-                anchor_scores,
-                anchor_grads,
-            )
-            if ref_mode == "exact_score":
-                estimates = beta * (estimates - ref_logps.detach())
+            if length_matched:
+                estimates = self._linear_approx_length_matched(
+                    candidate_embeddings,
+                    candidate_mask,
+                    anchor_positions,
+                    anchor_token_scores,
+                    anchor_grads,
+                    response_starts,
+                    response_lengths,
+                    ref_token_logps=ref_token_logps_full,
+                )
+                if ref_mode == "exact_score":
+                    estimates = beta * estimates
+            else:
+                estimates = self._linear_approx_from_anchor_tensors(
+                    candidate_embeddings,
+                    candidate_mask,
+                    anchor_positions,
+                    anchor_scores,
+                    anchor_grads,
+                )
+                if ref_mode == "exact_score":
+                    estimates = beta * (estimates - ref_logps.detach())
             reward_tensors.append(estimates)
 
         self._set_active_adapter(self.policy_adapter_name)
@@ -1492,10 +1745,7 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
 
         component_loss_value = 0.0
         total_loss_value = 0.0
-        closed_form_router = (
-            not self.mixture_config.use_contextual_router
-            and getattr(self.mixture_config, "use_closed_form_router_prior_update", False)
-        )
+        closed_form_router = self._use_closed_form_alpha_update()
 
         router_context = torch.no_grad() if closed_form_router else nullcontext()
         with router_context:
@@ -1513,32 +1763,189 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         if not closed_form_router:
             self.accelerator.backward(router_loss)
 
-        ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
         beta = self.listwise_beta_override if self.listwise_beta_override is not None else self.beta
+        use_linear_m_step = self._use_linear_reward_approx("train") and not self.mixture_config.use_contextual_router
 
-        for cluster_idx, adapter_name in enumerate(self.mixture_adapter_names):
-            self._set_active_adapter(adapter_name)
-            adapter_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
-            adapter_logps = self._sequence_logps(adapter_logits, flat_labels).view(batch_size, num_candidates)
-            rewards = beta * (adapter_logps - ref_logps)
-            comp_logp = pl_log_prob(
-                rewards,
-                rankings,
-                candidate_mask=candidate_mask,
-                ranked_prefix_lengths=ranked_prefix_lengths,
+        if use_linear_m_step:
+            embedding_layer = model.get_input_embeddings()
+            candidate_embeddings = embedding_layer(flat_input_ids).detach().view(
+                batch_size,
+                num_candidates,
+                seq_len,
+                -1,
             )
-            weighted_comp_nll = -(gamma[:, cluster_idx].to(dtype=comp_logp.dtype) * comp_logp)
-            if torch.any(valid_rows):
-                component_loss = weighted_comp_nll[valid_rows].mean()
-            else:
-                component_loss = weighted_comp_nll.sum() * 0.0
+            anchor_positions = self._select_linear_approx_anchors(candidate_mask)
+            anchor_flat_indices = [
+                row_idx * num_candidates + position
+                for row_idx, positions in enumerate(anchor_positions)
+                for position in positions.tolist()
+            ]
 
-            self.accelerator.backward(component_loss)
-            loss_value = float(component_loss.detach().item())
-            component_loss_value += loss_value
-            total_loss_value += loss_value
+            if anchor_flat_indices:
+                anchor_flat_indices_tensor = torch.tensor(
+                    anchor_flat_indices,
+                    device=flat_input_ids.device,
+                    dtype=torch.long,
+                )
+                anchor_embeds = candidate_embeddings.view(batch_size * num_candidates, seq_len, -1).index_select(
+                    0,
+                    anchor_flat_indices_tensor,
+                )
+                anchor_embeds = anchor_embeds.detach().requires_grad_(True)
+                anchor_attention_mask = flat_attention_mask.index_select(0, anchor_flat_indices_tensor)
+                anchor_labels = flat_labels.index_select(0, anchor_flat_indices_tensor)
 
-            del adapter_logits, adapter_logps, rewards, comp_logp, weighted_comp_nll, component_loss
+                ref_mode = getattr(self.mixture_config, "linear_approx_ref_mode", "input_gradient")
+                length_matched = bool(getattr(self.mixture_config, "linear_approx_length_matched", False))
+                response_starts = response_lengths = None
+                if length_matched:
+                    span_starts, span_lengths = self._response_spans(flat_labels)
+                    response_starts = span_starts.view(batch_size, num_candidates)
+                    response_lengths = span_lengths.view(batch_size, num_candidates)
+
+                ref_logps = None
+                ref_grads = None
+                ref_token_logps_full = None
+                ref_token_logps_anchor = None
+                if ref_mode == "exact_score":
+                    if length_matched:
+                        ref_token_logps_full = self._forward_ref(
+                            flat_input_ids, flat_attention_mask, flat_labels, return_token_logps=True
+                        ).view(batch_size, num_candidates, -1)
+                    else:
+                        ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(
+                            batch_size,
+                            num_candidates,
+                        )
+                else:
+                    with torch.enable_grad():
+                        if length_matched:
+                            ref_token_logps_anchor = self._forward_ref_from_embeds(
+                                anchor_embeds, anchor_attention_mask, anchor_labels, return_token_logps=True
+                            )
+                            ref_grads = torch.autograd.grad(
+                                ref_token_logps_anchor.sum(),
+                                anchor_embeds,
+                                retain_graph=False,
+                                create_graph=False,
+                            )[0].detach()
+                            ref_token_logps_anchor = ref_token_logps_anchor.detach()
+                        else:
+                            ref_logps = self._forward_ref_from_embeds(anchor_embeds, anchor_attention_mask, anchor_labels)
+                            ref_grads = torch.autograd.grad(
+                                ref_logps.sum(),
+                                anchor_embeds,
+                                retain_graph=False,
+                                create_graph=False,
+                            )[0].detach()
+
+                for cluster_idx, adapter_name in enumerate(self.mixture_adapter_names):
+                    self._set_active_adapter(adapter_name)
+                    with torch.enable_grad():
+                        adapter_logits = model(inputs_embeds=anchor_embeds, attention_mask=anchor_attention_mask).logits
+                        adapter_token_logps = self._sequence_token_logps(adapter_logits, anchor_labels)
+                        adapter_grads = torch.autograd.grad(
+                            adapter_token_logps.sum(),
+                            anchor_embeds,
+                            retain_graph=True,
+                            create_graph=False,
+                        )[0].detach()
+                        anchor_scores = None
+                        anchor_token_scores = None
+                        if ref_mode == "exact_score":
+                            anchor_token_scores = adapter_token_logps
+                            anchor_scores = adapter_token_logps.sum(dim=-1)
+                            anchor_grads = adapter_grads
+                        elif length_matched:
+                            anchor_token_scores = beta * (adapter_token_logps - ref_token_logps_anchor)
+                            anchor_grads = beta * (adapter_grads - ref_grads)
+                        else:
+                            anchor_scores = beta * (adapter_token_logps.sum(dim=-1) - ref_logps.detach())
+                            anchor_grads = beta * (adapter_grads - ref_grads)
+
+                    if length_matched:
+                        estimates = self._linear_approx_length_matched(
+                            candidate_embeddings,
+                            candidate_mask,
+                            anchor_positions,
+                            anchor_token_scores,
+                            anchor_grads,
+                            response_starts,
+                            response_lengths,
+                            ref_token_logps=ref_token_logps_full,
+                        )
+                        rewards = beta * estimates if ref_mode == "exact_score" else estimates
+                    else:
+                        estimates = self._linear_approx_from_anchor_tensors(
+                            candidate_embeddings,
+                            candidate_mask,
+                            anchor_positions,
+                            anchor_scores,
+                            anchor_grads,
+                        )
+                        rewards = beta * (estimates - ref_logps.detach()) if ref_mode == "exact_score" else estimates
+                    comp_logp = pl_log_prob(
+                        rewards,
+                        rankings,
+                        candidate_mask=candidate_mask,
+                        ranked_prefix_lengths=ranked_prefix_lengths,
+                    )
+                    weighted_comp_nll = -(gamma[:, cluster_idx].to(dtype=comp_logp.dtype) * comp_logp)
+                    if torch.any(valid_rows):
+                        component_loss = weighted_comp_nll[valid_rows].mean()
+                    else:
+                        component_loss = weighted_comp_nll.sum() * 0.0
+
+                    self.accelerator.backward(component_loss)
+                    if anchor_embeds.grad is not None:
+                        anchor_embeds.grad = None
+                    loss_value = float(component_loss.detach().item())
+                    component_loss_value += loss_value
+                    total_loss_value += loss_value
+
+                    del (
+                        adapter_logits,
+                        adapter_token_logps,
+                        adapter_grads,
+                        anchor_scores,
+                        anchor_token_scores,
+                        anchor_grads,
+                        estimates,
+                        rewards,
+                        comp_logp,
+                        weighted_comp_nll,
+                        component_loss,
+                    )
+
+                del anchor_embeds, anchor_attention_mask, anchor_labels
+                del ref_logps, ref_grads, ref_token_logps_full, ref_token_logps_anchor
+        else:
+            ref_logps = self._forward_ref(flat_input_ids, flat_attention_mask, flat_labels).view(batch_size, num_candidates)
+
+            for cluster_idx, adapter_name in enumerate(self.mixture_adapter_names):
+                self._set_active_adapter(adapter_name)
+                adapter_logits = model(input_ids=flat_input_ids, attention_mask=flat_attention_mask).logits
+                adapter_logps = self._sequence_logps(adapter_logits, flat_labels).view(batch_size, num_candidates)
+                rewards = beta * (adapter_logps - ref_logps)
+                comp_logp = pl_log_prob(
+                    rewards,
+                    rankings,
+                    candidate_mask=candidate_mask,
+                    ranked_prefix_lengths=ranked_prefix_lengths,
+                )
+                weighted_comp_nll = -(gamma[:, cluster_idx].to(dtype=comp_logp.dtype) * comp_logp)
+                if torch.any(valid_rows):
+                    component_loss = weighted_comp_nll[valid_rows].mean()
+                else:
+                    component_loss = weighted_comp_nll.sum() * 0.0
+
+                self.accelerator.backward(component_loss)
+                loss_value = float(component_loss.detach().item())
+                component_loss_value += loss_value
+                total_loss_value += loss_value
+
+                del adapter_logits, adapter_logps, rewards, comp_logp, weighted_comp_nll, component_loss
+            del ref_logps
 
         self._set_active_adapter(self.policy_adapter_name)
         self._set_trainable_lora_adapters([self.policy_adapter_name, *self.mixture_adapter_names])
@@ -1709,6 +2116,115 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
         gc.collect()
         torch.cuda.empty_cache()
 
+    def _ensure_em_row_ids(self) -> None:
+        if isinstance(self.train_dataset, IterableDataset):
+            raise ValueError("Block EM requires a map-style Dataset with stable `em_row_id` values.")
+        if not isinstance(self.train_dataset, Dataset):
+            raise ValueError("Block EM requires a datasets.Dataset training split.")
+        if "em_row_id" not in self.train_dataset.column_names:
+            self.train_dataset = self.train_dataset.add_column("em_row_id", list(range(len(self.train_dataset))))
+
+    @staticmethod
+    def _batch_row_ids(inputs: Dict[str, Any]) -> torch.Tensor:
+        row_ids = inputs.get("em_row_id")
+        if row_ids is None:
+            raise ValueError("Block EM requires `em_row_id` in every training batch.")
+        if not isinstance(row_ids, torch.Tensor):
+            row_ids = torch.tensor(row_ids, dtype=torch.long)
+        row_ids = row_ids.detach().long().view(-1)
+        if torch.any(row_ids < 0):
+            raise ValueError("Block EM found missing `em_row_id`; ensure the listwise collator preserves it.")
+        return row_ids
+
+    @staticmethod
+    def _stage_em_batch_on_cpu(batch: Any) -> Any:
+        if isinstance(batch, torch.Tensor):
+            return batch.detach().cpu()
+        if isinstance(batch, dict):
+            return {key: MixtureEMDPOTrainer._stage_em_batch_on_cpu(value) for key, value in batch.items()}
+        if isinstance(batch, list):
+            return [MixtureEMDPOTrainer._stage_em_batch_on_cpu(value) for value in batch]
+        if isinstance(batch, tuple):
+            return tuple(MixtureEMDPOTrainer._stage_em_batch_on_cpu(value) for value in batch)
+        return batch
+
+    def _gather_gamma_for_prior(self, gamma: torch.Tensor) -> torch.Tensor:
+        try:
+            return self.accelerator.gather_for_metrics(gamma.detach())
+        except Exception:
+            return gamma.detach()
+
+    def _alpha_entropy(self) -> float:
+        router = self.mixture_head.router if self.mixture_reward_backend == "head" else self.mixture_router
+        if router is None or not hasattr(router, "global_logits"):
+            return 0.0
+        probs = torch.softmax(router.global_logits.detach().float(), dim=0)
+        entropy = -(probs * probs.clamp_min(1e-12).log()).sum()
+        return float(entropy.item())
+
+    def _build_em_block_cache(
+        self,
+        raw_batches: list[Dict[str, Any]],
+    ) -> tuple[dict[int, torch.Tensor], torch.Tensor, int]:
+        gamma_cache: dict[int, torch.Tensor] = {}
+        gamma_sum: torch.Tensor | None = None
+        gamma_count = 0
+
+        # Responsibilities drive the closed-form alpha update, so approximation
+        # noise in the E-step lets a single cluster win early and collapse the
+        # mixture. With em_exact_e_step the block cache scores exactly (via the
+        # train_eval="eval" routing) and with dropout disabled.
+        exact_e_step = bool(getattr(self.mixture_config, "em_exact_e_step", True))
+        if (
+            exact_e_step
+            and getattr(self.args, "use_linear_reward_approx", False)
+            and not getattr(self.args, "linear_approx_exact_eval", True)
+        ):
+            warnings.warn(
+                "`em_exact_e_step=True` cannot take effect because `linear_approx_exact_eval=False` "
+                "keeps eval-mode scoring approximate; the E-step will use approximated rewards.",
+                stacklevel=2,
+            )
+        was_training = self.model.training
+        if exact_e_step:
+            self.model.eval()
+        try:
+            for raw_batch in raw_batches:
+                inputs = self._prepare_inputs(raw_batch)
+                row_ids = self._batch_row_ids(inputs)
+                with torch.no_grad():
+                    _, _, _, gamma = self.get_batch_mixture_em_loss_metrics(
+                        self.model,
+                        inputs,
+                        include_cluster_metrics=False,
+                        train_eval="eval" if exact_e_step else "train",
+                    )
+                gamma = gamma.detach()
+                for local_idx, row_id in enumerate(row_ids.detach().cpu().tolist()):
+                    gamma_cache[int(row_id)] = gamma[local_idx]
+
+                gamma_for_prior = self._gather_gamma_for_prior(gamma)
+                gamma_sum = gamma_for_prior.sum(dim=0) if gamma_sum is None else gamma_sum + gamma_for_prior.sum(dim=0)
+                gamma_count += int(gamma_for_prior.shape[0])
+        finally:
+            if exact_e_step:
+                self.model.train(was_training)
+
+        if gamma_sum is None or gamma_count == 0:
+            raise ValueError("Block EM received an empty E-step block.")
+        block_prior = gamma_sum / float(gamma_count)
+        return gamma_cache, block_prior, gamma_count
+
+    def _cached_gamma_for_batch(self, inputs: Dict[str, Any], gamma_cache: dict[int, torch.Tensor]) -> torch.Tensor:
+        row_ids = self._batch_row_ids(inputs)
+        gammas = []
+        for row_id in row_ids.detach().cpu().tolist():
+            row_gamma = gamma_cache.get(int(row_id))
+            if row_gamma is None:
+                raise KeyError(f"Missing cached EM responsibility for em_row_id={int(row_id)}")
+            gammas.append(row_gamma)
+        return torch.stack(gammas, dim=0).to(device=row_ids.device)
+
     def _update_best_metric_for_legacy_checkpointing(self, metrics: Optional[dict[str, float]]) -> None:
         """Update TrainerState best fields for Trainer versions whose _save_checkpoint lacks metrics=."""
         if not metrics:
@@ -1777,9 +2293,16 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
             self._load_from_checkpoint(resume_from_checkpoint)
 
         args = self.args
+        self._ensure_em_row_ids()
         train_dataloader = self.get_train_dataloader()
-        m_step_updates = self.mixture_config.m_step_updates
-        steps_per_epoch = max(len(train_dataloader) * m_step_updates, 1)
+        em_batches_per_update = int(getattr(self.mixture_config, "em_batches_per_update", 1))
+        if getattr(self.mixture_config, "m_step_updates", 1) != 1:
+            warnings.warn(
+                "`m_step_updates` is ignored by MixtureEMDPOTrainer block EM; "
+                "use `em_batches_per_update` to control the E/M block size.",
+                stacklevel=2,
+            )
+        steps_per_epoch = max(len(train_dataloader), 1)
         if args.max_steps > 0:
             max_steps = args.max_steps
             num_train_epochs = math.ceil(max_steps / steps_per_epoch)
@@ -1807,21 +2330,26 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
 
         for epoch in range(num_train_epochs):
             self.model.train()
+            block_batches: list[Dict[str, Any]] = []
+            block_index = 0
             for step, batch in enumerate(train_dataloader):
-                inputs = self._prepare_inputs(batch)
+                block_batches.append(self._stage_em_batch_on_cpu(batch))
+                if len(block_batches) < em_batches_per_update and step + 1 < len(train_dataloader):
+                    continue
 
-                # E-step: infer gamma once with current parameters.
-                with torch.no_grad():
-                    _, _, _, gamma = self.get_batch_mixture_em_loss_metrics(
-                        self.model,
-                        inputs,
-                        include_cluster_metrics=False,
-                    )
-                self._update_global_router_prior_from_gamma(gamma)
+                # E-step: infer responsibilities for a block before any M-step update.
+                gamma_cache, block_prior, block_gamma_count = self._build_em_block_cache(block_batches)
+                if self._use_closed_form_alpha_update():
+                    self._set_global_router_prior(block_prior)
 
-                # M-step: optimize only E_q[log p(z, ranking | x)] for fixed gamma.
-                for m_step in range(m_step_updates):
+                # M-step: replay the same block once with fixed cached responsibilities.
+                for raw_batch in block_batches:
+                    if self.state.global_step >= max_steps:
+                        stop_training = True
+                        break
                     self.model.train()
+                    inputs = self._prepare_inputs(raw_batch)
+                    gamma = self._cached_gamma_for_batch(inputs, gamma_cache)
                     should_log = args.logging_steps > 0 and (self.state.global_step + 1) % args.logging_steps == 0
                     if self.mixture_reward_backend == "lora":
                         loss_value, metrics = self._backward_lora_mixture_em_loss_sequential(
@@ -1835,20 +2363,58 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                             inputs,
                             gamma=gamma,
                         )
-                    metric_context_manager = (
-                        torch.autocast(self.accelerator.device.type)
-                        if self._peft_has_been_casted_to_bf16
-                        else nullcontext()
+                    # Under the linear reward approximation the surrogate NLLs are
+                    # inflated by stop-gradient Taylor error on non-anchor candidates,
+                    # so keep them under *_approx keys and reserve the primary keys
+                    # for exactly scored values (recomputed on logging steps below).
+                    approx_train_metrics = (
+                        self._use_linear_reward_approx("train")
+                        and not self.mixture_config.use_contextual_router
+                        and getattr(self.args, "linear_approx_exact_eval", True)
                     )
-                    with torch.no_grad(), metric_context_manager:
-                        if self.mixture_reward_backend == "lora":
-                            self._set_active_adapter(self.policy_adapter_name)
-                        _, listwise_metrics = self.get_batch_loss_metrics(
-                            self.model,
-                            inputs,
-                            train_eval="train",
+                    if approx_train_metrics:
+                        for metric_key in ("mixture/nll", "mixture/em_nll", "mixture/component_em_nll"):
+                            if metric_key in metrics:
+                                metrics[f"{metric_key}_approx"] = metrics.pop(metric_key)
+                    # Policy listwise metrics cost two extra full forwards and, in
+                    # em_only mode, the policy adapter is not updated, so only pay
+                    # for them on logging steps.
+                    if should_log:
+                        metric_context_manager = (
+                            torch.autocast(self.accelerator.device.type)
+                            if self._peft_has_been_casted_to_bf16
+                            else nullcontext()
                         )
-                    metrics.update(listwise_metrics)
+                        exact_metrics = None
+                        with torch.no_grad(), metric_context_manager:
+                            if self.mixture_reward_backend == "lora":
+                                self._set_active_adapter(self.policy_adapter_name)
+                            _, listwise_metrics = self.get_batch_loss_metrics(
+                                self.model,
+                                inputs,
+                                train_eval="train",
+                            )
+                            if approx_train_metrics:
+                                # train_eval="eval" routes through exact scoring when
+                                # linear_approx_exact_eval is enabled (guarded above).
+                                _, exact_metrics, _, _ = self.get_batch_mixture_em_loss_metrics(
+                                    self.model,
+                                    inputs,
+                                    gamma=gamma,
+                                    include_cluster_metrics=False,
+                                    train_eval="eval",
+                                )
+                        metrics.update(listwise_metrics)
+                        if exact_metrics is not None:
+                            metrics["mixture/nll"] = exact_metrics["mixture/nll"]
+                            metrics["mixture/em_nll"] = exact_metrics["mixture/em_nll"]
+                    metrics.update(
+                        {
+                            "em/block_index": float(block_index),
+                            "em/block_size": float(block_gamma_count),
+                            "em/alpha_entropy": self._alpha_entropy(),
+                        }
+                    )
                     self.store_metrics(metrics, train_eval="train")
 
                     if self.mixture_reward_backend != "lora":
@@ -1870,16 +2436,14 @@ class MixtureEMDPOTrainer(MixtureDPOTrainer):
                             {
                                 "loss": loss_value,
                                 "em/e_step_epoch": float(epoch),
-                                "em/m_step": float(m_step + 1),
+                                "em/block_index": float(block_index),
                             }
                         )
 
                     self._maybe_evaluate_and_save_em(trial=trial)
 
-                    if self.state.global_step >= max_steps:
-                        stop_training = True
-                        break
-
+                block_batches = []
+                block_index += 1
                 if stop_training:
                     break
 

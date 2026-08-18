@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASH_SCRIPTS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -13,7 +14,8 @@ RANKING_SIZES="${RANKING_SIZES:-2 3 4}"
 MAX_STEPS="${MAX_STEPS:-2000}"
 LEARNING_RATES="${LEARNING_RATES:-${LEARNING_RATE:-2e-6}}"
 EM_TEMPERATURES="${EM_TEMPERATURES:-${EM_TEMPERATURE:-1.0}}"
-M_STEP_UPDATES="${M_STEP_UPDATES:-5 3 1}"
+EM_BATCHES_PER_UPDATE="${EM_BATCHES_PER_UPDATE:-8}"
+EM_ALPHA_UPDATE="${EM_ALPHA_UPDATE:-block_closed_form}"
 MIXTURE_TRAINING_MODE="${MIXTURE_TRAINING_MODE:-em_only}"
 MIXTURE_REWARD_BACKEND="${MIXTURE_REWARD_BACKEND:-head}"
 DOWNSAMPLE_RATIO="${DOWNSAMPLE_RATIO:-0.2}"
@@ -59,20 +61,14 @@ BASE_WANDB_NAME="${WANDB_NAME:-qwen3-0.6b-mixture-pl-${dataset_tag}}"
 for seed in ${SEEDS}; do
 for learning_rate in ${LEARNING_RATES}; do
 for temperature in ${EM_TEMPERATURES}; do
-for m_step_updates in ${M_STEP_UPDATES}; do
 for ranking_size in ${RANKING_SIZES}; do
-  # if ranking_size == 2 and m_step_updates == 5, skip this combination as it may not be meaningful
-  if [[ ${ranking_size} -eq 2 && ${m_step_updates} -eq 5 ]]; then
-    continue
-  fi
-
   lr_tag="${learning_rate//./p}"
   lr_tag="${lr_tag//-/m}"
   temp_tag="${temperature//./p}"
-  run_name="${BASE_WANDB_NAME}-m${ranking_size}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
-  output_dir="${BASE_OUTPUT_DIR}/m${ranking_size}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
+  run_name="${BASE_WANDB_NAME}-m${ranking_size}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
+  output_dir="${BASE_OUTPUT_DIR}/m${ranking_size}-emb${EM_BATCHES_PER_UPDATE}-ds${ratio_tag}-temp${temp_tag}-lr${lr_tag}-s${seed}"
 
-  echo "Launching mixture PL: dataset=${DATASET_DIR}; dims=${DIMENSIONS}; m=${ranking_size}; seed=${seed}; downsample=${DOWNSAMPLE_RATIO}"
+  echo "Launching mixture PL: dataset=${DATASET_DIR}; dims=${DIMENSIONS}; m=${ranking_size}; em_batches_per_update=${EM_BATCHES_PER_UPDATE}; em_alpha_update=${EM_ALPHA_UPDATE}; seed=${seed}; downsample=${DOWNSAMPLE_RATIO}"
 
   ACCELERATE_LOG_LEVEL=info accelerate launch \
     --config_file recipes/accelerate_configs/single.yaml \
@@ -100,7 +96,8 @@ for ranking_size in ${RANKING_SIZES}; do
     --mixture_reward_backend "${MIXTURE_REWARD_BACKEND}" \
     --mixture_nll_weight "${MIXTURE_NLL_WEIGHT:-0.1}" \
     --em_temperature "${temperature}" \
-    --m_step_updates "${m_step_updates}" \
+    --em_batches_per_update "${EM_BATCHES_PER_UPDATE}" \
+    --em_alpha_update "${EM_ALPHA_UPDATE}" \
     --use_contextual_router "${USE_CONTEXTUAL_ROUTER:-false}" \
     --use_closed_form_router_prior_update "${USE_CLOSED_FORM_ROUTER_PRIOR_UPDATE:-false}" \
     --router_hidden_size "${ROUTER_HIDDEN_SIZE:-256}" \
@@ -118,7 +115,6 @@ for ranking_size in ${RANKING_SIZES}; do
     --report_to "${REPORT_TO:-wandb}" \
     --seed "${seed}" \
     "$@"
-done
 done
 done
 done

@@ -113,6 +113,15 @@ class ScriptArguments(trl.ScriptArguments):
             )
         },
     )
+    listwise_augmented_subset_strategy: str = field(
+        default="all_combinations",
+        metadata={
+            "help": (
+                "How to select original/generated candidates when reducing augmented preformatted listwise data. "
+                "'all_combinations' emits every subset; 'first' emits one deterministic subset per row."
+            )
+        },
+    )
     listwise_prompt_column: str = field(
         default="instruction",
         metadata={"help": "Prompt column in the raw listwise dataset."},
@@ -209,6 +218,16 @@ class ScriptArguments(trl.ScriptArguments):
             )
         },
     )
+    ranking_eval_during_training_max_samples: Optional[int] = field(
+        default=None,
+        metadata={
+            "help": (
+                "If set, cap the eval split used by the during-training ranking evaluation to this many "
+                "examples (a seeded shuffled subset). The post-training ranking evaluation still uses "
+                "the full splits."
+            )
+        },
+    )
     eval_only_ranking: bool = field(
         default=False,
         metadata={
@@ -243,6 +262,8 @@ class ScriptArguments(trl.ScriptArguments):
             raise ValueError("`listwise_num_responses` must be >= 2")
         if self.listwise_num_generated_responses < 0:
             raise ValueError("`listwise_num_generated_responses` must be >= 0")
+        if self.listwise_augmented_subset_strategy not in {"all_combinations", "first"}:
+            raise ValueError("`listwise_augmented_subset_strategy` must be either 'all_combinations' or 'first'")
         if self.listwise_min_responses < 2:
             raise ValueError("`listwise_min_responses` must be >= 2")
         if self.dataset_downsample_ratio <= 0 or self.dataset_downsample_ratio > 1:
@@ -375,7 +396,40 @@ class MixturePLConfig(DPOConfig):
     )
     m_step_updates: int = field(
         default=1,
-        metadata={"help": "Number of optimizer updates per E-step when mixture_training_mode='em_only'."},
+        metadata={
+            "help": (
+                "Deprecated for mixture_training_mode='em_only'. Kept for backward compatibility; "
+                "block EM uses em_batches_per_update instead."
+            )
+        },
+    )
+    em_batches_per_update: int = field(
+        default=1,
+        metadata={
+            "help": (
+                "Number of dataloader batches in one block-EM cycle when mixture_training_mode='em_only'. "
+                "The E-step computes responsibilities for this block, then the M-step replays the same block once."
+            )
+        },
+    )
+    em_alpha_update: str = field(
+        default="block_closed_form",
+        metadata={
+            "help": (
+                "How to update mixture weights in EM-only mixture PL training. "
+                "'block_closed_form' sets global alpha to the mean responsibility over the current EM block; "
+                "'gradient' updates alpha/router by backprop in the M-step."
+            )
+        },
+    )
+    em_exact_e_step: bool = field(
+        default=True,
+        metadata={
+            "help": (
+                "Compute block-EM E-step responsibilities with exact scoring and dropout disabled, "
+                "even when use_linear_reward_approx is enabled for the M-step."
+            )
+        },
     )
     mixture_reward_backend: str = field(
         default="head",
@@ -441,6 +495,15 @@ class MixturePLConfig(DPOConfig):
         default=True,
         metadata={"help": "If True, validation/evaluation uses exact scoring even when approximation is enabled."},
     )
+    linear_approx_length_matched: bool = field(
+        default=False,
+        metadata={
+            "help": (
+                "Estimate non-anchor scores on the min(anchor, candidate) response-token prefix and pair "
+                "with matched-length reference scores, removing the length bias of full-grid extrapolation."
+            )
+        },
+    )
     linear_approx_ref_mode: str = field(
         default="input_gradient",
         metadata={
@@ -473,6 +536,19 @@ class MixturePLConfig(DPOConfig):
                 raise ValueError("`mixture_training_mode` must be either 'hybrid_dpo_em' or 'em_only'")
             if self.m_step_updates < 1:
                 raise ValueError("`m_step_updates` must be >= 1")
+            if self.em_batches_per_update < 1:
+                raise ValueError("`em_batches_per_update` must be >= 1")
+            if self.em_alpha_update not in {"block_closed_form", "gradient"}:
+                raise ValueError("`em_alpha_update` must be either 'block_closed_form' or 'gradient'")
+            if (
+                self.mixture_training_mode == "em_only"
+                and self.em_alpha_update == "block_closed_form"
+                and self.use_contextual_router
+            ):
+                raise ValueError(
+                    "`em_alpha_update='block_closed_form'` requires `use_contextual_router=False` "
+                    "because it updates a global mixture prior."
+                )
             if self.mixture_reward_backend not in {"head", "lora"}:
                 raise ValueError("`mixture_reward_backend` must be either 'head' or 'lora'")
             if not self.mixture_lora_adapter_prefix:
