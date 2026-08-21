@@ -1,4 +1,4 @@
-# Learning Mixtures of Plackett-Luce Models for Preference Optimization
+# Learning Mixtures of Plackett-Luce Models for Multi-Objective Alignment
 
 This repository contains the code for reproducing the main experiments of **MoPLEx**, a method for learning mixtures of Plackett-Luce ranking models from heterogeneous preference data.
 
