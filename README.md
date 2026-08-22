@@ -119,9 +119,10 @@ For the main table, report the mean and standard deviation over three seeds:
 If you find this repository useful or happen to use it in a research paper, please cite our work with the following Bib information.
 
 ```bibtex
-@article{moplex2026,
+@inproceedings{li2026learning,
   title={Learning Mixtures of Plackett-Luce Models for Preference Optimization},
   author={Li, Dongyue and Zhang, Ziniu and Wang, Lu and Zhang, Hongyang R.},
+  booktitle={Conference on Empirical Methods in Natural Language Processing (EMNLP)},
   year={2026}
 }
 ```
