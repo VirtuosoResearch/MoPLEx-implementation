@@ -120,7 +120,7 @@ If you find this repository useful or happen to use it in a research paper, plea
 
 ```bibtex
 @inproceedings{li2026learning,
-  title={Learning Mixtures of Plackett-Luce Models for Preference Optimization},
+  title={Learning Mixtures of Plackett-Luce Models for Multi-Objective Alignment},
   author={Li, Dongyue and Zhang, Ziniu and Wang, Lu and Zhang, Hongyang R.},
   booktitle={Conference on Empirical Methods in Natural Language Processing (EMNLP)},
   year={2026}
