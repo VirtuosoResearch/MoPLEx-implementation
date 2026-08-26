@@ -180,7 +180,6 @@ results/
 MiCRo/
 evaluations/
 
-*.png
 *.pt
 
 */synthetic_datasets/
