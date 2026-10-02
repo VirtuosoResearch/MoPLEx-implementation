@@ -32,7 +32,7 @@ pip install -e .
 bash scripts/bash_scripts/generate_disagreement_ultrafeedback_dataset.sh
 ```
 
-MoPLEx uses augmented ranking slates with generated tail responses. Generate the augmented training data with:
+MoPLEx uses augmented ranking slates with generated responses. Generate the augmented training data with:
 
 ```bash
 bash scripts/bash_scripts/augment_ultrafeedback_disagreement/augment_train_downsampled_ultrafeedback_disagreement_0.25.sh
@@ -40,7 +40,7 @@ bash scripts/bash_scripts/augment_ultrafeedback_disagreement/augment_train_downs
 
 2. Run MoPLEx on UltraFeedback
 
-This command runs the main mixture-of-PL model with block EM, per-cluster LoRA adapters, response augmentation, and linear reward approximation.
+This command runs the main mixture-of-PL model with an EM algorithm, with LoRA adapters, response augmentation, and linear reward approximation.
 
 ```bash
 bash scripts/bash_scripts/evaluate_ultrafeedback_disagreement/run_mixture_pl_linear_approx_qlora_ultrafeedback_disagreement_original_augmented.sh
@@ -138,8 +138,8 @@ For the main table, report the mean and standard deviation over three seeds:
 If you find this repository useful or happen to use it in a research paper, please cite our work with the following Bib information.
 
 ```bibtex
-@inproceedings{li2026learning,
-  title={Learning Mixtures of Plackett-Luce Models for Multi-Objective Alignment},
+@inproceedings{li2026estimating,
+  title={MoPLEx: Estimating Plackett-Luce Mixture Models for Multi-Objective Alignment},
   author={Li, Dongyue and Zhang, Ziniu and Wang, Lu and Zhang, Hongyang R.},
   booktitle={Conference on Empirical Methods in Natural Language Processing (EMNLP)},
   year={2026}
