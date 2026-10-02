@@ -7,10 +7,13 @@ import math
 from typing import Any, Optional
 
 import numpy as np
-from scipy.optimize import linear_sum_assignment
 import torch
 from torch.utils.data import DataLoader
 
+from __future__ import annotations
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 from .listwise_dpo import ListwiseDPODataCollator
 from .mixture_pl_components import em_responsibilities, mixture_pl_nll
 
@@ -168,6 +171,16 @@ def _dimension_mapping(preference_dimensions: Optional[list[str]], dataset) -> d
 def _true_cluster_tensor(dimensions: list[str], dimension_to_id: dict[str, int], device: torch.device) -> torch.Tensor:
     return torch.tensor([dimension_to_id[str(dimension)] for dimension in dimensions], dtype=torch.long, device=device)
 
+def align_cluster_counts(confusion: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    counts = np.asarray(confusion, dtype=np.int64)
+    optimal_rows, optimal_cols = linear_sum_assignment(-counts)
+    jitter = np.random.default_rng().uniform(0.0, 1e-12, size=counts.shape)
+    rows, cols = linear_sum_assignment(-(counts.astype(np.float64) + jitter))
+    optimal_count = sum(int(counts[row, col]) for row, col in zip(optimal_rows, optimal_cols))
+    selected_count = sum(int(counts[row, col]) for row, col in zip(rows, cols))
+    if selected_count != optimal_count:
+        return optimal_rows, optimal_cols
+    return rows, cols
 
 def _cluster_alignment(true_labels: list[int], pred_labels: list[int], num_clusters: int) -> ClusterAlignment:
     if not true_labels or not pred_labels:
@@ -176,7 +189,7 @@ def _cluster_alignment(true_labels: list[int], pred_labels: list[int], num_clust
     for true_label, pred_label in zip(true_labels, pred_labels):
         if true_label < num_clusters and pred_label < num_clusters:
             confusion[true_label, pred_label] += 1
-    row_ind, col_ind = linear_sum_assignment(-confusion)
+    row_ind, col_ind = align_cluster_counts(confusion)
     true_to_pred = {int(true_idx): int(pred_idx) for true_idx, pred_idx in zip(row_ind, col_ind)}
     pred_to_true = {int(pred_idx): int(true_idx) for true_idx, pred_idx in zip(row_ind, col_ind)}
     return ClusterAlignment(true_to_pred=true_to_pred, pred_to_true=pred_to_true)

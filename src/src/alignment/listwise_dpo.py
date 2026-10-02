@@ -31,9 +31,9 @@ from transformers import BaseImageProcessor, FeatureExtractionMixin, PreTrainedT
 from transformers.trainer_utils import TrainOutput
 import torch
 import torch.nn.functional as F
-from scipy.optimize import linear_sum_assignment
 from trl import DPOTrainer
 
+from .ranking_eval import align_cluster_counts
 from .mixture_pl_components import (
     em_expected_complete_nll,
     em_responsibilities,
@@ -1533,8 +1533,8 @@ class MixtureDPOTrainer(ListwiseDPOTrainer):
         for true_cluster, pred_cluster in zip(true_clusters.view(-1), pred_clusters.view(-1)):
             confusion[true_cluster.long(), pred_cluster.long()] += 1
 
-        row_ind, col_ind = linear_sum_assignment((-confusion).cpu().numpy())
-        pred_to_true = {pred_idx: true_idx for true_idx, pred_idx in zip(row_ind, col_ind)}
+        row_ind, col_ind = align_cluster_counts(confusion.cpu().numpy())
+        pred_to_true = {int(pred_idx): int(true_idx) for true_idx, pred_idx in zip(row_ind, col_ind)}
         aligned_pred_clusters = torch.tensor(
             [pred_to_true.get(int(pred_cluster.item()), int(pred_cluster.item())) for pred_cluster in pred_clusters],
             device=pred_clusters.device,

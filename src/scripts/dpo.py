@@ -55,7 +55,7 @@ import time
 import datasets
 import torch
 import transformers
-from transformers import TrainerCallback, set_seed
+from transformers import set_seed
 from transformers.trainer_utils import get_last_checkpoint
 
 from alignment import (
@@ -67,15 +67,8 @@ from alignment import (
     MixturePLConfig,
     ScriptArguments,
     get_dataset,
-    get_ranking_dataset,
     get_model,
     get_tokenizer,
-)
-from alignment.ranking_eval import (
-    _dimension_mapping,
-    compute_validation_cluster_alignment,
-    evaluate_ranking_split,
-    evaluate_ranking_splits,
 )
 from trl import DPOTrainer, ModelConfig, TrlParser, get_peft_config
 
@@ -136,51 +129,6 @@ def cast_trainable_bf16_params_to_fp32(module: torch.nn.Module) -> int:
                 param.grad.data = param.grad.data.float()
             converted += 1
     return converted
-
-
-class RankingEvaluationCallback(TrainerCallback):
-    """Log full ranking metrics on the configured evaluation split during Trainer.evaluate()."""
-
-    def __init__(self, ranking_dataset, tokenizer, script_args, training_args):
-        self.tokenizer = tokenizer
-        self.script_args = script_args
-        self.training_args = training_args
-        self.eval_split = script_args.dataset_test_split
-        self.dimension_to_id = _dimension_mapping(script_args.preference_dimensions, ranking_dataset)
-        self.trainer = None
-
-        max_samples = getattr(script_args, "ranking_eval_during_training_max_samples", None)
-        if (
-            max_samples is not None
-            and max_samples > 0
-            and self.eval_split in ranking_dataset
-            and len(ranking_dataset[self.eval_split]) > max_samples
-        ):
-            # Copy so the full split is still used by the post-training ranking eval.
-            ranking_dataset = dict(ranking_dataset)
-            ranking_dataset[self.eval_split] = (
-                ranking_dataset[self.eval_split].shuffle(seed=training_args.seed).select(range(max_samples))
-            )
-        self.ranking_dataset = ranking_dataset
-
-    def on_evaluate(self, args, state, control, metrics=None, **kwargs):
-        del args, state, control, kwargs
-        if self.trainer is None or self.eval_split not in self.ranking_dataset:
-            return
-
-        split_metrics, _ = evaluate_ranking_split(
-            trainer=self.trainer,
-            split_dataset=self.ranking_dataset[self.eval_split],
-            tokenizer=self.tokenizer,
-            training_args=self.training_args,
-            dimension_to_id=self.dimension_to_id,
-            cluster_alignment=None,
-        )
-        logged_metrics = {f"ranking_{self.eval_split}/{key}": value for key, value in split_metrics.items()}
-        best_model_aliases = {f"eval_{key}": value for key, value in logged_metrics.items()}
-        if metrics is not None:
-            metrics.update(logged_metrics)
-            metrics.update(best_model_aliases)
 
 
 def main(script_args, training_args, model_args):
@@ -251,13 +199,9 @@ def main(script_args, training_args, model_args):
     # Dataset
     #########
     dataset = get_dataset(script_args)
-    ranking_dataset = get_ranking_dataset(script_args) if script_args.run_ranking_eval else None
     # print dataset sizes
     for split in dataset:
         logger.info(f"Loaded {len(dataset[split])} examples from the '{split}' split.")
-    if ranking_dataset is not None:
-        for split in ranking_dataset:
-            logger.info(f"Loaded {len(ranking_dataset[split])} ranking examples from the '{split}' split.")
     
     # print a few examples from the dataset for sanity check
     # for split in dataset:
@@ -317,54 +261,6 @@ def main(script_args, training_args, model_args):
         converted = cast_trainable_bf16_params_to_fp32(trainer.model)
         if converted:
             logger.info("Cast %d trainable bf16 parameters to fp32 for fp16 GradScaler compatibility.", converted)
-    if (
-        ranking_dataset is not None
-        and script_args.ranking_eval_during_training
-        and training_args.eval_strategy != "no"
-        and script_args.dataset_test_split in ranking_dataset
-    ):
-        ranking_callback = RankingEvaluationCallback(
-            ranking_dataset=ranking_dataset,
-            tokenizer=tokenizer,
-            script_args=script_args,
-            training_args=training_args,
-        )
-        ranking_callback.trainer = trainer
-        trainer.add_callback(ranking_callback)
-
-    if script_args.eval_only_ranking:
-        if ranking_dataset is None:
-            raise ValueError("`eval_only_ranking=True` requires `run_ranking_eval=True` and available ranking splits.")
-        eval_split = script_args.eval_ranking_split
-        if eval_split not in {"train", "validation", "test"}:
-            raise ValueError("`eval_ranking_split` must be one of: train, validation, test.")
-        if eval_split not in ranking_dataset:
-            raise ValueError(f"Ranking split '{eval_split}' not found in ranking dataset.")
-
-        if script_args.eval_checkpoint_path:
-            logger.info("Loading checkpoint for ranking-only eval from: %s", script_args.eval_checkpoint_path)
-            trainer._load_from_checkpoint(script_args.eval_checkpoint_path)
-
-        dimension_to_id = _dimension_mapping(script_args.preference_dimensions, ranking_dataset)
-        cluster_alignment = compute_validation_cluster_alignment(
-            trainer=trainer,
-            ranking_dataset=ranking_dataset,
-            tokenizer=tokenizer,
-            training_args=training_args,
-            dimension_to_id=dimension_to_id,
-        )
-        split_metrics, _ = evaluate_ranking_split(
-            trainer=trainer,
-            split_dataset=ranking_dataset[eval_split],
-            tokenizer=tokenizer,
-            training_args=training_args,
-            dimension_to_id=dimension_to_id,
-            cluster_alignment=cluster_alignment,
-        )
-        trainer.log_metrics(f"ranking_{eval_split}", split_metrics)
-        trainer.save_metrics(f"ranking_{eval_split}", split_metrics)
-        return
-
     logger.info("*** Train ***")
     checkpoint = None
     if training_args.resume_from_checkpoint is not None:
@@ -394,31 +290,6 @@ def main(script_args, training_args, model_args):
         _log_benchmark_metrics("eval", metrics)
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
-
-    if ranking_dataset is not None:
-        logger.info("*** Ranking evaluation on available ranking splits ***")
-        _reset_cuda_peak_memory()
-        ranking_wall_start = time.perf_counter()
-        ranking_results = evaluate_ranking_splits(
-            trainer=trainer,
-            ranking_dataset=ranking_dataset,
-            tokenizer=tokenizer,
-            script_args=script_args,
-            training_args=training_args,
-        )
-        _cuda_synchronize()
-        ranking_benchmark_metrics = {
-            "ranking_wall_time_seconds": time.perf_counter() - ranking_wall_start,
-            **_cuda_memory_metrics("ranking"),
-        }
-        _log_benchmark_metrics("ranking", ranking_benchmark_metrics)
-        trainer.log(ranking_benchmark_metrics)
-        trainer.log_metrics("ranking_benchmark", ranking_benchmark_metrics)
-        trainer.save_metrics("ranking_benchmark", ranking_benchmark_metrics)
-        for split_name, split_metrics in ranking_results.items():
-            trainer.log({f"ranking_{split_name}/{key}": value for key, value in split_metrics.items()})
-            trainer.log_metrics(f"ranking_{split_name}", split_metrics)
-            trainer.save_metrics(f"ranking_{split_name}", split_metrics)
 
     # Save and push to hub
     trainer.save_model(training_args.output_dir)

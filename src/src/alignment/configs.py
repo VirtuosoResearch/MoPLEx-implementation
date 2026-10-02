@@ -228,27 +228,6 @@ class ScriptArguments(trl.ScriptArguments):
             )
         },
     )
-    eval_only_ranking: bool = field(
-        default=False,
-        metadata={
-            "help": (
-                "If True, skip training and run ranking evaluation only using a loaded checkpoint/model."
-            )
-        },
-    )
-    eval_checkpoint_path: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Optional checkpoint path to load before eval_only_ranking. "
-                "Accepts Trainer checkpoint-* directory or final saved model directory."
-            )
-        },
-    )
-    eval_ranking_split: str = field(
-        default="test",
-        metadata={"help": "Ranking split to evaluate in eval_only_ranking mode. Choices: train/validation/test."},
-    )
 
     def __post_init__(self):
         if self.dataset_name is None and self.dataset_mixture is None:
