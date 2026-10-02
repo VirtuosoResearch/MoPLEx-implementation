@@ -1,9 +1,0 @@
-Issue:
-
-Traceback (most recent call last): File "/home/michael/anaconda3/envs/dpo/lib/python3.10/runpy.py", line 196, in _run_module_as_main return _run_code(code, main_globals, None, File "/home/michael/anaconda3/envs/dpo/lib/python3.10/runpy.py", line 86, in _run_code exec(code, run_globals) File "/home/michael/project/Preference-tuning-and-evaluation/trainers/dpo.py", line 595, in <module> app.run(main) File "/home/michael/anaconda3/envs/dpo/lib/python3.10/site-packages/absl/app.py", line 316, in run _run_main(main, args) File "/home/michael/anaconda3/envs/dpo/lib/python3.10/site-packages/absl/app.py", line 261, in _run_main sys.exit(main(argv)) File "/home/michael/project/Preference-tuning-and-evaluation/trainers/dpo.py", line 155, in main dataset = load_dataset(FLAGS.dataset_path, split="unlabeled", trust_remote_code=True) File "/home/michael/anaconda3/envs/dpo/lib/python3.10/site-packages/datasets/load.py", line 1392, in load_dataset builder_instance = load_dataset_builder( File "/home/michael/anaconda3/envs/dpo/lib/python3.10/site-packages/datasets/load.py", line 1132, in load_dataset_builder dataset_module = dataset_module_factory( File "/home/michael/anaconda3/envs/dpo/lib/python3.10/site-packages/datasets/load.py", line 1031, in dataset_module_factory raise e1 from None File "/home/michael/anaconda3/envs/dpo/lib/python3.10/site-packages/datasets/load.py", line 989, in dataset_module_factory raise RuntimeError(f"Dataset scripts are no longer supported, but found {filename}") RuntimeError: Dataset scripts are no longer supported, but found alpaca_farm.py
-
-Solve:
-```bash
-pip install -U "huggingface_hub>=0.34.0,<1.0"
-pip install -U "datasets<4.0.0"
-```
